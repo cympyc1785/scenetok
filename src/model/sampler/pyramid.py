@@ -30,6 +30,8 @@ class PyramidSampler(Sampler[PyramidSamplerCfg]):
         
         clean_targets = self.cfg.clean_targets if clean_targets is None else clean_targets
         window_shift = concurrency - clean_targets
+        if window_shift <= 0:
+            raise ValueError(f"clean_targets must be less than concurrency (number of targets), but got clean_targets={clean_targets} and concurrency={concurrency}")
         mat_list = []
         mask_list = [[True if i < concurrency else False for i in range(horizon) ]]
         
