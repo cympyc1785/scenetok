@@ -30,6 +30,7 @@ class DatasetLatentCfg(DatasetCfgCommon):
     context_latent_type: Literal["va", "wan_single"] = "va"
     target_latent_type: Literal["videodc", "wan"] = "videodc"
     scale_focal_by_256: bool=False # Allow backward compatibility with va-videodc, refer to docs/KNOWN_BUG.md
+    scale_context_focal_by_256: bool=False # Allow backward compatibility with va-wan, refer to docs/KNOWN_BUG.md
 
 class DatasetLatent(Dataset):
     cfg: DatasetLatentCfg
@@ -184,7 +185,10 @@ class DatasetLatent(Dataset):
 
             target_intrinsics[..., 0, 0] *= 3840/256
             target_intrinsics[..., 1, 1] *= 2160/256
-
+        
+        elif self.cfg.scale_context_focal_by_256:
+            context_intrinsics[..., 0, 0] *= 3840/256
+            context_intrinsics[..., 1, 1] *= 2160/256
 
         if view_indices.cond is not None:
             sample["cond"] = {

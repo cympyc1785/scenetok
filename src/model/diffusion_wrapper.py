@@ -696,7 +696,7 @@ class DiffusionWrapper(LightningModule):
             indices = torch.linspace(0, t, steps=t, device=start.device)
             new_target = {
                 "extrinsics": target_extrinsics.to(start.device),
-                "intrinsics": batch["context"]["intrinsics"][:, 0:1].expand(-1, t, -1, -1).clone(),
+                "intrinsics": batch["target"]["intrinsics"][:, 0:1].expand(-1, t, -1, -1).clone(),
                 "latent": torch.zeros((b, t, c, h, w), device=start.device).to(start.dtype),
                 "index": indices[None].expand(b, -1)
             }
