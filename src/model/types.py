@@ -27,6 +27,8 @@ class DenoiserInputs:
     pose: CameraInputs
     timestep: Float[Tensor, "batch view"]
     state: Optional[Float[Tensor, "batch num _"]]=None
+    text: Optional[Float[Tensor, "batch num _"]]=None
+    condition_latents: Optional[Float[Tensor, "batch cond_view _ height width"]]=None
 
 
 @dataclass
@@ -45,4 +47,3 @@ class SceneGeneratorInputs:
     anchor_pose: CameraInputs
     timestep: Optional[Float[Tensor, "batch view"]]=None
     state: Optional[Float[Tensor, "batch num _"]]=None
-

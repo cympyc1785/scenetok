@@ -27,12 +27,20 @@ class CheckpointingCfg:
     ignore_size_match: bool=False
 
 @dataclass
+class TextEncoderCfg:
+    name: Literal["umt5"]
+    pretrained_model_name_or_path: str = "google/umt5-base"
+    max_length: int = 128
+    trainable: bool = False
+
+@dataclass
 class ModelCfg:
     
     denoiser: DenoiserCfg
     scheduler: SchedulerCfg
     compressor: CompressorCfg | None
     autoencoders:  AutoencodersCfg
+    text_encoder: TextEncoderCfg | None = None
     scene_scheduler: SchedulerCfg | None=None
     scene_generator: SceneGeneratorCfg | None=None
     use_cfg: bool=False

@@ -75,6 +75,9 @@ class DiffusionWrapper(LightningModule):
         self.batch_size = batch_size
         self.val_check_interval = val_check_interval
         self.mode = mode
+        self.text_tokenizer = None
+        self.text_encoder = None
+        self.text_condition_proj = None
         torch._dynamo.config.optimize_ddp = model_cfg.optimize_ddp
         # if bool(int(os.getenv("DEBUG", 0))):
         #     print("Anomaly detection is enabled during DEBUG")
@@ -141,6 +144,7 @@ class DiffusionWrapper(LightningModule):
             num_views=self.dataset_cfg.view_sampler.num_target_views, 
             temporal_downsample=temporal_downsample, 
             using_wan=True if "wan" in getattr(self.model_cfg.autoencoders, "target").name else False)
+        self._init_text_encoder()
         self.scheduler = get_scheduler(model_cfg.scheduler)
 
         if self.freeze_cfg.denoiser:
@@ -287,6 +291,74 @@ class DiffusionWrapper(LightningModule):
         if token_mask is not None:
             scene_tokens[~token_mask] = self.denoiser.null_tokens[0].to(scene_tokens.dtype)
         return scene_tokens
+
+    def _init_text_encoder(self):
+        if self.model_cfg.text_encoder is None:
+            return
+        if self.model_cfg.text_encoder.name != "umt5":
+            raise ValueError(f"Unsupported text encoder: {self.model_cfg.text_encoder.name}")
+
+        try:
+            from transformers import AutoTokenizer, UMT5EncoderModel
+        except ImportError as err:
+            raise ImportError(
+                "transformers is required for umT5 conditioning. "
+                "Install it with `pip install transformers sentencepiece`."
+            ) from err
+
+        text_cfg = self.model_cfg.text_encoder
+        self.text_tokenizer = AutoTokenizer.from_pretrained(
+            text_cfg.pretrained_model_name_or_path
+        )
+        self.text_encoder = UMT5EncoderModel.from_pretrained(
+            text_cfg.pretrained_model_name_or_path
+        )
+
+        if not text_cfg.trainable:
+            freeze(self.text_encoder)
+            self.text_encoder.eval()
+
+        if getattr(self.denoiser, "text_proj", None) is None:
+            hidden_size = self.text_encoder.config.d_model
+            target_dim = self.denoiser.cnd_proj.out_features
+            if hidden_size != target_dim:
+                self.text_condition_proj = nn.Linear(hidden_size, target_dim)
+
+    def get_text_condition(self, batch, device=None):
+        if "text_embedding" in batch and batch["text_embedding"] is not None:
+            text = batch["text_embedding"]
+            if self.text_condition_proj is not None:
+                text = self.text_condition_proj(text.to(self.device))
+            if device is None:
+                return text
+            return text.to(device)
+
+        text = batch.get("text")
+        if text is None or self.text_encoder is None or self.text_tokenizer is None:
+            return None
+        if isinstance(text, str):
+            text = [text]
+
+        text_inputs = self.text_tokenizer(
+            list(text),
+            padding=True,
+            truncation=True,
+            max_length=self.model_cfg.text_encoder.max_length,
+            return_tensors="pt",
+        )
+        target_device = self.device if device is None else device
+        text_inputs = {k: v.to(target_device) for k, v in text_inputs.items()}
+
+        if self.model_cfg.text_encoder.trainable:
+            text_outputs = self.text_encoder(**text_inputs)
+        else:
+            with torch.no_grad():
+                text_outputs = self.text_encoder(**text_inputs)
+
+        text_state = text_outputs.last_hidden_state
+        if self.text_condition_proj is not None:
+            text_state = self.text_condition_proj(text_state)
+        return text_state
     
     def process_gt(self, latents, noise, timestep):
         
@@ -324,6 +396,9 @@ class DiffusionWrapper(LightningModule):
         target = repeat_batch(batch["target"], repeat_factor)
         device = context_latents.device
         dtype = context_latents.dtype
+        text_state = self.get_text_condition(batch, device=device)
+        if text_state is not None:
+            text_state = einops.repeat(text_state, "b n d -> (b r) n d", r=repeat_factor)
         b_c, v_c, *_ = context_latents.shape
         b, v_t, *_ = target["extrinsics"].shape
 
@@ -408,6 +483,7 @@ class DiffusionWrapper(LightningModule):
             x_t=x_t, 
             target_pose=target_pose,
             cond_state=scene_tokens,
+            text_state=text_state,
             sampler=sampler,
             scheduler=self.scheduler,
             autoencoder=self.autoencoder,
@@ -562,7 +638,8 @@ class DiffusionWrapper(LightningModule):
                 extrinsics=batch["target"]["extrinsics"]
             ), 
             timestep=t, 
-            state=scene_tokens
+            state=scene_tokens,
+            text=self.get_text_condition(batch, device=device)
 
         )
         
@@ -751,7 +828,13 @@ class DiffusionWrapper(LightningModule):
             gathered_sampled = gathered_sampled.cpu()
             gathered_target = gathered_target.cpu()
 
-            general_metrics = self.metric(gathered_sampled, gathered_target, fvd=True, fid=True)
+            general_metrics = self.metric(
+                gathered_sampled,
+                gathered_target,
+                num_views=chunk_size,
+                fvd=True,
+                fid=True,
+            )
             
             self.metric.reset_fid()
             self.metric.reset_fvd()
@@ -819,32 +902,40 @@ class DiffusionWrapper(LightningModule):
 
         # Relative camera w.r.t middle context camera (can be any other context camera)
         batch = preprocess_batch(batch, index=v_c//2)
-        sampled_views, _, _ = self.generate_batch_with_scene(
+        sampled_views, uncertainty_maps, _ = self.generate_batch_with_scene(
             batch, 
             self.sampler, 
             repeat_factor=1
         )
+
+        # for j in tqdm(range(b), desc="Saving Uncertainty Maps: "):
+        #     save_image_video(
+        #         images=uncertainty_maps[j], 
+        #         indices=torch.arange(0, uncertainty_maps[j].shape[0]), 
+        #         output_dir=self.output_dir / "uncertainty" / batch["scene"][j],
+        #         name=self.sampler.cfg.name, save_img=True, save_video=True, fps=self.dataset_cfg.fps
+        #     )
 
         for j in tqdm(range(b), desc="Saving Sampled Views: "):
             save_image_video(
                 images=sampled_views[j], 
                 indices=torch.arange(0, sampled_views[j].shape[0]), 
                 output_dir=self.output_dir / "predicted" / batch["scene"][j],
-                name=self.sampler.cfg.name, save_img=True, save_video=False
+                name=self.sampler.cfg.name, save_img=True, save_video=True, fps=self.dataset_cfg.fps
             )
         for j in tqdm(range(b), desc="Saving Original Views: "):
             save_image_video(
                 images=target_views[j], 
                 indices=torch.arange(0, target_views[j].shape[0]), 
                 output_dir=self.output_dir / "gt" / batch["scene"][j],
-                name="original", save_img=True, save_video=False
+                name="original", save_img=True, save_video=True, fps=self.dataset_cfg.fps
             )
 
             save_image_video(
                 images=context_views[j], 
                 indices=batch["context"]["index"][j], 
                 output_dir=self.output_dir / "context" / batch["scene"][j],
-                name="context", save_img=True, save_video=False
+                name="context", save_img=True, save_video=True, fps=self.dataset_cfg.fps
             )
         return None
 

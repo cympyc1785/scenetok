@@ -60,6 +60,7 @@ class LightningDiTCfg:
     ckpt_path: str | Path | None = None
     load_strict: bool=True
     causal_attention: bool=False
+    text_cond_dim: int | None = None
 class LightningDiT(Denoiser[LightningDiTCfg]):
     def __init__(
         self, 
@@ -113,9 +114,14 @@ class LightningDiT(Denoiser[LightningDiTCfg]):
             self.model.load_state_dict(weights, strict=False)
 
         self.cnd_proj = nn.Linear(cond_dim, inner_dim)
+        self.text_proj = None
+        if cfg.text_cond_dim is not None:
+            self.text_proj = nn.Linear(cfg.text_cond_dim, inner_dim)
 
         if cfg_train:
             self.null_tokens = nn.Parameter(torch.zeros(1, 1, inner_dim))
+            if self.text_proj is not None:
+                self.null_text_tokens = nn.Parameter(torch.zeros(1, 1, inner_dim))
 
         if cfg.ckpt_path is not None:
             self.load_weights(cfg.ckpt_path, strict=cfg.load_strict)
@@ -146,8 +152,25 @@ class LightningDiT(Denoiser[LightningDiTCfg]):
         
 
         latents, pose, timestep, state = inputs.view, inputs.pose, inputs.timestep, inputs.state
+        text = inputs.text
         # latents = latents.to(torch.half)
         pemb = self.pose_embed(pose, temporal_downsample=temporal_downsample)
+
+        if pemb.shape[1] != latents.shape[1]:
+            raise ValueError("Shape mismatch", pose.extrinsics.shape, pemb.shape, latents.shape)
+
+        if text is not None:
+            if self.text_proj is not None:
+                text = self.text_proj(text)
+            elif state is not None and text.shape[-1] != state.shape[-1]:
+                raise ValueError(
+                    f"Text embedding dim {text.shape[-1]} does not match conditioning dim {state.shape[-1]}. "
+                    "Set denoiser.text_cond_dim to enable text projection."
+                )
+            if state is None:
+                state = text
+            else:
+                state = torch.cat([state, text], dim=1)
 
         pemb = rearrange(pemb, "b v c h w -> b v (h w) c")
         sample, qk_list = self.model(latents=latents, pose=pemb.bfloat16(), timestep=timestep, cond_state=state)
