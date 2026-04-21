@@ -15,6 +15,7 @@ context_latent_type: "va"
 target_latent_type: "videodc"
 augment: true
 cameras_are_circular: false
+fps: 24
 precomputed_latents: 
   context: true
   target: true

@@ -13,6 +13,7 @@ baseline_epsilon: 1e-3
 make_baseline: false
 augment: true
 cameras_are_circular: false
+fps: 24
 
 # Kown Bug: refer to docs/KNOWN_BUGS.md
 scale_focal_by_256: false

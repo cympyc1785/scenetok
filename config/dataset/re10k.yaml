@@ -9,6 +9,7 @@ augment: false
 random_transform_extrinsics: false
 background_color: [0.0, 0.0, 0.0]
 cameras_are_circular: false
+fps: 24
 precomputed_latents: 
   context: false
   target: false

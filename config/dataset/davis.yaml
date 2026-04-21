@@ -1,0 +1,31 @@
+defaults:
+  - view_sampler: bounded
+
+name: davis
+root: null
+meta_file: null
+meta_scene_column: scene
+meta_split_column: split
+use_meta_split: true
+overfit_train_all_meta: false
+overfit_val_from_meta_last: false
+shape: [256, 256]
+precomputed_latents:
+  context: false
+  target: false
+baseline_epsilon: 1e-3
+
+make_baseline: false
+augment: false
+cameras_are_circular: false
+fps: 10
+
+camera_file: cameras.json
+context_video_name: inpaint_result_effecterase.mp4
+target_video_name: video_input.mp4
+train_split_ratio: 1.0
+camera_rotation_is_world_to_camera: true
+prompt_file: null
+prompt_source: null
+# prompt_file: dynamic_prompts.json
+# prompt_source: prompt_dynamic_object

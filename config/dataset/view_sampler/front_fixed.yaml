@@ -1,0 +1,10 @@
+name: front_fixed
+
+num_context_views: 0
+num_target_views: 0
+min_context_views: 1
+num_target_split: 1
+chunk_index_gap: 1
+temporal_downsample: 4
+offset: 0
+context_sampling: "uniform"

@@ -5,6 +5,7 @@ from torch import Generator
 
 from .view_sampler import ViewSampler
 from .view_sampler_bounded import ViewSamplerBounded, ViewSamplerBoundedCfg
+from .view_sampler_front_fixed import ViewSamplerFrontFixed, ViewSamplerFrontFixedCfg
 from .view_sampler_unbounded import ViewSamplerUnbounded, ViewSamplerUnboundedCfg
 from .view_sampler_evaluation import ViewSamplerEvaluation, ViewSamplerEvaluationCfg
 from .view_sampler_evaluation_scene import ViewSamplerEvaluationScene, ViewSamplerEvaluationSceneCfg 
@@ -17,6 +18,7 @@ from ...misc.step_tracker import StepTracker
 VIEW_SAMPLERS: dict[str, ViewSampler[Any]] = {
 
     "bounded": ViewSamplerBounded,
+    "front_fixed": ViewSamplerFrontFixed,
     "unbounded": ViewSamplerUnbounded,
     "evaluation": ViewSamplerEvaluation,
     "evaluation_video": ViewSamplerEvaluationVideo,
@@ -27,6 +29,7 @@ VIEW_SAMPLERS: dict[str, ViewSampler[Any]] = {
 
 ViewSamplerCfg = (
     ViewSamplerBoundedCfg
+    | ViewSamplerFrontFixedCfg
     | ViewSamplerEvaluationCfg
     | ViewSamplerEvaluationVideoCfg
     | ViewSamplerEvaluationVideoWanCfg

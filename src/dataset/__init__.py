@@ -11,6 +11,7 @@ from .dataset_re10k import DatasetRE10k, DatasetRE10kCfg
 from .dataset_dl3dv import DatasetDL3DV, DatasetDL3DVCfg
 from .dataset_re10k import DatasetRE10k, DatasetRE10kCfg
 from .dataset_latent import DatasetLatent, DatasetLatentCfg
+from .dataset_davis import DatasetDAVIS, DatasetDAVISCfg
 
 
 
@@ -18,6 +19,7 @@ DATASETS: dict[str, Dataset] = {
     "re10k": DatasetRE10k,
     "dl3dv": DatasetDL3DV,
     "latent": DatasetLatent,
+    "davis": DatasetDAVIS,
 }
 
 
@@ -25,6 +27,7 @@ DatasetCfg = (
     DatasetDL3DVCfg 
     | DatasetLatentCfg
     | DatasetRE10kCfg
+    | DatasetDAVISCfg
 
 )
 
