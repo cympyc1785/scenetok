@@ -122,7 +122,7 @@ class Metric(nn.Module):
     def compute_fid(self, pred=None, gt=None, update=True, num_views: int=16):
         
         if update:
-            self.update_fid(pred, gt)
+            self.update_fid(pred, gt, num_views=num_views)
         
         fid = self.fid.compute()
 
@@ -132,7 +132,7 @@ class Metric(nn.Module):
     def compute_fvd(self, pred=None, gt=None, update=True, num_views: int=16):
 
         if update:
-            self.update_fvd(pred, gt)
+            self.update_fvd(pred, gt, num_views=num_views)
         
         pred_tensor = torch.cat(self.pred_list, dim=0)
         gt_tensor = torch.cat(self.gt_list, dim=0)
