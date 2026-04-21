@@ -23,6 +23,8 @@ class ViewSamplerEvaluationVideoCfg:
     max_cond_number: int=3
     chunk_index_gap: int=4
     offset: int=0
+    num_target_split: int=1
+
 class ViewSamplerEvaluationVideo(ViewSampler[ViewSamplerEvaluationVideoCfg]):
     index: dict[str, list[IndexEntry]]
 
