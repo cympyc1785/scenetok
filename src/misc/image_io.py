@@ -341,7 +341,7 @@ def prep_video(video) -> UInt8[np.ndarray, "frame 3 height width"]:
 #     write_video(str(path), video.transpose(0, 2, 3, 1), **kwargs)
     
     
-def save_image_video(images, indices, output_dir, name, save_img: bool=True, save_video: bool=True):
+def save_image_video(images, indices, output_dir, name, save_img: bool=True, save_video: bool=True, fps=24):
     
     os.makedirs(output_dir, exist_ok=True)
     if save_img:
@@ -361,8 +361,55 @@ def save_image_video(images, indices, output_dir, name, save_img: bool=True, sav
     if save_video:
         images = images.permute(0, 2, 3, 1) * 255
         original_image_pil = [np.asarray(img) for img in images.cpu()]
-        h_fps = ImageSequenceClip(original_image_pil, fps=24)
+        h_fps = ImageSequenceClip(original_image_pil, fps=fps)
         # l_fps = ImageSequenceClip(original_image_pil, fps=10)
-        h_fps.write_videofile(str(output_dir / f"{name}.mp4"),fps=24)
+        h_fps.write_videofile(str(output_dir / f"{name}.mp4"),fps=fps)
     
     # l_fps.write_videofile(str(output_dir / scene / f"{name}_10.mp4"),fps=10)
+
+def get_uncertainty_viz(uncertainty_raw_map):
+    num_uncertainty_views = uncertainty_maps.shape[1]
+    num_sampled_views = sampled_views.shape[1]
+    uncertainty_min = uncertainty_maps.reshape(b, uncertainty_maps.shape[1], -1).min(dim=-1).values
+    uncertainty_max = uncertainty_maps.reshape(b, uncertainty_maps.shape[1], -1).max(dim=-1).values
+    uncertainty_maps = (uncertainty_maps - uncertainty_min[..., None, None]) / (
+        uncertainty_max[..., None, None] - uncertainty_min[..., None, None] + 1e-6
+    )
+    uncertainty_maps = uncertainty_maps.unsqueeze(2)
+    uncertainty_maps = F.interpolate(
+        rearrange(uncertainty_maps, "b v c h w -> (b v) c h w"),
+        size=sampled_views.shape[-2:],
+        mode="bilinear",
+        align_corners=False,
+    )
+    uncertainty_maps = rearrange(
+        uncertainty_maps,
+        "(b v) c h w -> b v c h w",
+        b=b,
+        v=num_uncertainty_views,
+    )
+    if num_uncertainty_views != num_sampled_views:
+        if num_sampled_views % num_uncertainty_views == 0:
+            repeat_factor = num_sampled_views // num_uncertainty_views
+            uncertainty_maps = repeat(
+                uncertainty_maps,
+                "b v c h w -> b (v r) c h w",
+                r=repeat_factor,
+            )
+        else:
+            time_idx = torch.linspace(
+                0,
+                num_uncertainty_views - 1,
+                steps=num_sampled_views,
+                device=uncertainty_maps.device,
+            ).round().long()
+            uncertainty_maps = uncertainty_maps[:, time_idx]
+    uncertainty_vis = []
+    for batch_maps in uncertainty_maps:
+        batch_vis = []
+        for frame_map in batch_maps:
+            colored = colorize(frame_map[0].detach().cpu().numpy())
+            batch_vis.append(torch.from_numpy(colored).permute(2, 0, 1).float() / 255.0)
+        uncertainty_vis.append(torch.stack(batch_vis))
+    
+    return torch.stack(uncertainty_vis).to(sampled_views.device)

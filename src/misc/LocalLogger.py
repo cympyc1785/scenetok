@@ -2,10 +2,12 @@ import os
 from pathlib import Path
 from typing import Any, Optional
 import torch
+import numpy as np
 from PIL import Image
 from lightning.pytorch.loggers.logger import Logger
 from lightning.pytorch.utilities import rank_zero_only
-from torchvision.io import write_video
+# from torchvision.io import write_video
+import imageio.v3 as iio
 
 LOG_PATH = Path("outputs/local")
 
@@ -60,26 +62,34 @@ class LocalLogger(Logger):
         format: list[str],
         **kwargs,
     ):
-        # The function signature is the same as the wandb logger's, but the step is
-        # actually required.
-        
         assert step is not None
+
         for index, video in enumerate(videos):
-            fmat= format[index]
+            fmat = format[index]
             cap = caption[index]
             path = LOG_PATH / f"{key}/{cap}_{step:0>6}.{fmat}"
             path.parent.mkdir(exist_ok=True, parents=True)
-            video = torch.from_numpy(video).permute(0, 2, 3, 1).cpu()
+
+            # (T, C, H, W) → (T, H, W, C)
+            if isinstance(video, np.ndarray):
+                video = torch.from_numpy(video)
+
+            video = video.permute(0, 2, 3, 1).cpu().numpy()
+
+            # dtype 처리 (imageio는 uint8 권장)
+            if video.dtype != np.uint8:
+                video = np.clip(video, 0, 255)
+                video = video.astype(np.uint8)
+
             print(video.shape, video.dtype)
             print(path)
             print(cap)
             print(fmat)
             print(fps[index])
-            write_video(
-                filename=path,
-                video_array=video,
+
+            iio.imwrite(
+                path,
+                video,
                 fps=fps[index],
-                video_codec='libx264',
-                options={"crf": "20"}
             )
             
