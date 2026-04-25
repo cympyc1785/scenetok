@@ -1,0 +1,456 @@
+from .diffusion import first_stage_encode
+from .diffusion_wrapper import *
+
+
+class T2VWrapper(DiffusionWrapper):
+    def should_use_condition_latents(self):
+        return (
+            getattr(self.denoiser, "supports_condition_latents", False)
+            and getattr(self.denoiser, "use_condition_latents", True)
+        )
+
+    def preprocess_scene_tokens(self, scene_tokens, shape, device, token_mask=None):
+        if not getattr(self.denoiser, "supports_scene_tokens", True):
+            return None
+
+        return super().preprocess_scene_tokens(scene_tokens, shape, device, token_mask)
+
+    def _init_text_encoder(self):
+        if self.model_cfg.text_encoder is None:
+            return
+        if getattr(self.denoiser, "uses_internal_text_encoder", False):
+            self.text_tokenizer = getattr(self.denoiser, "text_tokenizer", None)
+            self.text_encoder = getattr(self.denoiser, "text_encoder", None)
+            self.text_condition_proj = None
+            return
+        return super()._init_text_encoder()
+
+    def get_text_condition(self, batch, device=None):
+        target_device = self.device if device is None else device
+        if getattr(self.denoiser, "uses_internal_text_encoder", False):
+            if "text_embedding" in batch and batch["text_embedding"] is not None:
+                return batch["text_embedding"].to(target_device)
+            text = batch.get("text")
+            if text is None:
+                return None
+            return self.denoiser.encode_text_condition(text, device=target_device)
+
+        return super().get_text_condition(batch, device=device)
+
+    def get_autoencoder_name(self, view_type: str):
+        cfg = getattr(self.model_cfg.autoencoders, view_type)
+        return None if cfg is None else cfg.name
+
+    def get_autoencoder_scaling_factor(self, view_type: str):
+        cfg = getattr(self.model_cfg.autoencoders, view_type)
+        return 1.0 if cfg is None else cfg.kwargs.scaling_factor
+
+    def get_condition_latents(self, batch, device, dtype):
+        if not self.should_use_condition_latents():
+            return None
+
+        target_cfg = getattr(self.model_cfg.autoencoders, "target")
+        context_cfg = getattr(self.model_cfg.autoencoders, "context")
+        target_name = target_cfg.name
+        target_scale = target_cfg.kwargs.scaling_factor
+
+        if self.dataset_cfg.precomputed_latents["context"]:
+            if context_cfg is None or context_cfg.name != target_name:
+                raise ValueError(
+                    "Wan TI2V conditioning requires raw context images or matching context/target autoencoders "
+                    "when precomputed context latents are enabled."
+                )
+            condition_latents = get_latents(
+                autoencoder=self.autoencoder,
+                inputs=batch["context"],
+                view_type="context",
+                precomputed_latents=self.dataset_cfg.precomputed_latents,
+                autoencoder_name=context_cfg.name,
+                scaling_factor=context_cfg.kwargs.scaling_factor,
+            )[:, :1]
+        else:
+            condition_latents = first_stage_encode(
+                autoencoder=self.autoencoder,
+                inputs=batch["context"]["latent"][:, :1],
+                view_type="target",
+                autoencoder_name=target_name,
+                scaling_factor=target_scale,
+            )
+
+        return condition_latents.to(device=device, dtype=dtype)
+
+    def prepare_target_pose(self, target, num_latents: Optional[int] = None):
+        target_cfg = getattr(self.model_cfg.autoencoders, "target")
+        target_name = None if target_cfg is None else target_cfg.name
+        temporal_downsample = 4 if target_name in ["video_dc", "wan"] else 1
+        intrinsics = target["intrinsics"]
+        extrinsics = target["extrinsics"]
+        num = num_latents
+
+        if target_name == "video_dc":
+            if num is None:
+                num = extrinsics.shape[1] // temporal_downsample
+            num_pose_views = num * temporal_downsample
+            intrinsics = intrinsics[:, :num_pose_views]
+            extrinsics = extrinsics[:, :num_pose_views]
+        elif target_name == "wan":
+            if num is None:
+                num_chunks = extrinsics.shape[1] // 17
+            else:
+                num_chunks = num_latents // 5
+            num = num_chunks * 5
+            num_pose_views = num_chunks * 17
+            intrinsics = intrinsics[:, :num_pose_views]
+            extrinsics = extrinsics[:, :num_pose_views]
+
+        return CameraInputs(intrinsics=intrinsics, extrinsics=extrinsics), temporal_downsample, num
+
+    @torch.no_grad()
+    def generate_batch_with_scene(self, batch, sampler: Sampler, repeat_factor: int = 1):
+        context_latents = get_latents(
+            autoencoder=self.autoencoder,
+            inputs=batch["context"],
+            view_type="context",
+            precomputed_latents=self.dataset_cfg.precomputed_latents,
+            autoencoder_name=self.get_autoencoder_name("context"),
+            scaling_factor=self.get_autoencoder_scaling_factor("context"),
+        )
+
+        target = repeat_batch(batch["target"], repeat_factor)
+        device = context_latents.device
+        dtype = context_latents.dtype
+        text_state = self.get_text_condition(batch, device=device)
+        if text_state is not None:
+            text_state = einops.repeat(text_state, "b n d -> (b r) n d", r=repeat_factor)
+
+        b, v_t, *_ = target["extrinsics"].shape
+        target_pose, temporal_downsample, num = self.prepare_target_pose(target)
+        if num is None:
+            num = v_t
+
+        target_cfg = getattr(self.model_cfg.autoencoders, "target")
+        if target_cfg is not None:
+            if target_cfg.name in ["kl"]:
+                c = target_cfg.kwargs.latent_channels // 2
+            else:
+                c = target_cfg.kwargs.latent_channels
+        else:
+            c = 3
+
+        input_shape = self.model_cfg.denoiser.input_shape
+        if isinstance(input_shape, int):
+            h = w = input_shape
+        else:
+            h, w = input_shape
+
+        x_t = torch.randn((b, num, c, h, w), device=device, dtype=dtype)
+        x_t *= self.scheduler.init_noise_sigma
+
+        context_camera = CameraInputs(
+            intrinsics=batch["context"]["intrinsics"],
+            extrinsics=batch["context"]["extrinsics"],
+        )
+
+        if self.model_cfg.compressor is None:
+            scene_tokens = None
+        else:
+            context_inputs = CompressorInputs(
+                view=context_latents,
+                pose=context_camera,
+                mask=None,
+            )
+            tokens, _ = self.compressor._forward(inputs=context_inputs)
+            if self.model_cfg.compressor.scene_token_projection == "kl":
+                scene_tokens = tokens.sample()
+            else:
+                scene_tokens = tokens
+            scene_tokens = repeat(scene_tokens, "b ... -> (b n) ...", n=repeat_factor)
+
+        sampler.set_scheduling_matrix(
+            horizon=num,
+            steps=self.model_cfg.scheduler.num_inference_steps,
+            concurrency=self.dataset_cfg.view_sampler.num_target_views,
+            device=device,
+            dtype=dtype,
+            cond_mask_indices=None,
+        )
+        if self.model_cfg.scheduler.kwargs.weighting == "shifted":
+            print(f"(Sampler) Shifting scheduling matrix by {self.model_cfg.scheduler.kwargs.timestep_shift}")
+            sampler.shift_scheduling_matrix(self.model_cfg.scheduler.kwargs.timestep_shift)
+        sampler.log_vis(self.logger, step=self.step_tracker, name=f"({sampler.cfg.name})")
+        print("Shape of latents: ", x_t.shape)
+        return *sample(
+            model=self.denoiser,
+            x_t=x_t,
+            target_pose=target_pose,
+            cond_state=scene_tokens,
+            text_state=text_state,
+            sampler=sampler,
+            scheduler=self.scheduler,
+            autoencoder=self.autoencoder,
+            temporal_downsample=temporal_downsample,
+            cfg_scale=self.model_cfg.cfg_scale,
+            autoencoder_name=target_cfg.name,
+            scaling_factor=target_cfg.kwargs.scaling_factor,
+            chunk_index_gap=self.dataset_cfg.view_sampler.chunk_index_gap,
+            offset=self.dataset_cfg.view_sampler.offset,
+        ), scene_tokens
+
+    def training_step(self, batch, batch_idx):
+        if self.step_tracker is not None:
+            self.step_tracker.set_step(self.global_step)
+            self.log("step_tracker/step", self.step_tracker.get_step())
+
+        batch = preprocess_batch(batch)
+        target_latents = get_latents(
+            autoencoder=self.autoencoder,
+            inputs=batch["target"],
+            view_type="target",
+            precomputed_latents=self.dataset_cfg.precomputed_latents,
+            autoencoder_name=self.get_autoencoder_name("target"),
+            scaling_factor=self.get_autoencoder_scaling_factor("target"),
+        )
+
+        device = target_latents.device
+        dtype = target_latents.dtype
+        target_pose, temporal_downsample, num_target_latents = self.prepare_target_pose(
+            batch["target"],
+            num_latents=target_latents.shape[1],
+        )
+        if num_target_latents is not None and num_target_latents != target_latents.shape[1]:
+            target_latents = target_latents[:, :num_target_latents]
+        b, v_t, *_ = target_latents.shape
+
+        conditional_tokens = True
+        if self.train_cfg.cfg_train and not self.freeze_cfg.denoiser:
+            conditional_tokens = np.random.choice([True, False], 1, p=[0.90, 0.10])
+
+        token_mask = None
+        if conditional_tokens and self.model_cfg.compressor is not None:
+            context_latents = get_latents(
+                autoencoder=self.autoencoder,
+                inputs=batch["context"],
+                view_type="context",
+                precomputed_latents=self.dataset_cfg.precomputed_latents,
+                autoencoder_name=self.get_autoencoder_name("context"),
+                scaling_factor=self.get_autoencoder_scaling_factor("context"),
+            )
+            b_c, v_c, *_ = context_latents.shape
+            if self.model_cfg.mask_context and np.random.choice([True, False], p=[0.4, 0.6]):
+                context_mask = generate_biased_boolean_mask((b_c, v_c), self.dataset_cfg.view_sampler.min_context_views).to(context_latents.device)
+            else:
+                context_mask = None
+
+            context_inputs = CompressorInputs(
+                view=context_latents,
+                pose=CameraInputs(
+                    intrinsics=batch["context"]["intrinsics"],
+                    extrinsics=batch["context"]["extrinsics"],
+                ),
+                mask=context_mask,
+            )
+            if self.frozen_compressor:
+                with torch.no_grad():
+                    tokens, *_ = self.compressor(inputs=context_inputs)
+            else:
+                tokens, *_ = self.compressor(inputs=context_inputs)
+
+            if self.model_cfg.compressor.scene_token_projection == "kl":
+                scene_tokens = tokens.sample()
+            else:
+                scene_tokens = tokens
+
+            if self.model_cfg.noisy_scene_tokens and np.random.choice([True, False], p=[self.model_cfg.noise_prob, 1 - self.model_cfg.noise_prob]):
+                scene_noise = torch.randn_like(scene_tokens, device=device)
+                timestep_scene = self.get_noise_level((b, self.compressor.num_scene_tokens), dtype=dtype, mu=self.model_cfg.mu, sigma=self.model_cfg.sigma)
+                scene_tokens = self.scheduler.add_noise(scene_tokens, scene_noise, timestep_scene)
+
+            if self.model_cfg.mask_tokens:
+                token_mask, _, _ = random_mask_biased(B=scene_tokens.shape[0], N=scene_tokens.shape[1], M=0.6, device="cpu")
+        else:
+            scene_tokens = None
+
+        use_scalar_timestep = (
+            self.should_use_condition_latents()
+            and getattr(self.denoiser, "lock_condition_frame", False)
+            and not getattr(self.denoiser, "uses_internal_text_encoder", False)
+        )
+        if use_scalar_timestep:
+            timestep_shape = ()
+        elif not getattr(self.denoiser, "supports_per_view_timestep", True):
+            timestep_shape = (b,)
+        elif self.model_cfg.scheduler.sampling_type == "random_uniform":
+            timestep_shape = (b,)
+        elif self.model_cfg.scheduler.sampling_type == "random_chunked_uniform":
+            timestep_shape = (b, self.dataset_cfg.view_sampler.num_target_split)
+        elif self.model_cfg.scheduler.sampling_type == "random_independent":
+            timestep_shape = (b, v_t)
+        else:
+            raise NotImplementedError(f"Sampling type in scheduler is not correctly specified and instead got {self.model_cfg.scheduler.sampling_type}")
+
+        if (
+            not use_scalar_timestep
+            and np.random.choice([True, False], p=[0.2, 0.8])
+            and self.model_cfg.enforce_uniform_noise
+        ):
+            timestep_shape = (b,)
+
+        timestep = self.get_noise_level(timestep_shape, dtype=dtype)
+        if timestep.ndim == 1:
+            timestep = repeat(timestep, "b -> b v", v=v_t)
+        elif timestep.ndim == 2 and self.model_cfg.scheduler.sampling_type == "random_chunked_uniform":
+            timestep = repeat(timestep, "b n -> b (n v)", v=self.dataset_cfg.view_sampler.num_target_views // self.dataset_cfg.view_sampler.num_target_split)
+
+        if self.model_cfg.force_clean:
+            if use_scalar_timestep:
+                raise ValueError("force_clean is not supported with Wan TI2V locked first-frame conditioning.")
+            target_cond_mask = self.get_conditioning_mask((b, v_t), device=device, dtype=dtype)
+            timestep = timestep * target_cond_mask
+
+        noise = torch.randn_like(target_latents, device=device)
+        noisy_latents = self.scheduler.add_noise(target_latents, noise, timestep)
+        condition_latents = self.get_condition_latents(batch, device=device, dtype=dtype)
+        if condition_latents is not None and getattr(self.denoiser, "lock_condition_frame", False):
+            noisy_latents[:, : condition_latents.shape[1]] = condition_latents
+
+        scene_tokens = self.preprocess_scene_tokens(
+            scene_tokens=scene_tokens,
+            shape=(b, self.denoiser.num_scene_tokens, self.denoiser.cond_dim),
+            device=device,
+            token_mask=token_mask,
+        )
+
+        denoiser_input = DenoiserInputs(
+            view=noisy_latents,
+            pose=target_pose,
+            timestep=self.rescale_timesteps(timestep=timestep),
+            state=scene_tokens,
+            text=self.get_text_condition(batch, device=device),
+            condition_latents=condition_latents,
+        )
+
+        pred, _ = self.denoiser(
+            inputs=denoiser_input,
+            temporal_downsample=temporal_downsample,
+        )
+        gt = self.process_gt(target_latents, noise, timestep)
+        if pred.shape[1] != gt.shape[1]:
+            raise RuntimeError("prediction shape mismatch", pred.shape, gt.shape)
+        if condition_latents is not None and getattr(self.denoiser, "lock_condition_frame", False):
+            pred = pred[:, condition_latents.shape[1]:]
+            gt = gt[:, condition_latents.shape[1]:]
+            if self.model_cfg.force_clean:
+                target_cond_mask = target_cond_mask[:, condition_latents.shape[1]:]
+
+        loss = F.mse_loss(pred, gt, reduction="none")
+        if self.model_cfg.force_clean:
+            loss = einops.reduce(loss, "b v c h w -> b v", "mean")
+            loss = loss * target_cond_mask
+            loss = loss.sum(-1) / target_cond_mask.sum(-1)
+        else:
+            loss = einops.reduce(loss, "b v c h w -> b", "mean")
+
+        if self.model_cfg.compressor is not None and self.model_cfg.compressor.scene_token_projection == "kl" and conditional_tokens and not self.frozen_compressor:
+            kl = tokens.kl()
+            kl_weight = 0.0
+            if self.global_step <= self.model_cfg.compressor.kl_schedule[0]:
+                kl_weight = self.model_cfg.compressor.kl_weights[0]
+            elif self.global_step <= self.model_cfg.compressor.kl_schedule[1]:
+                t = (self.global_step - self.model_cfg.compressor.kl_schedule[0]) / (self.model_cfg.compressor.kl_schedule[1] - self.model_cfg.compressor.kl_schedule[0])
+                kl_weight = (1 - t) * self.model_cfg.compressor.kl_weights[0] + t * self.model_cfg.compressor.kl_weights[1]
+            else:
+                kl_weight = self.model_cfg.compressor.kl_weights[1]
+            loss = loss + kl_weight * kl
+            self.log("loss/kl", kl.mean())
+
+        loss = loss.mean()
+        current_lr = self.optimizers().param_groups[0]["lr"]
+        if self.global_rank == 0:
+            print(f"Train step {self.step_tracker.get_step()}; loss = {loss.item():.4f} lr = {current_lr}")
+        self.log("loss/diffusion", loss)
+        return loss
+
+    def on_train_batch_start(self, batch, batch_idx):
+        step = self.global_step
+        if (
+            self.model_cfg.compressor is not None
+            and step >= self.model_cfg.compressor.freeze_after
+            and self.model_cfg.compressor.freeze_after != -1
+            and not self.frozen_compressor
+        ):
+            print(f"[INFO] Freezing Compressor after {step} steps!")
+            freeze(self.compressor)
+            self.frozen_compressor = True
+
+        if self.optimizer_cfg.scheduler is None:
+            return
+
+        if type(self.optimizer_cfg.scheduler) != list:
+            warmup_iters = self.optimizer_cfg.scheduler.kwargs.get("total_iters", 0)
+            if step < warmup_iters and not self.override_applied:
+                self.print(f"[INFO] Warmup not done yet! Current step {step} < {warmup_iters}. Overriding will happen afterwards!")
+                self.override_applied = True
+
+            if step >= warmup_iters and not self.override_applied:
+                for group in self.trainer.optimizers[0].param_groups:
+                    ckpt_lr = group["lr"]
+                    if ckpt_lr != self.lr:
+                        group["lr"] = self.lr
+                        self.print(f"[INFO] Warmup done at step {step}. Overriding LR from {ckpt_lr} to {self.lr}")
+                        self.override_applied = True
+        else:
+            if self.optimizer_cfg.override_lr is not None and not self.override_applied:
+                for group in self.trainer.optimizers[0].param_groups:
+                    ckpt_lr = group["lr"]
+                    if ckpt_lr != self.optimizer_cfg.override_lr:
+                        group["lr"] = self.optimizer_cfg.override_lr
+                        self.print(f"[INFO] Overriding LR from {ckpt_lr} to {self.optimizer_cfg.override_lr}")
+                        self.override_applied = True
+
+    @staticmethod
+    def get_lr_scheduler(opt: optim.Optimizer, optim_cfg: OptimizerCfg):
+        lr_scheduler_cfg = optim_cfg.scheduler
+        if lr_scheduler_cfg is None:
+            return None
+        if type(lr_scheduler_cfg) == list:
+            schedulers = [
+                getattr(optim.lr_scheduler, cfg.name)(
+                    opt,
+                    **(cfg.kwargs if cfg.kwargs is not None else {}),
+                )
+                for cfg in lr_scheduler_cfg
+            ]
+            if len(schedulers) == 1:
+                return schedulers[0]
+            return optim.lr_scheduler.SequentialLR(
+                optimizer=opt,
+                schedulers=schedulers,
+                milestones=optim_cfg.milestones,
+            )
+        return getattr(optim.lr_scheduler, lr_scheduler_cfg.name)(
+            opt,
+            **(lr_scheduler_cfg.kwargs if lr_scheduler_cfg.kwargs is not None else {}),
+        )
+
+    def configure_optimizers(self):
+        optimizer = self.get_optimizer(
+            self.optimizer_cfg,
+            [{"params": self.denoiser.parameters()}],
+            self.lr,
+        )
+        if self.optimizer_cfg.scheduler is None:
+            return optimizer
+        if type(self.optimizer_cfg.scheduler) == list:
+            frequency = self.optimizer_cfg.scheduler[0].frequency
+            interval = self.optimizer_cfg.scheduler[0].interval
+        else:
+            frequency = self.optimizer_cfg.scheduler.frequency
+            interval = self.optimizer_cfg.scheduler.interval
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": self.get_lr_scheduler(optimizer, self.optimizer_cfg),
+                "frequency": frequency,
+                "interval": interval,
+            },
+        }

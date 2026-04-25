@@ -10,14 +10,18 @@ import warnings
 
 from pathlib import Path
 from torch import manual_seed, load
+from torch.utils.data import DataLoader
 from colorama import Fore
 from omegaconf import DictConfig, OmegaConf
+from tqdm import tqdm
 
-from lightning.pytorch import Trainer
+from lightning.pytorch import Trainer, LightningModule
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers.wandb import WandbLogger
 
 from src.config import load_typed_root_config
+from src.dataset import get_dataset
+from src.dataset.dataset_dl3dv import build_dl3dv_meta
 from src.dataset.data_module import DataModule
 from src.global_cfg import set_cfg
 from src.misc.LocalLogger import LocalLogger
@@ -25,12 +29,50 @@ from src.misc.step_tracker import StepTracker
 from src.misc.wandb_tools import update_checkpoint_path
 from src.misc.graceful_exit import GracefulExitCallback
 from src.model.diffusion_wrapper import DiffusionWrapper
+from src.model.t2v_wrapper import T2VWrapper
 from src.profiler import get_profiler
 
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
 def cyan(text: str) -> str:
     return f"{Fore.CYAN}{text}{Fore.RESET}"
+
+
+def preprocess_dataset_cache(cfg, step_tracker):
+    data_module = DataModule(cfg.dataset, cfg.data_loader, step_tracker)
+    num_workers = 8
+    stages = [
+        ("train", cfg.data_loader.train),
+        ("val", next(iter(cfg.data_loader.val.values()))),
+        ("test", cfg.data_loader.test),
+    ]
+
+    for stage, loader_cfg in stages:
+        generator = data_module.get_generator(loader_cfg)
+        print(cyan(f"Building {stage} dataset index..."))
+        if cfg.dataset.name == "dl3dv":
+            meta_path = build_dl3dv_meta(cfg.dataset, stage, force=False)
+            print(cyan(f"Using DL3DV meta: {meta_path}"))
+        dataset = get_dataset(cfg.dataset, stage, step_tracker, generator, force_shuffle=False)
+        print(cyan(f"Preprocessing {stage} dataset: {len(dataset)} scenes with {num_workers} workers."))
+
+        loader = DataLoader(
+            dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=num_workers,
+            generator=generator,
+            persistent_workers=num_workers > 0,
+            collate_fn=lambda batch: [item for item in batch if item is not None],
+        )
+        for _ in tqdm(
+            loader,
+            total=len(dataset),
+            desc=f"preprocess {stage}",
+            unit="scene",
+            dynamic_ncols=True,
+        ):
+            pass
 
 
 @hydra.main(
@@ -50,6 +92,11 @@ def train(cfg_dict: DictConfig):
         hydra.core.hydra_config.HydraConfig.get()["runtime"]["output_dir"]
     )    
     print(cyan(f"Saving outputs to {output_dir}."))
+
+    if cfg.mode == "preprocess_data":
+        step_tracker = StepTracker(cfg.train.step_offset)
+        preprocess_dataset_cache(cfg, step_tracker)
+        return
 
     # Set up logging with wandb.
     callbacks = []
@@ -71,10 +118,14 @@ def train(cfg_dict: DictConfig):
         if wandb.run is not None:
             wandb.run.log_code("src")
     else:
-        logger = LocalLogger()
+        logger = LocalLogger(output_dir, clean=False)
 
     # Set up checkpointing.
-    checkpoint_dir = output_dir / "checkpoints"
+    checkpoint_dir = Path(
+        cfg.checkpointing.dirpath
+        if cfg.checkpointing.dirpath is not None
+        else output_dir / "checkpoints"
+    )
     if cfg.checkpointing.save:
         # if cfg.checkpointing.every_n_train_steps is not None:
         callbacks.append(
@@ -119,7 +170,12 @@ def train(cfg_dict: DictConfig):
         val_check_interval=cfg.trainer.val_check_interval,
         mode=cfg.mode,
     )
-    if cfg.mode == "train" and checkpoint_path is not None and not resume:
+    if cfg.model.denoiser.name == "wan_ti2v_5b":
+        if cfg.mode == "train" and checkpoint_path is not None and not resume:
+            model_wrapper = T2VWrapper.load_from_checkpoint(checkpoint_path, **kwargs)
+        else:
+            model_wrapper = T2VWrapper(**kwargs)
+    elif cfg.mode == "train" and checkpoint_path is not None and not resume:
         # Just load model weights but no optimizer state
         model_wrapper = DiffusionWrapper.load_from_checkpoint(checkpoint_path, **kwargs)
     else:
@@ -155,7 +211,7 @@ def train(cfg_dict: DictConfig):
         max_steps=max_steps,
         strategy=cfg.trainer.strategy,
         accumulate_grad_batches=cfg.trainer.accumulate_grad_batches,
-        limit_test_batches=cfg.trainer.limit_test_batches,
+        # limit_test_batches=cfg.trainer.limit_test_batches,
         profiler=get_profiler(cfg.trainer.profiler)
     )
     # model_wrapper.strict_loading = True

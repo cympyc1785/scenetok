@@ -21,6 +21,8 @@ from lightning.pytorch import LightningModule
 from lightning.pytorch.loggers.wandb import WandbLogger
 from lightning.pytorch.utilities import rank_zero_only
 
+import imageio
+
 from .metrics import Metric
 from .denoiser import get_denoiser
 from .scheduler import get_scheduler
@@ -409,7 +411,9 @@ class SceneWrapper(LightningModule):
             model = self.ema
         else:
             model = self.scene_generator
-        cond_mask = torch.zeros((b, self.dataset_cfg.view_sampler.max_cond_number), device=device, dtype=torch.bool)
+        # cond_mask = torch.zeros((b, self.dataset_cfg.view_sampler.max_cond_number), device=device, dtype=torch.bool)
+        mask_num = max(num_cond, self.dataset_cfg.view_sampler.max_cond_number)
+        cond_mask = torch.zeros((b, mask_num), device=device, dtype=torch.bool)
         cond_mask[:, :num_cond] = True
         pbar = tqdm(range(self.scene_sampler.global_steps), desc=f"Sampling Scene with {num_cond} conditioning: ")
         for m in pbar:
@@ -483,6 +487,35 @@ class SceneWrapper(LightningModule):
             intrinsics=batch["context"]["intrinsics"],
             extrinsics=batch["context"]["extrinsics"]
         )
+
+        # target_intr = batch["target"]["intrinsics"]   # (b, v_t, 3, 3)
+        # target_ext = batch["target"]["extrinsics"]    # (b, v_t, 4, 4)
+
+        # # equally spaced indices
+        # num_anchors = 12
+        # idx = torch.linspace(0, v_t - 1, steps=num_anchors, device=target_ext.device)
+        # idx = idx.long()  # (num_anchors,)
+
+        # # expand for batch
+        # idx = idx.unsqueeze(0).expand(b, -1)  # (b, num_anchors)
+
+        # # gather
+        # anchor_intr = torch.gather(
+        #     target_intr,
+        #     dim=1,
+        #     index=idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 3, 3)
+        # )
+        # anchor_ext = torch.gather(
+        #     target_ext,
+        #     dim=1,
+        #     index=idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 4, 4)
+        # )
+
+        # anchor_pose = CameraInputs(
+        #     intrinsics=anchor_intr,
+        #     extrinsics=anchor_ext
+        # )
+
         cond_pose=CameraInputs(
             intrinsics=batch["cond"]["intrinsics"],
             extrinsics=batch["cond"]["extrinsics"]
@@ -885,6 +918,16 @@ class SceneWrapper(LightningModule):
             "latent": batch["context"]["latent"].clone()[:, [0, -1, -1]],  
             "index": batch["context"]["index"].clone()[:, [0, -1, -1]]
         }
+        # self.test_cfg.num_condition_views = 2
+        # self.test_cfg.num_condition_views = batch["context"]["extrinsics"].shape[1]
+        # num_cond = self.test_cfg.num_condition_views
+
+        # batch["cond"] = {
+        #     "extrinsics": batch["context"]["extrinsics"].clone()[:, :num_cond],
+        #     "intrinsics": batch["context"]["intrinsics"].clone()[:, :num_cond],
+        #     "latent": batch["context"]["latent"].clone()[:, :num_cond],  
+        #     "index": batch["context"]["index"].clone()[:, :num_cond]
+        # }
         device = batch["target"]["extrinsics"].device
         ctxt_idx = torch.linspace(0, v_t - 1, 12, device=device).long()
         batch["context"]["extrinsics"] = batch["target"]["extrinsics"].clone()[:, ctxt_idx]
@@ -916,7 +959,7 @@ class SceneWrapper(LightningModule):
                 images=sampled_views_gen[j], 
                 indices=torch.arange(0, sampled_views_gen[j].shape[0]), 
                 output_dir=self.output_dir / "predicted"/ batch["scene"][j],
-                name=self.sampler.cfg.name + "_gen", save_img=True, save_video=False
+                name=self.sampler.cfg.name + "_gen", save_img=True, save_video=True
             )
 
                 
@@ -925,21 +968,21 @@ class SceneWrapper(LightningModule):
                 images=target_views[j], 
                 indices=batch["target"]["index"][j], 
                 output_dir=self.output_dir/ "gt" / batch["scene"][j] ,
-                name="original", save_img=True, save_video=False
+                name="original", save_img=True, save_video=True
             )
 
             save_image_video(
                 images=context_views[j], 
                 indices=batch["context"]["index"][j], 
                 output_dir=self.output_dir / "context" /  batch["scene"][j],
-                name="context", save_video=False
+                name="context", save_video=True
             )
 
             save_image_video(
                 images=cond_views[j, :self.test_cfg.num_condition_views], 
                 indices=batch["cond"]["index"][j], 
                 output_dir=self.output_dir / "cond"/ batch["scene"][j],
-                name="cond", save_video=False
+                name="cond", save_video=True
             )
         
 

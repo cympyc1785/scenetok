@@ -29,6 +29,7 @@ class DatasetRE10kCfg(DatasetCfgCommon):
     baseline_epsilon: float
     max_fov: float
     make_baseline: bool
+    random_transform_extrinsics = False
 
 
 class DatasetRE10k(Dataset):

@@ -732,14 +732,13 @@ class DiffusionWrapper(LightningModule):
 
         # Sample target views
         sampled_views, _, _ = self.generate_batch_with_scene(batch, self.sampler)
+        b, v_t, c, h, w = sampled_views.shape
+        target_views = target_views[:, :v_t]
         self.generated.append(sampled_views)
         self.predicted.append(target_views)
         # Only do remaining on Rank: 0 in case of multi-gpu/node
         if self.global_rank != 0:
             return None
-
-
-        b, v_t, c, h, w = sampled_views.shape
 
         batch_vis = []
         batch_scene = []
@@ -794,8 +793,8 @@ class DiffusionWrapper(LightningModule):
 
         if len(self.predicted) == 0 or len(self.generated) == 0:
             return None
-        sampled_views = torch.concat(self.predicted)
-        target_views = torch.concat(self.generated)
+        sampled_views = torch.concat(self.generated)
+        target_views = torch.concat(self.predicted)
         print(sampled_views.shape)
         print(target_views.shape)
         metrics = self.metric(sampled_views.flatten(0, 1), target_views.flatten(0, 1), psnr=True, ssim=True, lpips=True)
@@ -814,6 +813,11 @@ class DiffusionWrapper(LightningModule):
         if getattr(self.model_cfg.autoencoders, "target") is not None:
             if getattr(self.model_cfg.autoencoders, "target").name == "wan":
                 chunk_size = min(17, num_views)
+        
+        if gathered_sampled.shape[1] != gathered_target.shape[1]:
+            print(pred.shape, gt.shape)
+            breakpoint()
+            raise RuntimeError("prediction shape mismatch", pred.shape, gt.shape)
 
         # flatten across world size
         gathered_sampled = rearrange(gathered_sampled, "... (k v) c h w -> (... k) v c h w", v=chunk_size)
@@ -918,21 +922,21 @@ class DiffusionWrapper(LightningModule):
 
         for j in tqdm(range(b), desc="Saving Sampled Views: "):
             save_image_video(
-                images=sampled_views[j], 
+                images=sampled_views[j].float(), 
                 indices=torch.arange(0, sampled_views[j].shape[0]), 
                 output_dir=self.output_dir / "predicted" / batch["scene"][j],
                 name=self.sampler.cfg.name, save_img=True, save_video=True, fps=self.dataset_cfg.fps
             )
         for j in tqdm(range(b), desc="Saving Original Views: "):
             save_image_video(
-                images=target_views[j], 
+                images=target_views[j].float(), 
                 indices=torch.arange(0, target_views[j].shape[0]), 
                 output_dir=self.output_dir / "gt" / batch["scene"][j],
                 name="original", save_img=True, save_video=True, fps=self.dataset_cfg.fps
             )
 
             save_image_video(
-                images=context_views[j], 
+                images=context_views[j].float(), 
                 indices=batch["context"]["index"][j], 
                 output_dir=self.output_dir / "context" / batch["scene"][j],
                 name="context", save_img=True, save_video=True, fps=self.dataset_cfg.fps

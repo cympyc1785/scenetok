@@ -71,7 +71,7 @@ def train(cfg_dict: DictConfig):
         if wandb.run is not None:
             wandb.run.log_code("src")
     else:
-        logger = LocalLogger()
+        logger = LocalLogger(output_dir, clean=False)
 
     # Set up checkpointing.
     checkpoint_dir = output_dir / "checkpoints"
@@ -127,7 +127,7 @@ def train(cfg_dict: DictConfig):
     step = load(checkpoint_path, "cpu")["global_step"] if cfg.mode == "train" and checkpoint_path is not None else 0
     max_steps = cfg.trainer.max_steps if cfg.trainer.task_steps is None else min(step+cfg.trainer.task_steps, cfg.trainer.max_steps)
 
-    train_dataloaders = data_module.train_dataloader()
+    # train_dataloaders = data_module.train_dataloader()
     val_dataloaders = data_module.val_dataloader()
     # if len(val_dataloaders) > 1:
     #     callbacks.append(MultiValidationCallback(cfg=cfg.data_loader.val["evaluate"], dataloader=val_dataloaders["evaluate"]))
@@ -151,7 +151,7 @@ def train(cfg_dict: DictConfig):
         max_steps=max_steps,
         strategy=cfg.trainer.strategy,
         accumulate_grad_batches=cfg.trainer.accumulate_grad_batches,
-        limit_test_batches=cfg.trainer.limit_test_batches,
+        # limit_test_batches=cfg.trainer.limit_test_batches,
         profiler=get_profiler(cfg.trainer.profiler)    
     )
     # model_wrapper.strict_loading = True

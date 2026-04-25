@@ -44,7 +44,10 @@ def first_stage_encode(
                 latents = autoencoder[view_type].encode(inputs)
         elif autoencoder_name == "wan":
             inputs = rearrange(inputs, "(b v) c h w -> b v c h w", v=v)
-            latents = autoencoder[view_type].encode(inputs)
+            latents = []
+            for inputs_chunk in torch.split(inputs, 17, dim=1):
+                latents.append(autoencoder[view_type].encode(inputs_chunk))
+            latents = torch.concat(latents, dim=1)
         elif autoencoder_name == "wan_single":
             inputs = rearrange(inputs, "(b v) c h w -> b v c h w", v=v)
             latents = []
@@ -188,6 +191,7 @@ def step(
     target_pose: CameraInputs, 
     scheduler: Scheduler,
     cond_state: Optional[Float[Tensor, "batch _ _"]]=None, 
+    text_state: Optional[Float[Tensor, "batch _ _"]]=None,
     temporal_downsample: int=1,
     cfg_scale: float=1.0
 ):
@@ -212,13 +216,18 @@ def step(
         view=inputs, 
         pose=target_pose, 
         timestep=t, 
-        state=cond_state
+        state=cond_state,
+        text=text_state
     )
     # print(temporal_downsample, inputs.shape, t.shape, cond_state.shape, target_pose.extrinsics.shape)
     pred_conditional, qk_list = model._forward(inputs=denoiser_input, temporal_downsample=temporal_downsample)
     if cfg_scale > 1.0:
         cond_state_uc = model.null_tokens.expand(b, model.num_scene_tokens, -1)            
         denoiser_input.state = cond_state_uc
+        if hasattr(model, "null_text_tokens") and text_state is not None:
+            denoiser_input.text = model.null_text_tokens.expand(b, text_state.shape[1], -1)
+        else:
+            denoiser_input.text = None
         pred_unconditional, _ = model._forward(inputs=denoiser_input, temporal_downsample=temporal_downsample)
         pred_out = pred_unconditional + cfg_scale * (pred_conditional - pred_unconditional)
 
@@ -267,6 +276,7 @@ def sample(
     sampler: Sampler, 
     scheduler: Scheduler,
     autoencoder: Autoencoder,
+    text_state: Optional[Float[Tensor, "batch _ _"]]=None,
     temporal_downsample: int=1,
     cfg_scale: float=1.0,
     autoencoder_name: Optional[str]=None,
@@ -278,6 +288,7 @@ def sample(
     
     device = x_t.device
     b, v_t, c, h, w = x_t.shape
+    pred_conditional = None
 
 
     pbar = tqdm(range(sampler.global_steps), desc=f"Sampling ({sampler.cfg.name}): ")
@@ -316,19 +327,27 @@ def sample(
 
 
         # Denoise within the sliding window
+        if not denoise_mask.any():
+            scheduler.unset_scheduling_matrix()
+            continue
+
         x_t[:, denoise_mask], qk_list, pred_conditional = step(
             model=model, 
             x_t=x_t[:, denoise_mask], 
             ts=ts[:, denoise_mask], 
             target_pose=target_pose[:, new_denoise_mask], 
             cond_state=cond_state, 
+            text_state=text_state,
             temporal_downsample=temporal_downsample,
             scheduler=scheduler,
             cfg_scale=cfg_scale
         )
         scheduler.unset_scheduling_matrix()
 
-    uncertainty_map = pred_conditional.norm(dim=2) 
+    if pred_conditional is None:
+        uncertainty_map = torch.zeros((b, v_t, h, w), device=device, dtype=x_t.dtype)
+    else:
+        uncertainty_map = pred_conditional.norm(dim=2)
     if autoencoder_name is not None:
         if autoencoder_name == "video_dc":
             decoded = last_stage_decode(

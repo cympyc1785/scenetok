@@ -66,6 +66,32 @@ class ViewSamplerBounded(ViewSampler[ViewSamplerBoundedCfg]):
         offset = self.cfg.offset
 
         temporal_downsample = self.cfg.temporal_downsample
+        if self.cfg.num_target_views > 0:
+            if offset == 0:
+                required_num_views = self.cfg.num_target_views * temporal_downsample
+                available_num_latents = num_views // temporal_downsample
+            else:
+                required_num_views = self.latent_to_original_index(self.cfg.num_target_views)
+                available_num_latents = num_latents
+
+            if num_views < required_num_views:
+                raise ValueError(
+                    f"Example does not have enough frames for target views: "
+                    f"num_views={num_views}, required_num_views={required_num_views}, "
+                    f"num_target_views={self.cfg.num_target_views}, "
+                    f"temporal_downsample={temporal_downsample}, "
+                    f"chunk_index_gap={self.cfg.chunk_index_gap}, offset={offset}"
+                )
+
+            if available_num_latents < self.cfg.num_target_views:
+                raise ValueError(
+                    f"Example does not have enough latents for target views: "
+                    f"num_latents={available_num_latents}, "
+                    f"num_target_views={self.cfg.num_target_views}, "
+                    f"num_views={num_views}, temporal_downsample={temporal_downsample}, "
+                    f"chunk_index_gap={self.cfg.chunk_index_gap}, offset={offset}"
+                )
+
         max_distance_between_context_views = \
             self.cfg.max_distance_between_context_views or num_views
         initial_max_distance_between_context_views = \
@@ -156,9 +182,20 @@ class ViewSamplerBounded(ViewSampler[ViewSamplerBoundedCfg]):
                 end = (end // chunk_index_gap) * chunk_index_gap
             try:
                 starting_indices = torch.arange(start, end - num_target_views + 1, chunk_index_gap)
-            except:
-
-                raise ValueError("Error in generating starting indices")
+            except Exception as err:
+                raise ValueError(
+                    f"Error in generating starting indices: start={start}, end={end},\n"
+                    f"num_target_views={num_target_views}, chunk_index_gap={chunk_index_gap}\n"
+                    f"num_views={num_views}, num_latents={num_latents}\n"
+                    f"extrinsics={extrinsics.shape}"
+                ) from err
+            if len(starting_indices) == 0:
+                raise ValueError(
+                    f"No valid target start indices: start={start}, end={end},\n"
+                    f"num_target_views={num_target_views}, chunk_index_gap={chunk_index_gap},\n"
+                    f"num_views={num_views}, num_latents={num_latents}\n"
+                    f"extrinsics={extrinsics.shape}"
+                )
             num_target_split = min(len(starting_indices), num_target_split)
             index_target = torch.arange(0, num_latents).long()
             if np.random.choice([True, False], size=1, p=[1 - self.cfg.target_split_prob, self.cfg.target_split_prob]):
