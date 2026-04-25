@@ -1,0 +1,34 @@
+name: wan_ti2v_5b
+
+camera:
+  name: ray
+  input_shape: [8, 8]
+  normalize: false
+  origin_first: false
+  scale: [1.0, 1.0]
+  embedding:
+    name: time_embed
+    in_channels: 6
+    dropout_prob: 0.0
+    fourier: true
+    freq_origin: 15
+    freq_direction: 15
+
+model_root: src/model/DiffSynth-Studio/Wan2.2/Wan2.2-TI2V-5B
+dit_pattern: diffusion_pytorch_model*.safetensors
+text_encoder_path: null
+tokenizer_path: null
+seq_len: 512
+clean: whitespace
+gradient_checkpointing: true
+lock_first_frame: true
+num_target_split: 1
+ckpt_path: null
+load_strict: true
+
+lora:
+  enabled: true
+  rank: 32
+  alpha: 32
+  target_modules: q,k,v,o,ffn.0,ffn.2
+  checkpoint: null

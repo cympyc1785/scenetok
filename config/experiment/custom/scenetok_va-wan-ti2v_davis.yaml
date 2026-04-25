@@ -1,0 +1,120 @@
+# @package _global_
+
+defaults:
+  - override /dataset: davis
+  - override /dataset/view_sampler: front_fixed
+  - override /model/scheduler: rf
+  - override /model/denoiser: wan_ti2v_5b
+  - override /model/autoencoders/context: va
+  - override /model/autoencoders/target: wan
+  - override /model/compressor: mv_B1
+  - override /model/compressor/camera: ray
+  - override /model/compressor/camera/embedding: patch
+
+dataset:
+  view_sampler:
+    num_context_views: 12
+    num_target_split: 2
+    num_target_views: 10
+    chunk_index_gap: 5
+    max_distance_between_context_views: 20
+
+data_loader:
+  train:
+    batch_size: 4
+  val:
+    standard:
+      batch_size: 1
+
+val:
+  video_length: 49
+  window_shift: 5
+
+wandb:
+  tags: [davis, wan-ti2v, lora]
+  activated: true
+
+sampler:
+  clean_targets: 5
+
+freeze:
+  denoiser: false
+  compressor: true
+  autoencoder: true
+
+model:
+  text_encoder: null
+
+  scheduler:
+    sampling_type: random_uniform
+    num_inference_steps: 25
+    kwargs:
+      weighting: shifted
+      timestep_shift: 8
+
+  denoiser:
+    model_root: src/model/DiffSynth-Studio/Wan2.2/Wan2.2-TI2V-5B
+    dit_pattern: diffusion_pytorch_model*.safetensors
+    text_encoder_path: null
+    tokenizer_path: null
+    seq_len: 512
+    clean: whitespace
+    gradient_checkpointing: true
+    lock_first_frame: true
+    ckpt_path: null
+    load_strict: true
+    lora:
+      enabled: true
+      rank: 32
+      alpha: 32
+      target_modules: q,k,v,o,ffn.0,ffn.2
+      checkpoint: null
+
+  compressor:
+    ckpt_path: checkpoints/va-videodc_dl3dv.ckpt
+    load_strict: false
+    kl_weights: [0.0, 0.0]
+    input_shape: [16, 16]
+    num_scene_tokens: 1024
+    causal_self_atten: false
+    gradient_checkpointing: false
+    token_dim: 64
+    init_large: true
+    camera_conditioning: adaLN
+    scene_token_projection: kl
+    mask_context: false
+    camera:
+      name: ray
+      input_shape: [128, 128]
+      normalize: false
+      origin_first: false
+      scale: [1.0, 1.0]
+      embedding:
+        name: patch_embed
+        dropout_prob: 0.0
+        in_channels: 6
+        bias: true
+        flatten: true
+        patch_size: 16
+    kwargs:
+      use_rope_2d: true
+      use_rope_3d: false
+      patch_size: 2
+
+trainer:
+  max_steps: 5_000_001
+  val_check_interval: 5000
+  task_steps: null
+  accumulate_grad_batches: 1
+  gradient_clip_val: 0.1
+  precision: bf16-mixed
+
+optimizer:
+  name: AdamW
+  lr: 1.0e-5
+  scale_lr: false
+  milestones: [2000]
+  scheduler:
+    - name: LinearLR
+      frequency: 1
+      interval: step

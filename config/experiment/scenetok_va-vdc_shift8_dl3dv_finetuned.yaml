@@ -1,7 +1,7 @@
 # @package _global_
 
 defaults:
-  - override /dataset: latent_dl3dv
+  - override /dataset: dl3dv
   - override /dataset/view_sampler: bounded
   - override /model/scheduler: rf
   - override /model/denoiser: lightningdit_L_1
@@ -48,7 +48,7 @@ model:
       timestep_shift: 8
 
   denoiser:
-    ckpt_path: checkpoints/va-videodc_re10k.ckpt
+    ckpt_path: checkpoints/va-videodc_dl3dv.ckpt
     load_strict: false # Backward compatibility: only for provided checkpoints
 
     input_shape: [8, 8]

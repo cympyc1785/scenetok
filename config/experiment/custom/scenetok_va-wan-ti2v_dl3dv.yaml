@@ -1,0 +1,145 @@
+# @package _global_
+
+defaults:
+  - override /dataset: dl3dv
+  - override /dataset/view_sampler: bounded
+  - override /model/scheduler: rf
+  - override /model/denoiser: wan_ti2v_5b
+  - override /model/autoencoders/context: va
+  - override /model/autoencoders/target: wan
+  - override /model/compressor: mv_B1
+  - override /model/compressor/camera: ray
+  - override /model/compressor/camera/embedding: lvsm
+
+dataset:
+  root: ./DATA/DL3DV
+  overfit: false
+  target_latent_type: wan
+
+  # NOTE: Allow compatibility with va-wan, refer to docs/KNOWN_BUG.md
+  scale_context_focal_by_256: true
+
+  view_sampler:
+    num_context_views: 16
+    num_target_split: 2
+    num_target_views: 10
+    min_distance_between_context_views: 64
+    max_distance_between_context_views: 96
+    context_gap_warm_up_steps: 30_000
+    target_gap_warm_up_steps: 30_000
+    initial_min_distance_between_context_views: 48
+    initial_max_distance_between_context_views: 64
+    chunk_index_gap: 5
+    offset: 1
+
+data_loader:
+  train:
+    batch_size: 4
+  val:
+    standard:
+      batch_size: 4
+
+val:
+  video_length: 68
+  window_shift: 5
+
+wandb:
+  tags: [dl3dv, wan-ti2v, lora, recam]
+  activated: true
+
+sampler:
+  clean_targets: 5
+
+freeze:
+  denoiser: false
+  compressor: true
+  autoencoder: true
+
+model:
+  text_encoder: null
+
+  scheduler:
+    sampling_type: random_chunked_uniform
+    num_inference_steps: 25
+    kwargs:
+      weighting: shifted
+      timestep_shift: 8
+
+  denoiser:
+    name: wan_ti2v_5b
+    model_root: src/model/DiffSynth-Studio/Wan2.2/Wan2.2-TI2V-5B
+    dit_pattern: diffusion_pytorch_model*.safetensors
+    text_encoder_path: null
+    tokenizer_path: null
+    seq_len: 512
+    clean: whitespace
+    gradient_checkpointing: true
+    lock_first_frame: true
+    enable_recam_attention: false # 임시
+    input_shape: [16, 16]
+    num_target_split: 2
+    ckpt_path: null
+    load_strict: true
+    use_condition_latents: false
+    camera:
+      name: ray
+      input_shape: [128, 128]
+      normalize: false
+      origin_first: false
+      scale: [1.0, 1.0]
+      embedding:
+        name: time_embed
+        in_channels: 6
+        dropout_prob: 0.0
+        fourier: true
+        freq_origin: 15
+        freq_direction: 15
+    lora:
+      enabled: true
+      rank: 32
+      alpha: 32
+      target_modules: q,k,v,o,ffn.0,ffn.2
+      checkpoint: null
+
+  compressor:
+    ckpt_path: checkpoints/va-wan_dl3dv.ckpt
+    load_strict: false
+    kl_weights: [0.0, 0.0]
+    input_shape: [16, 16]
+    num_scene_tokens: 1024
+    causal_self_atten: false
+    gradient_checkpointing: false
+    token_dim: 64
+    init_large: true
+    camera_conditioning: adaLN
+    scene_token_projection: kl
+    mask_context: false
+    camera:
+      input_shape: [128, 128]
+      embedding:
+        patch_size: 16
+    kwargs:
+      use_rope_2d: true
+      use_rope_3d: false
+      patch_size: 2
+
+trainer:
+  max_steps: 5_000_001
+  val_check_interval: 5000
+  task_steps: null
+  accumulate_grad_batches: 1
+  gradient_clip_val: 0.1
+  precision: bf16-mixed
+
+optimizer:
+  name: AdamW
+  lr: 1.0e-5
+  scale_lr: false
+  milestones: [2000]
+  scheduler:
+    - name: LinearLR
+      frequency: 1
+      interval: step
+      kwargs:
+        start_factor: 5.e-4
+        total_iters: 2000
