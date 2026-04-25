@@ -16,6 +16,7 @@ class CheckpointingCfg:
     resume: bool = False
     save_top_k: int = 1
     every_n_train_steps: int | None = None
+    dirpath: Optional[Path] = None
 
 
 @dataclass
@@ -36,7 +37,14 @@ class TrainerCfg:
 @dataclass
 class RootCfg:
     wandb: dict
-    mode: Literal["train", "val", "test", "predict_train", "predict_test"]
+    mode: Literal[
+        "train",
+        "val",
+        "test",
+        "predict_train",
+        "predict_test",
+        "preprocess_data",
+    ]
     dataset: DatasetCfg
     model: ModelCfg
     data_loader: DataLoaderCfg

@@ -1,5 +1,5 @@
-import os
 from pathlib import Path
+import shutil
 from typing import Any, Optional
 import torch
 import numpy as np
@@ -13,10 +13,12 @@ LOG_PATH = Path("outputs/local")
 
 
 class LocalLogger(Logger):
-    def __init__(self) -> None:
+    def __init__(self, log_dir: str | Path = LOG_PATH, clean: bool = True) -> None:
         super().__init__()
         self.experiment = None
-        os.system(f"rm -r {LOG_PATH}")
+        self._log_dir = Path(log_dir)
+        if clean:
+            shutil.rmtree(self._log_dir, ignore_errors=True)
 
     @property
     def name(self):
@@ -25,6 +27,10 @@ class LocalLogger(Logger):
     @property
     def version(self):
         return 0
+
+    @property
+    def log_dir(self):
+        return self._log_dir
 
     @rank_zero_only
     def log_hyperparams(self, params):
@@ -46,7 +52,7 @@ class LocalLogger(Logger):
         # actually required.
         assert step is not None
         for index, image in enumerate(images):
-            path = LOG_PATH / f"{key}/{index:0>2}_{step:0>6}.png"
+            path = self._log_dir / f"{key}/{index:0>2}_{step:0>6}.png"
             path.parent.mkdir(exist_ok=True, parents=True)
             Image.fromarray(image).save(path)
 
@@ -67,7 +73,7 @@ class LocalLogger(Logger):
         for index, video in enumerate(videos):
             fmat = format[index]
             cap = caption[index]
-            path = LOG_PATH / f"{key}/{cap}_{step:0>6}.{fmat}"
+            path = self._log_dir / f"{key}/{cap}_{step:0>6}.{fmat}"
             path.parent.mkdir(exist_ok=True, parents=True)
 
             # (T, C, H, W) → (T, H, W, C)
