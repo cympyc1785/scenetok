@@ -26,7 +26,6 @@ dataset:
     num_target_split: 2
     num_target_views: 10
     chunk_index_gap: 5
-    offset: 1
     max_distance_between_context_views: 20
 
 data_loader:
