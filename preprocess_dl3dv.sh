@@ -1,29 +1,23 @@
-config=custom/scenetok_va-wan-ti2v_davis
+config=custom/scenetok_va-wan-ti2v_dl3dv
 num_workers=8
 gpus=1
 num_nodes=1
-data_root=./WorldTraj/dynamicverse/DAVIS
-meta_file=/NHNHOME/WORKSPACE/0226010013_A/cympyc1785/scenetok/WorldTraj/dynamicverse/meta.csv
-exp_name="exp_va-wan_t2v_train_1"
+exp_name="exp_va-wan_t2v_recon_train_1"
 resume_lora_ckpt=null
 
 export WANDB_API_KEY=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
 export DEBUG=1
-CUDA_VISIBLE_DEVICES=1 exec -a dynamic_scenetok_lets_go_4 python -m src.main +experiment=${config} \
+CUDA_VISIBLE_DEVICES=3 exec -a dynamic_scenetok_lets_go python -m src.main +experiment=${config} \
   data_loader.train.num_workers=${num_workers} \
-  mode=train \
+  mode=preprocess_data \
   trainer.devices=${gpus} \
   trainer.num_nodes=${num_nodes} \
-  dataset.root=${data_root} \
-  dataset.meta_file=${meta_file} \
-  dataset.overfit_train_all_meta=true \
-  dataset.overfit_val_from_meta_last=true \
   freeze.denoiser=false \
   freeze.compressor=true \
   freeze.autoencoder=true \
   model.text_encoder=null \
   model.denoiser.lora.enabled=true \
   model.denoiser.lora.checkpoint=${resume_lora_ckpt} \
-  wandb.activated=true \
+  wandb.activated=false \
   hydra.run.dir=${exp_name} \
   checkpointing.dirpath=my_checkpoints/${exp_name}

@@ -1,10 +1,10 @@
 io_mode="dl3dv_c16_64"
 
-config=scenetok_va-vdc_shift8_dl3dv_finetuned
+config=scenetok_va-wan_shift4_dl3dv_finetuned
 dataset="dl3dv"
-ckpt="./checkpoints/va-videodc_dl3dv.ckpt"
-data_root="./DATA/DL3DV/DL3DV-Benchmark"
-output_dir=./results/tok_${io_mode}_eval
+ckpt="./checkpoints/va-wan_dl3dv.ckpt"
+data_root="./DATA/DL3DV"
+output_dir=./results/tok_va-wan_${io_mode}_eval
 view_sampler="evaluation_video"
 index_path=./assets/evaluation_index/${io_mode}.json
 

@@ -4,7 +4,7 @@ config=scenetok_va-vdc_lognorm_re10k_scratch
 dataset="re10k"
 ckpt="./checkpoints/va-videodc_re10k.ckpt"
 data_root="./DATA/re10k"
-output_dir=./results/tok_${io_mode}_eval
+output_dir=./results/tok_va-vdc_${io_mode}_eval
 view_sampler="evaluation_video"
 index_path=./assets/evaluation_index/${io_mode}.json
 
