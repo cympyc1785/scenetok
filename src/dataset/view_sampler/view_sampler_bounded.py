@@ -26,6 +26,8 @@ class ViewSamplerBoundedCfg(ViewSamplerCfg):
     target_split_prob: float=0.0
     temporal_downsample: int=1
     offset: int=0
+    chunk_targets: bool=True
+    override_context_gap: int | None = None
 
 
 class ViewSamplerBounded(ViewSampler[ViewSamplerBoundedCfg]):
@@ -41,6 +43,17 @@ class ViewSamplerBounded(ViewSampler[ViewSamplerBoundedCfg]):
         return min(initial + int((final - initial) * fraction), final)
     
     def latent_to_original_index(self, latent_idx):
+        if not self.cfg.chunk_targets and self.cfg.offset != 0:
+            # Wan without chunking
+            if isinstance(latent_idx, int):
+                if latent_idx == 0:
+                    return 0
+                return self.cfg.temporal_downsample * latent_idx - (self.cfg.temporal_downsample - 1)
+            return torch.where(
+                latent_idx == 0,
+                torch.zeros_like(latent_idx),
+                self.cfg.temporal_downsample * latent_idx - (self.cfg.temporal_downsample - 1),
+            )
 
         if latent_idx % self.cfg.chunk_index_gap==0:
             idx = self.cfg.temporal_downsample  * latent_idx - (self.cfg.temporal_downsample-1)*(latent_idx//self.cfg.chunk_index_gap)
@@ -50,6 +63,12 @@ class ViewSamplerBounded(ViewSampler[ViewSamplerBoundedCfg]):
         return idx
 
     def original_to_latent_index(self, idx):
+        if not self.cfg.chunk_targets and self.cfg.offset != 0:
+            # Wan without chunking
+            if idx == 0:
+                return 0
+            return (idx - 1) // self.cfg.temporal_downsample + 1
+
         frame_index_gap = self.cfg.temporal_downsample * (self.cfg.chunk_index_gap-1) + 1
         k = idx // frame_index_gap
         r = idx % frame_index_gap
@@ -96,6 +115,12 @@ class ViewSamplerBounded(ViewSampler[ViewSamplerBoundedCfg]):
             self.cfg.max_distance_between_context_views or num_views
         initial_max_distance_between_context_views = \
             self.cfg.initial_max_distance_between_context_views or num_views
+        min_distance_between_context_views = \
+            self.cfg.min_distance_between_context_views or (
+                self.latent_to_original_index(self.cfg.num_target_views) - self.latent_to_original_index(1)
+                if self.cfg.num_target_views > 0
+                else 0
+            )
         # Compute the context view spacing based on the current global step.
         if self.stage == "test":
             # When testing, always use the full gap.
@@ -116,11 +141,13 @@ class ViewSamplerBounded(ViewSampler[ViewSamplerBoundedCfg]):
             )
         else:
             max_context_gap = min(max_distance_between_context_views, num_views)
-            min_context_gap = min(self.cfg.min_distance_between_context_views, num_views)
+            min_context_gap = min(min_distance_between_context_views, num_views)
 
         if not self.cameras_are_circular:
             max_context_gap = min(max_context_gap, num_views - 1)
             min_context_gap = min(min_context_gap, num_views - 1)
+        
+        min_context_gap = max(min_context_gap, self.latent_to_original_index(self.cfg.num_target_views))
 
         # if not self.cameras_are_circular:
         #     max_context_gap = min(num_views - 1, max_context_gap)   # NOTE fixed former bug here
@@ -146,6 +173,9 @@ class ViewSamplerBounded(ViewSampler[ViewSamplerBoundedCfg]):
                 size=tuple()
             ).item()
 
+        if self.cfg.override_context_gap:
+            context_gap = self.cfg.override_context_gap
+
         # Pick the left and right context indices.
         index_context_left = torch.randint(
             low=0,
@@ -156,7 +186,7 @@ class ViewSamplerBounded(ViewSampler[ViewSamplerBoundedCfg]):
         index_context_right = index_context_left + context_gap
 
         index_unrolled = None
-        num_target_split = self.cfg.num_target_split if stage == "train" else 1
+        num_target_split = self.cfg.num_target_split if stage == "train" and self.cfg.chunk_targets else 1
         # Compute target indices
         if self.cfg.num_target_views > 0:
             index_target_left = index_context_left - max_target_gap
@@ -169,7 +199,7 @@ class ViewSamplerBounded(ViewSampler[ViewSamplerBoundedCfg]):
 
             # Pick the target view indices.
             num_target_views = self.cfg.num_target_views
-            chunk_index_gap = self.cfg.chunk_index_gap
+            chunk_index_gap = self.cfg.chunk_index_gap if self.cfg.chunk_targets else 1
 
             if offset == 0:
                 num_latents = num_views // temporal_downsample
@@ -181,11 +211,11 @@ class ViewSamplerBounded(ViewSampler[ViewSamplerBoundedCfg]):
                 start = (start // chunk_index_gap) * chunk_index_gap
                 end = (end // chunk_index_gap) * chunk_index_gap
             try:
-                starting_indices = torch.arange(start, end - num_target_views + 1, chunk_index_gap)
+                starting_indices = torch.arange(start, end - num_target_views + 2, chunk_index_gap)
             except Exception as err:
                 raise ValueError(
-                    f"Error in generating starting indices: start={start}, end={end},\n"
-                    f"num_target_views={num_target_views}, chunk_index_gap={chunk_index_gap}\n"
+                    f"Error in generating starting indices: start={start}, end={end}, to={end - num_target_views + 2}\n"
+                    f"num_target_views={num_target_views}, chunk_index_gap={chunk_index_gap}, context_gap={context_gap}\n"
                     f"num_views={num_views}, num_latents={num_latents}\n"
                     f"extrinsics={extrinsics.shape}"
                 ) from err
@@ -193,7 +223,7 @@ class ViewSamplerBounded(ViewSampler[ViewSamplerBoundedCfg]):
                 raise ValueError(
                     f"No valid target start indices: start={start}, end={end},\n"
                     f"num_target_views={num_target_views}, chunk_index_gap={chunk_index_gap},\n"
-                    f"num_views={num_views}, num_latents={num_latents}\n"
+                    f"num_views={num_views}, num_latents={num_latents}\n, context_gap={context_gap}"
                     f"extrinsics={extrinsics.shape}"
                 )
             num_target_split = min(len(starting_indices), num_target_split)
@@ -229,6 +259,9 @@ class ViewSamplerBounded(ViewSampler[ViewSamplerBoundedCfg]):
                         print("Error: ", err)
                         return self.sample(num_views=num_views, num_latents=num_latents)
 
+                    if not self.cfg.chunk_targets:
+                        end = start + 1 + (target.shape[0] - 1) * temporal_downsample
+
                     idx_unrolled = torch.arange(start, end)
                 
                 index_unrolled.append(idx_unrolled)
@@ -258,7 +291,6 @@ class ViewSamplerBounded(ViewSampler[ViewSamplerBoundedCfg]):
             if index_target is not None:
                 index_target %= num_views
             index_context_right %= extrinsics.shape[0]
-
         return ViewIndex(torch.tensor(sorted([index_context_left, *indices, index_context_right])), index_unrolled), index_target
 
     @property

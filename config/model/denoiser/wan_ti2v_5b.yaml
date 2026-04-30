@@ -21,8 +21,12 @@ tokenizer_path: null
 seq_len: 512
 clean: whitespace
 gradient_checkpointing: true
-lock_first_frame: true
+condition_latents_input_type: none
+camera_input_type: none
+camera_context_spatial_pool: 1
+scene_input_type: none
 num_target_split: 1
+noise_seed: null
 ckpt_path: null
 load_strict: true
 

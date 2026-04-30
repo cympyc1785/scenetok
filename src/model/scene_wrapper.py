@@ -547,7 +547,8 @@ class SceneWrapper(LightningModule):
                 view_type="context",
                 precomputed_latents=self.dataset_cfg.precomputed_latents,
                 autoencoder_name=getattr(self.model_cfg.autoencoders, "context").name,
-                scaling_factor=getattr(self.model_cfg.autoencoders, "context").kwargs.scaling_factor
+                scaling_factor=getattr(self.model_cfg.autoencoders, "context").kwargs.scaling_factor,
+                chunk_targets=getattr(self.dataset_cfg.view_sampler, "chunk_targets", True),
             )
             context_inputs = CompressorInputs(
                 view=context_latents,
@@ -597,7 +598,8 @@ class SceneWrapper(LightningModule):
                 autoencoder_name=getattr(self.model_cfg.autoencoders, "target").name,
                 scaling_factor=getattr(self.model_cfg.autoencoders, "target").kwargs.scaling_factor,
                 chunk_index_gap=self.dataset_cfg.view_sampler.chunk_index_gap,
-                offset=self.dataset_cfg.view_sampler.offset
+                offset=self.dataset_cfg.view_sampler.offset,
+                chunk_targets=getattr(self.dataset_cfg.view_sampler, "chunk_targets", True),
             ), scene_tokens_pred)
         else:
             predicted_outputs = (None, None, None)
@@ -614,7 +616,8 @@ class SceneWrapper(LightningModule):
             autoencoder_name=getattr(self.model_cfg.autoencoders, "target").name,
             scaling_factor=getattr(self.model_cfg.autoencoders, "target").kwargs.scaling_factor,
             chunk_index_gap=self.dataset_cfg.view_sampler.chunk_index_gap,
-            offset=self.dataset_cfg.view_sampler.offset
+            offset=self.dataset_cfg.view_sampler.offset,
+            chunk_targets=getattr(self.dataset_cfg.view_sampler, "chunk_targets", True),
         ), scene_tokens_gen), predicted_outputs)
 
     def training_step(self, batch, batch_idx):
@@ -742,7 +745,8 @@ class SceneWrapper(LightningModule):
             view_type="context",
             precomputed_latents=self.dataset_cfg.precomputed_latents,
             autoencoder_name=getattr(self.model_cfg.autoencoders, "context").name,
-            scaling_factor=getattr(self.model_cfg.autoencoders, "context").kwargs.scaling_factor
+            scaling_factor=getattr(self.model_cfg.autoencoders, "context").kwargs.scaling_factor,
+            chunk_targets=getattr(self.dataset_cfg.view_sampler, "chunk_targets", True),
         )
 
         device = cond_views.device
@@ -837,10 +841,14 @@ class SceneWrapper(LightningModule):
         # --- sequence-level metrics ---
         gathered_sampled = self.all_gather(sampled_views)
         gathered_target = self.all_gather(target_views)
+        num_views = gathered_sampled.shape[-4]
+        chunk_size = min(16, num_views)
+        if num_views % chunk_size != 0:
+            chunk_size = num_views
 
         # flatten across world size
-        gathered_sampled = rearrange(gathered_sampled, "... (k v) c h w -> (... k) v c h w", v=16)
-        gathered_target = rearrange(gathered_target, "... (k v) c h w -> (... k) v c h w", v=16)
+        gathered_sampled = rearrange(gathered_sampled, "... (k v) c h w -> (... k) v c h w", v=chunk_size)
+        gathered_target = rearrange(gathered_target, "... (k v) c h w -> (... k) v c h w", v=chunk_size)
 
         # flatten views for metric
         gathered_sampled = rearrange(gathered_sampled, "... c h w -> (...) c h w")
@@ -903,7 +911,8 @@ class SceneWrapper(LightningModule):
             view_type="target",
             precomputed_latents=self.dataset_cfg.precomputed_latents,
             autoencoder_name=getattr(self.model_cfg.autoencoders, "target").name,
-            scaling_factor=getattr(self.model_cfg.autoencoders, "target").kwargs.scaling_factor
+            scaling_factor=getattr(self.model_cfg.autoencoders, "target").kwargs.scaling_factor,
+            chunk_targets=getattr(self.dataset_cfg.view_sampler, "chunk_targets", True),
         )
 
         b, v_c, *_ = batch["context"]["extrinsics"].shape

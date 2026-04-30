@@ -1,12 +1,15 @@
+import math
+
 from .diffusion import first_stage_encode
 from .diffusion_wrapper import *
+from einops import repeat
 
 
 class T2VWrapper(DiffusionWrapper):
     def should_use_condition_latents(self):
         return (
             getattr(self.denoiser, "supports_condition_latents", False)
-            and getattr(self.denoiser, "use_condition_latents", True)
+            and getattr(self.denoiser, "condition_latents_input_type", "none") != "none"
         )
 
     def preprocess_scene_tokens(self, scene_tokens, shape, device, token_mask=None):
@@ -45,37 +48,38 @@ class T2VWrapper(DiffusionWrapper):
         cfg = getattr(self.model_cfg.autoencoders, view_type)
         return 1.0 if cfg is None else cfg.kwargs.scaling_factor
 
-    def get_condition_latents(self, batch, device, dtype):
+    def get_condition_latents(self, batch, device, dtype, target_num_views=None, first_frame_only=False):
         if not self.should_use_condition_latents():
             return None
 
         target_cfg = getattr(self.model_cfg.autoencoders, "target")
-        context_cfg = getattr(self.model_cfg.autoencoders, "context")
         target_name = target_cfg.name
         target_scale = target_cfg.kwargs.scaling_factor
 
         if self.dataset_cfg.precomputed_latents["context"]:
-            if context_cfg is None or context_cfg.name != target_name:
-                raise ValueError(
-                    "Wan TI2V conditioning requires raw context images or matching context/target autoencoders "
-                    "when precomputed context latents are enabled."
-                )
-            condition_latents = get_latents(
-                autoencoder=self.autoencoder,
-                inputs=batch["context"],
-                view_type="context",
-                precomputed_latents=self.dataset_cfg.precomputed_latents,
-                autoencoder_name=context_cfg.name,
-                scaling_factor=context_cfg.kwargs.scaling_factor,
-            )[:, :1]
-        else:
-            condition_latents = first_stage_encode(
-                autoencoder=self.autoencoder,
-                inputs=batch["context"]["latent"][:, :1],
-                view_type="target",
-                autoencoder_name=target_name,
-                scaling_factor=target_scale,
+            raise ValueError(
+                "Width-concat Wan TI2V conditioning requires raw context images so they can be "
+                "repeated to the target view count and encoded with the target Wan autoencoder."
             )
+
+        context_views = batch["context"]["latent"]
+        if target_num_views is None:
+            target_num_views = batch["target"]["latent"].shape[1]
+        repeat_count = math.ceil(target_num_views / context_views.shape[1])
+        context_views = repeat(context_views, "b v c h w -> b (r v) c h w", r=repeat_count)
+        context_views = context_views[:, :target_num_views]
+
+        condition_latents = first_stage_encode(
+            autoencoder=self.autoencoder,
+            inputs=context_views,
+            view_type="target",
+            autoencoder_name=target_name,
+            scaling_factor=target_scale,
+            chunk_targets=getattr(self.dataset_cfg.view_sampler, "chunk_targets", True),
+        )
+        
+        if first_frame_only:
+            condition_latents = condition_latents[:, :1]
 
         return condition_latents.to(device=device, dtype=dtype)
 
@@ -94,12 +98,17 @@ class T2VWrapper(DiffusionWrapper):
             intrinsics = intrinsics[:, :num_pose_views]
             extrinsics = extrinsics[:, :num_pose_views]
         elif target_name == "wan":
-            if num is None:
-                num_chunks = extrinsics.shape[1] // 17
+            if getattr(self.dataset_cfg.view_sampler, "chunk_targets", True):
+                if num is None:
+                    num_chunks = extrinsics.shape[1] // 17
+                else:
+                    num_chunks = num_latents // 5
+                num = num_chunks * 5
+                num_pose_views = num_chunks * 17
             else:
-                num_chunks = num_latents // 5
-            num = num_chunks * 5
-            num_pose_views = num_chunks * 17
+                if num is None:
+                    num = 1 + (extrinsics.shape[1] - 1) // temporal_downsample
+                num_pose_views = 1 + (num - 1) * temporal_downsample
             intrinsics = intrinsics[:, :num_pose_views]
             extrinsics = extrinsics[:, :num_pose_views]
 
@@ -143,7 +152,14 @@ class T2VWrapper(DiffusionWrapper):
         else:
             h, w = input_shape
 
-        x_t = torch.randn((b, num, c, h, w), device=device, dtype=dtype)
+        noise_seed = getattr(getattr(self.denoiser, "cfg", None), "noise_seed", None)
+        noise_generator = None
+        if noise_seed is not None:
+            noise_generator = torch.Generator(device=device)
+            noise_generator.manual_seed(int(noise_seed))
+            print(f"(Wan TI2V) Using noise seed: {noise_seed}")
+
+        x_t = torch.randn((b, num, c, h, w), device=device, dtype=dtype, generator=noise_generator)
         x_t *= self.scheduler.init_noise_sigma
 
         context_camera = CameraInputs(
@@ -179,6 +195,8 @@ class T2VWrapper(DiffusionWrapper):
             sampler.shift_scheduling_matrix(self.model_cfg.scheduler.kwargs.timestep_shift)
         sampler.log_vis(self.logger, step=self.step_tracker, name=f"({sampler.cfg.name})")
         print("Shape of latents: ", x_t.shape)
+        if "negative_prompt" in batch and hasattr(self.denoiser, "negative_prompt"):
+            self.denoiser.negative_prompt = batch["negative_prompt"]
         return *sample(
             model=self.denoiser,
             x_t=x_t,
@@ -194,7 +212,94 @@ class T2VWrapper(DiffusionWrapper):
             scaling_factor=target_cfg.kwargs.scaling_factor,
             chunk_index_gap=self.dataset_cfg.view_sampler.chunk_index_gap,
             offset=self.dataset_cfg.view_sampler.offset,
+            chunk_targets=getattr(self.dataset_cfg.view_sampler, "chunk_targets", True),
         ), scene_tokens
+
+    def test_step(self, batch, batch_idx):
+        
+        step = self.step_tracker.get_step()
+        
+        prompt = getattr(self.test_cfg, "prompt", None)
+        negative_prompt = getattr(self.test_cfg, "negative_prompt", None)
+
+        if prompt:
+            batch["text"] = [prompt] * len(batch["scene"])
+            print(f"\n\nPrompt: {batch['text']}")
+        if negative_prompt:
+            batch["negative_prompt"] = negative_prompt
+            print(f"Negative prompt: {batch['negative_prompt']}\n")
+        
+        print(
+            f"Current epoch {step}; "
+            f"Step {batch_idx}; "
+            f"Scene = {batch['scene']}; "
+            f"Context = {batch['context']['index'].tolist()}; "
+            f"Target = {batch['target']['index'].tolist()}; "
+        )
+
+        b, v_t, *_ = batch["target"]["extrinsics"].shape
+        b, v_c, *_ = batch["context"]["extrinsics"].shape
+
+        print(f"Number of context views: {v_c}")
+        print(f"Number of target views: {v_t}")
+
+        target_views=get_images(
+            autoencoder=self.autoencoder,
+            inputs=batch["target"],
+            view_type="target",
+            precomputed_latents=self.dataset_cfg.precomputed_latents,
+            autoencoder_name=getattr(self.model_cfg.autoencoders, "target").name,
+            scaling_factor=getattr(self.model_cfg.autoencoders, "target").kwargs.scaling_factor,
+            chunk_targets=getattr(self.dataset_cfg.view_sampler, "chunk_targets", True),
+        )
+        context_views=get_images(
+            autoencoder=self.autoencoder,
+            inputs=batch["context"],
+            view_type="context",
+            precomputed_latents=self.dataset_cfg.precomputed_latents,
+            autoencoder_name=getattr(self.model_cfg.autoencoders, "context").name,
+            scaling_factor=getattr(self.model_cfg.autoencoders, "context").kwargs.scaling_factor,
+            chunk_targets=getattr(self.dataset_cfg.view_sampler, "chunk_targets", True),
+        )
+
+        # Relative camera w.r.t middle context camera (can be any other context camera)
+        batch = preprocess_batch(batch, index=v_c//2)
+        sampled_views, uncertainty_maps, _ = self.generate_batch_with_scene(
+            batch, 
+            self.sampler, 
+            repeat_factor=1,
+        )
+
+        # for j in tqdm(range(b), desc="Saving Uncertainty Maps: "):
+        #     save_image_video(
+        #         images=uncertainty_maps[j], 
+        #         indices=torch.arange(0, uncertainty_maps[j].shape[0]), 
+        #         output_dir=self.output_dir / "uncertainty" / batch["scene"][j],
+        #         name=self.sampler.cfg.name, save_img=True, save_video=True, fps=self.dataset_cfg.fps
+        #     )
+
+        for j in tqdm(range(b), desc="Saving Sampled Views: "):
+            save_image_video(
+                images=sampled_views[j].float(), 
+                indices=torch.arange(0, sampled_views[j].shape[0]), 
+                output_dir=self.output_dir / "predicted" / batch["scene"][j],
+                name=self.sampler.cfg.name, save_img=True, save_video=True, fps=self.dataset_cfg.fps
+            )
+        # for j in tqdm(range(b), desc="Saving Original Views: "):
+        #     save_image_video(
+        #         images=target_views[j].float(), 
+        #         indices=torch.arange(0, target_views[j].shape[0]), 
+        #         output_dir=self.output_dir / "gt" / batch["scene"][j],
+        #         name="original", save_img=True, save_video=True, fps=self.dataset_cfg.fps
+        #     )
+
+        #     save_image_video(
+        #         images=context_views[j].float(), 
+        #         indices=batch["context"]["index"][j], 
+        #         output_dir=self.output_dir / "context" / batch["scene"][j],
+        #         name="context", save_img=True, save_video=True, fps=self.dataset_cfg.fps
+        #     )
+        return None
 
     def training_step(self, batch, batch_idx):
         if self.step_tracker is not None:
@@ -209,6 +314,7 @@ class T2VWrapper(DiffusionWrapper):
             precomputed_latents=self.dataset_cfg.precomputed_latents,
             autoencoder_name=self.get_autoencoder_name("target"),
             scaling_factor=self.get_autoencoder_scaling_factor("target"),
+            chunk_targets=getattr(self.dataset_cfg.view_sampler, "chunk_targets", True),
         )
 
         device = target_latents.device
@@ -270,16 +376,15 @@ class T2VWrapper(DiffusionWrapper):
         else:
             scene_tokens = None
 
-        use_scalar_timestep = (
-            self.should_use_condition_latents()
-            and getattr(self.denoiser, "lock_condition_frame", False)
-            and not getattr(self.denoiser, "uses_internal_text_encoder", False)
-        )
-        if use_scalar_timestep:
-            timestep_shape = ()
-        elif not getattr(self.denoiser, "supports_per_view_timestep", True):
-            timestep_shape = (b,)
-        elif self.model_cfg.scheduler.sampling_type == "random_uniform":
+        # use_scalar_timestep = (
+        #     self.should_use_condition_latents()
+        #     and not getattr(self.denoiser, "uses_internal_text_encoder", False)
+        # )
+        # if use_scalar_timestep:
+        #     timestep_shape = ()
+        # if not getattr(self.denoiser, "supports_per_view_timestep", True):
+        #     timestep_shape = (b,)
+        if self.model_cfg.scheduler.sampling_type == "random_uniform":
             timestep_shape = (b,)
         elif self.model_cfg.scheduler.sampling_type == "random_chunked_uniform":
             timestep_shape = (b, self.dataset_cfg.view_sampler.num_target_split)
@@ -288,12 +393,12 @@ class T2VWrapper(DiffusionWrapper):
         else:
             raise NotImplementedError(f"Sampling type in scheduler is not correctly specified and instead got {self.model_cfg.scheduler.sampling_type}")
 
-        if (
-            not use_scalar_timestep
-            and np.random.choice([True, False], p=[0.2, 0.8])
-            and self.model_cfg.enforce_uniform_noise
-        ):
-            timestep_shape = (b,)
+        # if (
+        #     not use_scalar_timestep
+        #     and np.random.choice([True, False], p=[0.2, 0.8])
+        #     and self.model_cfg.enforce_uniform_noise
+        # ):
+        #     timestep_shape = (b,)
 
         timestep = self.get_noise_level(timestep_shape, dtype=dtype)
         if timestep.ndim == 1:
@@ -301,17 +406,21 @@ class T2VWrapper(DiffusionWrapper):
         elif timestep.ndim == 2 and self.model_cfg.scheduler.sampling_type == "random_chunked_uniform":
             timestep = repeat(timestep, "b n -> b (n v)", v=self.dataset_cfg.view_sampler.num_target_views // self.dataset_cfg.view_sampler.num_target_split)
 
+        # Experimental: Force zero noise-levels for conditioning 
         if self.model_cfg.force_clean:
-            if use_scalar_timestep:
-                raise ValueError("force_clean is not supported with Wan TI2V locked first-frame conditioning.")
+            # if use_scalar_timestep:
+            #     raise ValueError("force_clean is not supported with Wan TI2V locked first-frame conditioning.")
             target_cond_mask = self.get_conditioning_mask((b, v_t), device=device, dtype=dtype)
             timestep = timestep * target_cond_mask
 
         noise = torch.randn_like(target_latents, device=device)
         noisy_latents = self.scheduler.add_noise(target_latents, noise, timestep)
-        condition_latents = self.get_condition_latents(batch, device=device, dtype=dtype)
-        if condition_latents is not None and getattr(self.denoiser, "lock_condition_frame", False):
-            noisy_latents[:, : condition_latents.shape[1]] = condition_latents
+        condition_latents = self.get_condition_latents(
+            batch,
+            device=device,
+            dtype=dtype,
+            target_num_views=batch["target"]["latent"].shape[1],
+        )
 
         scene_tokens = self.preprocess_scene_tokens(
             scene_tokens=scene_tokens,
@@ -332,15 +441,11 @@ class T2VWrapper(DiffusionWrapper):
         pred, _ = self.denoiser(
             inputs=denoiser_input,
             temporal_downsample=temporal_downsample,
+            chunk_targets=getattr(self.dataset_cfg.view_sampler, "chunk_targets", True),
         )
         gt = self.process_gt(target_latents, noise, timestep)
         if pred.shape[1] != gt.shape[1]:
             raise RuntimeError("prediction shape mismatch", pred.shape, gt.shape)
-        if condition_latents is not None and getattr(self.denoiser, "lock_condition_frame", False):
-            pred = pred[:, condition_latents.shape[1]:]
-            gt = gt[:, condition_latents.shape[1]:]
-            if self.model_cfg.force_clean:
-                target_cond_mask = target_cond_mask[:, condition_latents.shape[1]:]
 
         loss = F.mse_loss(pred, gt, reduction="none")
         if self.model_cfg.force_clean:

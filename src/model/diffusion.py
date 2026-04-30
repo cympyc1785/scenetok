@@ -27,7 +27,8 @@ def first_stage_encode(
     inputs: Float[Tensor, "b v c h w"], 
     view_type: str, 
     autoencoder_name: Optional[str]=None,
-    scaling_factor: float=1.0
+    scaling_factor: float=1.0,
+    chunk_targets: bool=True,
 ):
     b, v, c, h, w = inputs.shape
     inputs = rearrange(inputs, "b v c h w -> (b v) c h w ")
@@ -44,10 +45,13 @@ def first_stage_encode(
                 latents = autoencoder[view_type].encode(inputs)
         elif autoencoder_name == "wan":
             inputs = rearrange(inputs, "(b v) c h w -> b v c h w", v=v)
-            latents = []
-            for inputs_chunk in torch.split(inputs, 17, dim=1):
-                latents.append(autoencoder[view_type].encode(inputs_chunk))
-            latents = torch.concat(latents, dim=1)
+            if chunk_targets:
+                latents = []
+                for inputs_chunk in torch.split(inputs, 17, dim=1):
+                    latents.append(autoencoder[view_type].encode(inputs_chunk))
+                latents = torch.concat(latents, dim=1)
+            else:
+                latents = autoencoder[view_type].encode(inputs)
         elif autoencoder_name == "wan_single":
             inputs = rearrange(inputs, "(b v) c h w -> b v c h w", v=v)
             latents = []
@@ -75,7 +79,8 @@ def last_stage_decode(
     latents: Float[Tensor, "b v c h w"], 
     view_type: str, 
     autoencoder_name: Optional[str]=None,
-    scaling_factor: float=1.0
+    scaling_factor: float=1.0,
+    chunk_targets: bool=True,
 ):
     
     if autoencoder_name is not None:
@@ -98,10 +103,12 @@ def last_stage_decode(
         elif autoencoder_name == "wan":
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 latents = rearrange(latents, "(b v) c h w -> b v c h w", v=v)
-                t = len(torch.split(latents, dim=1, split_size_or_sections=5))
-                latents = rearrange(latents, "b (t v) c h w -> (b t) v c h w", t=t)
+                if chunk_targets:
+                    t = len(torch.split(latents, dim=1, split_size_or_sections=5))
+                    latents = rearrange(latents, "b (t v) c h w -> (b t) v c h w", t=t)
                 image = autoencoder[view_type].decode(latents)
-                image = rearrange(image, "(b t) v c h w -> b (t v) c h w", t=t)
+                if chunk_targets:
+                    image = rearrange(image, "(b t) v c h w -> b (t v) c h w", t=t)
                 image = rearrange(image, "b v c h w -> (b v) c h w")
         elif autoencoder_name == "wan_single":
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -129,6 +136,7 @@ def get_latents(
     precomputed_latents: dict[str, bool],
     autoencoder_name: Optional[str]=None,
     scaling_factor: float=1.0,
+    chunk_targets: bool=True,
 ):
         
     if autoencoder_name is None:
@@ -146,7 +154,8 @@ def get_latents(
             inputs=inputs["latent"], 
             view_type=view_type, 
             autoencoder_name=autoencoder_name,
-            scaling_factor=scaling_factor
+            scaling_factor=scaling_factor,
+            chunk_targets=chunk_targets,
         )
         
     return latents
@@ -158,6 +167,7 @@ def get_images(
     precomputed_latents: dict[str, bool],
     autoencoder_name: Optional[str]=None,
     scaling_factor: float=1.0,
+    chunk_targets: bool=True,
 ):
     if autoencoder_name is None:
         return  inputs["latent"]  
@@ -171,11 +181,13 @@ def get_images(
                 view_type=view_type, 
                 precomputed_latents=precomputed_latents,
                 autoencoder_name=autoencoder_name,
-                scaling_factor=scaling_factor
+                scaling_factor=scaling_factor,
+                chunk_targets=chunk_targets,
             ), 
             view_type=view_type,
             autoencoder_name=autoencoder_name,
-            scaling_factor=scaling_factor
+            scaling_factor=scaling_factor,
+            chunk_targets=chunk_targets,
         )
     else:
         images = inputs["latent"]
@@ -193,9 +205,10 @@ def step(
     cond_state: Optional[Float[Tensor, "batch _ _"]]=None, 
     text_state: Optional[Float[Tensor, "batch _ _"]]=None,
     temporal_downsample: int=1,
+    chunk_targets: bool=True,
     cfg_scale: float=1.0
 ):
-    
+
     b, v_t, *_ = x_t.shape 
     x_t_inputs = scheduler.scale_model_input(x_t, ts)
     
@@ -220,15 +233,28 @@ def step(
         text=text_state
     )
     # print(temporal_downsample, inputs.shape, t.shape, cond_state.shape, target_pose.extrinsics.shape)
-    pred_conditional, qk_list = model._forward(inputs=denoiser_input, temporal_downsample=temporal_downsample)
+    pred_conditional, qk_list = model._forward(
+        inputs=denoiser_input,
+        temporal_downsample=temporal_downsample,
+        chunk_targets=chunk_targets,
+    )
     if cfg_scale > 1.0:
         cond_state_uc = model.null_tokens.expand(b, model.num_scene_tokens, -1)            
         denoiser_input.state = cond_state_uc
-        if hasattr(model, "null_text_tokens") and text_state is not None:
-            denoiser_input.text = model.null_text_tokens.expand(b, text_state.shape[1], -1)
+        negative_prompt = getattr(model, "negative_prompt", None)
+        if negative_prompt:
+            denoiser_input.text = model.encode_text_condition(negative_prompt, device=inputs.device)
         else:
-            denoiser_input.text = None
-        pred_unconditional, _ = model._forward(inputs=denoiser_input, temporal_downsample=temporal_downsample)
+            denoiser_input.text = model.encode_text_condition("", device=inputs.device)
+        # elif hasattr(model, "null_text_tokens") and text_state is not None:
+        #     denoiser_input.text = model.null_text_tokens.expand(b, text_state.shape[1], -1)
+        # else:
+        #     denoiser_input.text = None
+        pred_unconditional, _ = model._forward(
+            inputs=denoiser_input,
+            temporal_downsample=temporal_downsample,
+            chunk_targets=chunk_targets,
+        )
         pred_out = pred_unconditional + cfg_scale * (pred_conditional - pred_unconditional)
 
     else:
@@ -239,27 +265,44 @@ def step(
 
     return sch_out, qk_list, pred_conditional
 
-def latent_to_original_index(latent_idx, temporal_downsample, chunk_index_gap, offset):
+def latent_to_original_index(latent_idx, temporal_downsample, chunk_index_gap, offset, chunk_targets=True):
+    if not chunk_targets and offset != 0:
+        if isinstance(latent_idx, int):
+            if latent_idx == 0:
+                return 0
+            return temporal_downsample * latent_idx - (temporal_downsample - 1)
+        return torch.where(
+            latent_idx == 0,
+            torch.zeros_like(latent_idx),
+            temporal_downsample * latent_idx - (temporal_downsample - 1),
+        )
     if latent_idx % chunk_index_gap==0:
         idx = temporal_downsample  * latent_idx - (temporal_downsample-1)*(latent_idx//chunk_index_gap)
     else:
         idx = temporal_downsample  * latent_idx - (temporal_downsample-1)*(latent_idx//chunk_index_gap + offset)
     return idx
 
-def original_to_latent_index(idx, temporal_downsample, chunk_index_gap):
+def original_to_latent_index(idx, temporal_downsample, chunk_index_gap, offset=0, chunk_targets=True):
+    if not chunk_targets and offset != 0:
+        if idx == 0:
+            return 0
+        return (idx + temporal_downsample - 2) // temporal_downsample + 1
     frame_index_gap = temporal_downsample * (chunk_index_gap-1) + 1
     k = idx // frame_index_gap
     r = idx % frame_index_gap
     return chunk_index_gap * k + (r + temporal_downsample-1) // temporal_downsample
 
-def preprocess_denoise_mask(denoise_mask, temporal_downsample, num_latents, chunk_index_gap, offset, autoencoder_name: Optional[str]=None):
+def preprocess_denoise_mask(denoise_mask, temporal_downsample, num_latents, chunk_index_gap, offset, autoencoder_name: Optional[str]=None, chunk_targets=True):
     new_denoise_mask = denoise_mask
     if autoencoder_name is not None:
         if autoencoder_name == "wan":
-            num_pose = (num_latents // 5) * 17
+            if chunk_targets:
+                num_pose = (num_latents // 5) * 17
+            else:
+                num_pose = 1 + (num_latents - 1) * temporal_downsample
             idx = torch.nonzero(denoise_mask).squeeze(1)
-            start = latent_to_original_index(idx[0], temporal_downsample, chunk_index_gap, offset)
-            end = latent_to_original_index(idx[-1]+1, temporal_downsample, chunk_index_gap, offset)
+            start = latent_to_original_index(idx[0], temporal_downsample, chunk_index_gap, offset, chunk_targets)
+            end = latent_to_original_index(idx[-1]+1, temporal_downsample, chunk_index_gap, offset, chunk_targets)
             range_idx = torch.arange(start, end)
             new_denoise_mask = torch.zeros((num_pose,), device=denoise_mask.device, dtype=torch.bool)
             new_denoise_mask[range_idx] = True
@@ -283,6 +326,7 @@ def sample(
     scaling_factor: float=1.0,
     chunk_index_gap: int=4,
     offset: int=0, 
+    chunk_targets: bool=True,
     ):
 
     
@@ -322,7 +366,8 @@ def sample(
             num_latents=v_t, 
             chunk_index_gap=chunk_index_gap,
             offset=offset,
-            autoencoder_name=autoencoder_name
+            autoencoder_name=autoencoder_name,
+            chunk_targets=chunk_targets,
         )
 
 
@@ -339,6 +384,7 @@ def sample(
             cond_state=cond_state, 
             text_state=text_state,
             temporal_downsample=temporal_downsample,
+            chunk_targets=chunk_targets,
             scheduler=scheduler,
             cfg_scale=cfg_scale
         )
@@ -358,16 +404,27 @@ def sample(
                     scaling_factor=scaling_factor,
                 )
         elif autoencoder_name == "wan":
-            decoded = []
-            for x in torch.split(x_t, split_size_or_sections=5, dim=1):
-                decoded.append(last_stage_decode(
+            if chunk_targets:
+                decoded = []
+                for x in torch.split(x_t, split_size_or_sections=5, dim=1):
+                    decoded.append(last_stage_decode(
+                        autoencoder=autoencoder,
+                        latents=x, 
+                        view_type="target",
+                        autoencoder_name=autoencoder_name,
+                        scaling_factor=scaling_factor,
+                        chunk_targets=chunk_targets,
+                    ))
+                decoded = torch.concat(decoded, dim=1)
+            else:
+                decoded = last_stage_decode(
                     autoencoder=autoencoder,
-                    latents=x, 
+                    latents=x_t, 
                     view_type="target",
                     autoencoder_name=autoencoder_name,
                     scaling_factor=scaling_factor,
-                ))
-            decoded = torch.concat(decoded, dim=1)
+                    chunk_targets=chunk_targets,
+                )
 
     else:
         decoded = (x_t + 1) / 2

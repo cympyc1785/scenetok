@@ -32,6 +32,13 @@ class ValidationWrapper(Dataset):
                 self.dataset_iterator = iter(self.dataset)
             return next(self.dataset_iterator)
 
-        random_index = torch.randint(0, len(self.dataset), tuple())
-        
-        return self.dataset[random_index.item()]
+        dataset_length = len(self.dataset)
+        if dataset_length == 0:
+            raise ValueError(
+                "ValidationWrapper received an empty dataset. "
+                "Check the validation split path, meta.csv, and dataset filtering options."
+            )
+
+        # random_index = torch.randint(0, dataset_length, tuple())
+
+        return self.dataset[index]

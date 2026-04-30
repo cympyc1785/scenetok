@@ -1,37 +1,45 @@
 # @package _global_
 
 defaults:
-  - override /dataset: davis
-  - override /dataset/view_sampler: front_fixed
+  - override /dataset: dl3dv
+  - override /dataset/view_sampler: bounded
   - override /model/scheduler: rf
   - override /model/denoiser: wan_ti2v_5b
   - override /model/autoencoders/context: va
   - override /model/autoencoders/target: wan
   - override /model/compressor: mv_B1
   - override /model/compressor/camera: ray
-  - override /model/compressor/camera/embedding: patch
+  - override /model/compressor/camera/embedding: lvsm
 
 dataset:
+  root: ./DATA/DL3DV
+  smallset: true
+  target_latent_type: wan
+
+  # NOTE: Allow compatibility with va-wan, refer to docs/KNOWN_BUG.md
+  scale_context_focal_by_256: true
+
   view_sampler:
-    num_context_views: 12
-    num_target_split: 2
+    num_context_views: 16
     num_target_views: 10
-    chunk_index_gap: 5
-    max_distance_between_context_views: 20
+    override_context_gap: 36
+    chunk_targets: false
+    offset: 1
 
 data_loader:
   train:
     batch_size: 4
   val:
     standard:
-      batch_size: 1
+      batch_size: 16
+      max_batches: 8
 
 val:
-  video_length: 49
+  video_length: 34
   window_shift: 5
 
 wandb:
-  tags: [davis, wan-ti2v, lora]
+  tags: [dl3dv, wan-ti2v, lora, recam]
   activated: true
 
 sampler:
@@ -53,6 +61,7 @@ model:
       timestep_shift: 8
 
   denoiser:
+    name: wan_ti2v_5b
     model_root: src/model/DiffSynth-Studio/Wan2.2/Wan2.2-TI2V-5B
     dit_pattern: diffusion_pytorch_model*.safetensors
     text_encoder_path: null
@@ -60,8 +69,26 @@ model:
     seq_len: 512
     clean: whitespace
     gradient_checkpointing: true
+    camera_input_type: none
+    camera_context_spatial_pool: 1
+    input_shape: [16, 16]
+    num_target_split: 2
     ckpt_path: null
     load_strict: true
+    condition_latents_input_type: none
+    camera:
+      name: ray
+      input_shape: [128, 128]
+      normalize: false
+      origin_first: false
+      scale: [1.0, 1.0]
+      embedding:
+        name: time_embed
+        in_channels: 6
+        dropout_prob: 0.0
+        fourier: true
+        freq_origin: 15
+        freq_direction: 15
     lora:
       enabled: true
       rank: 32
@@ -70,7 +97,7 @@ model:
       checkpoint: null
 
   compressor:
-    ckpt_path: checkpoints/va-videodc_dl3dv.ckpt
+    ckpt_path: checkpoints/va-wan_dl3dv.ckpt
     load_strict: false
     kl_weights: [0.0, 0.0]
     input_shape: [16, 16]
@@ -83,17 +110,8 @@ model:
     scene_token_projection: kl
     mask_context: false
     camera:
-      name: ray
       input_shape: [128, 128]
-      normalize: false
-      origin_first: false
-      scale: [1.0, 1.0]
       embedding:
-        name: patch_embed
-        dropout_prob: 0.0
-        in_channels: 6
-        bias: true
-        flatten: true
         patch_size: 16
     kwargs:
       use_rope_2d: true
@@ -117,3 +135,6 @@ optimizer:
     - name: LinearLR
       frequency: 1
       interval: step
+      kwargs:
+        start_factor: 5.e-4
+        total_iters: 2000

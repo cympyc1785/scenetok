@@ -29,6 +29,7 @@ class TrainerCfg:
     validate: bool = True
     accumulate_grad_batches: int=1
     limit_test_batches: int | None=32
+    limit_val_batches: int | None=8
     strategy: str = 'ddp_find_unused_parameters_true'
     devices: int=1
     num_nodes: int=1
@@ -44,6 +45,7 @@ class RootCfg:
         "predict_train",
         "predict_test",
         "preprocess_data",
+        "t2v_prompt",
     ]
     dataset: DatasetCfg
     model: ModelCfg

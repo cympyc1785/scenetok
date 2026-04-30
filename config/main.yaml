@@ -73,7 +73,7 @@ data_loader:
   val:
     standard:
       name: val
-      shuffle: true
+      shuffle: false
       batch_size: 4
       max_batches: 1
       num_workers: 4
@@ -93,6 +93,7 @@ data_loader:
 
 checkpointing:
   load: null
+  save: true
   resume: false
   every_n_train_steps: null # Set to null to only save at the end of training for SLURM Job Arrays. Set to an int value to save checkpoints every n steps.
   save_top_k: 1
@@ -107,6 +108,10 @@ test:
   mode: null
   scene_id: null
   output_dir: ""
+  prompt: null
+  negative_prompt: null
+  num_latent_frames: null
+  fps: 15
   extrapolate_context: false
   num_context_views: 12
   num_condition_views: 1
@@ -124,7 +129,7 @@ val:
 
 
 trainer:
-  max_steps: 1_000_001
+  max_steps: 50_001 # 1_000_001
   val_check_interval: 5000
   task_steps: null
   gradient_clip_val: 0.05 # 0.5
@@ -132,6 +137,7 @@ trainer:
   validate: true
   accumulate_grad_batches: 1
   limit_test_batches: 1
+  limit_val_batches: 8
   strategy: 'ddp_find_unused_parameters_true'
   num_nodes: 1
   devices: 1

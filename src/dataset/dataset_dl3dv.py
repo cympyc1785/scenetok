@@ -24,21 +24,26 @@ from .shims.crop_shim import apply_crop_shim
 
 
 def get_dl3dv_stage_root(cfg: "DatasetDL3DVCfg", stage: Stage) -> Path:
-    return cfg.root / ("test" if stage == "val" else stage)
-
-
-def should_use_dl3dv_1k_only(cfg: "DatasetDL3DVCfg") -> bool:
-    return cfg.overfit is not None
-
+    if cfg.smallset and stage in {"val", "test"}:
+        return cfg.root / "train"
+    # return cfg.root / ("test" if stage == "val" else stage)
+    return cfg.root / "train"
 
 def get_dl3dv_scene_dirs(cfg: "DatasetDL3DVCfg", root: Path, stage: Stage) -> list[Path]:
-    if stage == "train":
-        chunk_ids = [1] if should_use_dl3dv_1k_only(cfg) else range(1, 12)
+    if stage == "train" or str(root).endswith("train"):
+        chunk_ids = [1] if cfg.smallset else range(1, 12)
         chunk_roots = [root / f"{i}K" for i in chunk_ids if (root / f"{i}K").exists()]
         return [
             scene_dir
             for chunk_root in chunk_roots
             for scene_dir in chunk_root.iterdir()
+            if scene_dir.is_dir()
+        ]
+
+    if cfg.smallset and (root / "1K").exists(): # 11K
+        return [
+            scene_dir
+            for scene_dir in (root / "1K").iterdir() # 11K
             if scene_dir.is_dir()
         ]
 
@@ -63,6 +68,18 @@ def get_dl3dv_image_folder(data_dir: Path, folder_key: str) -> Path | None:
         ),
         None,
     )
+
+
+def apply_dl3dv_smallset_filter(chunks: list[Path], stage: Stage) -> list[Path]:
+    if not chunks:
+        return chunks
+
+    desired_prefix = "1K" if stage == "train" else "1K"  # 11K
+    filtered = [chunk for chunk in chunks if chunk.parts and chunk.parts[0] == desired_prefix]
+    if filtered:
+        return filtered
+
+    return chunks
 
 def check_teleport_camera(extrinsics):
     c2w = extrinsics
@@ -183,7 +200,7 @@ class DatasetDL3DVCfg(DatasetCfgCommon):
     scale_focal_by_256: bool=False # Allow compatibility with va-videodc, refer to docs/KNOWN_BUG.md
     scale_context_focal_by_256: bool=False # Allow compatibility with va-wan, refer to docs/KNOWN_BUG.md
     folder_key: str="images_4"
-    overfit: bool = False
+    smallset: bool = True
     target_latent_type: str | None = None
     stage_override: Literal["train", "val", "test"] | None = None
     scene_id: str | None = None
@@ -224,9 +241,9 @@ class DatasetDL3DV(Dataset):
                 if (get_dl3dv_data_dir(scene_dir) / "transforms.json").exists()
                 and get_dl3dv_image_folder(get_dl3dv_data_dir(scene_dir), self.cfg.folder_key) is not None
             )
-        if self.data_stage_override == "train" and should_use_dl3dv_1k_only(self.cfg):
-            print("\n\nOverfitting!\n\n")
-            self.chunks = [chunk for chunk in self.chunks if chunk.parts and chunk.parts[0] == "1K"]
+        if cfg.smallset:
+            print("\ndl3dv small set!\n")
+            self.chunks = apply_dl3dv_smallset_filter(self.chunks, self.data_stage_override)
         if self.cfg.scene_id is not None:
             scene_id = Path(self.cfg.scene_id)
             if scene_id not in self.chunks:
@@ -245,6 +262,7 @@ class DatasetDL3DV(Dataset):
             chunk_path = chunk_path / "nerfstudio"
         images = []
         if os.path.exists(chunk_path / "preprocessed" / "images.npy") and os.path.exists(chunk_path / "preprocessed" / "transforms.npz"):
+            # Load preprocessed data
             chunk_path = chunk_path / "preprocessed"
             images = torch.from_numpy(np.load(chunk_path / "images.npy"))
             if images.dtype == torch.uint8:
@@ -255,6 +273,7 @@ class DatasetDL3DV(Dataset):
             extrinsics = torch.from_numpy(cameras["extrinsics"]).float()
             intrinsics = torch.from_numpy(cameras["intrinsics"]).float()
         else:
+            # Load raw data
             image_folder = next(
                 (
                     chunk_path / folder
@@ -321,10 +340,10 @@ class DatasetDL3DV(Dataset):
             
                 
             sample[view_type] = {
-                "extrinsics": extrinsics[indices],
-                "intrinsics": intrinsics[indices],
-                "latent": images[indices],
-                "index": indices
+                "extrinsics": extrinsics[indices].clone().contiguous(),
+                "intrinsics": intrinsics[indices].clone().contiguous(),
+                "latent": images[indices].clone().contiguous(),
+                "index": indices.clone().contiguous()
             }
 
             if view_type == "context" and self.cfg.scale_context_focal_by_256:

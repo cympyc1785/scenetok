@@ -138,9 +138,14 @@ class DatasetLatent(Dataset):
 
         # Sanity check to make sure number of views are the same as the number of latents (should not occur if latents are precomputed correctly)
         # If there is a discrepency, skip the sample and fetch another one
-        if self.cfg.target_latent_type == "wan" and num_latents != ( 5 * (num_views // 17)):
-            print(f"Number of views {num_views} is not the same as number of latents {num_latents}")
-            return self.__getitem__(index)
+        if self.cfg.target_latent_type == "wan":
+            if getattr(self.view_sampler.cfg, "chunk_targets", True):
+                expected_num_latents = 5 * (num_views // 17)
+            else:
+                expected_num_latents = 1 + (num_views - 1) // getattr(self.view_sampler.cfg, "temporal_downsample", 4)
+            if num_latents != expected_num_latents:
+                print(f"Number of views {num_views} is not compatible with number of latents {num_latents}")
+                return self.__getitem__(index)
         # if self.cfg.target_latent_type == "videodc" and num_latents != ( num_views // 16):
         #     print(f"Number of views {num_views} is not the same as number of latents {num_latents}")
         #     return self.__getitem__(index)

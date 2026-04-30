@@ -56,7 +56,8 @@ class Plucker(Camera[PluckerCfg]):
     def forward(
         self,
         inputs: CameraInputs,
-        temporal_downsample: int=1
+        temporal_downsample: int=1,
+        chunk_targets: bool=True,
     ) -> Float[Tensor, "batch ... channel _ _"]:
         
         intrinsics, extrinsics = inputs.intrinsics, inputs.extrinsics
@@ -78,8 +79,11 @@ class Plucker(Camera[PluckerCfg]):
 
             # First video token encodes one image
             # Need to pad it 
-            n = ray_encodings.shape[1] // 17
-            ray_encodings = torch.chunk(ray_encodings, n, dim=1)
+            if chunk_targets:
+                n = ray_encodings.shape[1] // 17
+                ray_encodings = torch.chunk(ray_encodings, n, dim=1)
+            else:
+                ray_encodings = (ray_encodings,)
             _list = []
             for ray_encoding in ray_encodings:
                 padding = torch.zeros_like(ray_encoding[:, 0:temporal_downsample-1], device=ray_encoding.device, dtype=ray_encoding.dtype)

@@ -1,7 +1,7 @@
 # @package _global_
 
 defaults:
-  - override /dataset: latent_dl3dv
+  - override /dataset: dl3dv
   - override /dataset/view_sampler: bounded
   - override /model/scheduler: rf
   - override /model/denoiser: lightningdit_L_1
@@ -14,6 +14,8 @@ defaults:
   - override /model/denoiser/camera/embedding: lvsm
 
 dataset:
+  root: ./DATA/DL3DV
+  smallset: true
   context_root: "dataset/dl3dv_vavae_latents"
   target_root: "dataset/dl3dv_wan_latents" 
   map_dict: dataset/dl3dv_vavae_latents/map_dict.json
@@ -22,19 +24,28 @@ dataset:
   scale_context_focal_by_256: true  
 
   view_sampler:
+    num_context_views: 16
     num_target_split: 2
     num_target_views: 10
     chunk_index_gap: 5
+    chunk_targets: true
+    # min_distance_between_context_views: 64
+    max_distance_between_context_views: 96
+    context_gap_warm_up_steps: 30_000
+    target_gap_warm_up_steps: 30_000
+    # initial_min_distance_between_context_views: 48
+    initial_max_distance_between_context_views: 64
     offset: 1
 
 data_loader:
   train:
-    batch_size: 4
+    batch_size: 16
   val:
     standard:
       batch_size: 16
+      max_batches: 8
 val:
-  video_length: 68
+  video_length: 34
   window_shift: 5
 wandb:
   tags: [re10k, 256x256]
@@ -55,7 +66,7 @@ model:
       weighting: shifted
       timestep_shift: 8
   denoiser:
-    ckpt_path: checkpoints/va-videodc_dl3dv.ckpt
+    ckpt_path: checkpoints/va-videodc_dl3dv.ckpt # checkpoints/va-videodc_dl3dv.ckpt
     load_strict: false # Backward compatibility: only for provided checkpoints
     input_shape: [16, 16]
     gradient_checkpointing: false
@@ -70,7 +81,7 @@ model:
       in_channels: 48
 
   compressor:
-    ckpt_path: checkpoints/va-videodc_dl3dv.ckpt
+    ckpt_path: checkpoints/va-videodc_dl3dv.ckpt # checkpoints/va-videodc_dl3dv.ckpt
     load_strict: false # Backward compatibility: only for provided checkpoints
     kl_weights: [0.0, 0.0]
     input_shape: [16, 16]

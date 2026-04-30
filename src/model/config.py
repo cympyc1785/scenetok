@@ -101,9 +101,13 @@ class OptimizerCfg:
 
 @dataclass
 class TestCfg:
-    mode: Literal["sequential", "random", "interleave", "single", "pyramid", "pyramid_random", "autoregressive"] | None
+    mode: Literal["sequential", "random", "interleave", "single", "pyramid", "pyramid_random", "autoregressive", "t2v_prompt"] | None
     output_dir: str | Path
     scene_id: int | str | None = None
+    prompt: str | None = None
+    negative_prompt: str | None = None
+    num_latent_frames: int | None = None
+    fps: int = 15
     generation_camera: bool = False
     window_shift: int = 1
     extrapolate_context: bool = False

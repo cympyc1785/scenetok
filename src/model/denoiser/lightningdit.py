@@ -147,14 +147,19 @@ class LightningDiT(Denoiser[LightningDiTCfg]):
     def _forward(
         self,
         inputs: DenoiserInputs,
-        temporal_downsample: int
+        temporal_downsample: int,
+        chunk_targets: bool=True,
     ) -> Float[Tensor, "batch view channel height width"]:
         
 
         latents, pose, timestep, state = inputs.view, inputs.pose, inputs.timestep, inputs.state
         text = inputs.text
         # latents = latents.to(torch.half)
-        pemb = self.pose_embed(pose, temporal_downsample=temporal_downsample)
+        pemb = self.pose_embed(
+            pose,
+            temporal_downsample=temporal_downsample,
+            chunk_targets=chunk_targets,
+        )
 
         if pemb.shape[1] != latents.shape[1]:
             raise ValueError("Shape mismatch", pose.extrinsics.shape, pemb.shape, latents.shape)

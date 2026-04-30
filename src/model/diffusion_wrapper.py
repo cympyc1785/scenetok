@@ -14,6 +14,7 @@ from lightning.pytorch import LightningModule
 from typing import Any, Dict, Iterator, Optional
 from lightning.pytorch.loggers.wandb import WandbLogger
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
+from colorama import Fore
 
 from .metrics import Metric
 from .denoiser import get_denoiser
@@ -35,6 +36,8 @@ from ..visualization.layout import  hcat
 from ..visualization.annotation import add_label
 from ..visualization.camera_trajectory.spline import interpolate_extrinsics_batched
 
+def cyan(text: str) -> str:
+    return f"{Fore.CYAN}{text}{Fore.RESET}"
 
 class DiffusionWrapper(LightningModule):
     logger: Optional[WandbLogger]
@@ -391,6 +394,7 @@ class DiffusionWrapper(LightningModule):
             precomputed_latents=self.dataset_cfg.precomputed_latents,
             autoencoder_name=getattr(self.model_cfg.autoencoders, "context").name,
             scaling_factor=getattr(self.model_cfg.autoencoders, "context").kwargs.scaling_factor,
+            chunk_targets=getattr(self.dataset_cfg.view_sampler, "chunk_targets", True),
         )
 
         target = repeat_batch(batch["target"], repeat_factor)
@@ -420,10 +424,15 @@ class DiffusionWrapper(LightningModule):
             
             elif getattr(self.model_cfg.autoencoders, "target").name == "wan":
                 temporal_downsample = 4
-                num = (v_t // 17) * 5
+                if getattr(self.dataset_cfg.view_sampler, "chunk_targets", True):
+                    num = (v_t // 17) * 5
+                    num_pose_views = (num // 5) * 17
+                else:
+                    num = 1 + (v_t - 1) // temporal_downsample
+                    num_pose_views = 1 + (num - 1) * temporal_downsample
 
-                target["extrinsics"] = target["extrinsics"][:, :(num//5)*17]
-                target["intrinsics"] = target["intrinsics"][:, :(num//5)*17]
+                target["extrinsics"] = target["extrinsics"][:, :num_pose_views]
+                target["intrinsics"] = target["intrinsics"][:, :num_pose_views]
 
         h, w = self.model_cfg.denoiser.input_shape
         x_t = torch.randn((b, num, c, h, w)).to(device)  
@@ -493,6 +502,7 @@ class DiffusionWrapper(LightningModule):
             scaling_factor=getattr(self.model_cfg.autoencoders, "target").kwargs.scaling_factor,
             chunk_index_gap=self.dataset_cfg.view_sampler.chunk_index_gap,
             offset=self.dataset_cfg.view_sampler.offset, 
+            chunk_targets=getattr(self.dataset_cfg.view_sampler, "chunk_targets", True),
         ), scene_tokens
     
     def training_step(self, batch, batch_idx):
@@ -516,6 +526,7 @@ class DiffusionWrapper(LightningModule):
             precomputed_latents=self.dataset_cfg.precomputed_latents,
             autoencoder_name=getattr(self.model_cfg.autoencoders, "target").name,
             scaling_factor=getattr(self.model_cfg.autoencoders, "target").kwargs.scaling_factor,
+            chunk_targets=getattr(self.dataset_cfg.view_sampler, "chunk_targets", True),
         )
         
         device = target_latents.device
@@ -539,6 +550,7 @@ class DiffusionWrapper(LightningModule):
                 precomputed_latents=self.dataset_cfg.precomputed_latents,
                 autoencoder_name=getattr(self.model_cfg.autoencoders, "context").name,
                 scaling_factor=getattr(self.model_cfg.autoencoders, "context").kwargs.scaling_factor,
+                chunk_targets=getattr(self.dataset_cfg.view_sampler, "chunk_targets", True),
             )
             
             b, v_c, *_ = context_latents.shape
@@ -646,7 +658,8 @@ class DiffusionWrapper(LightningModule):
         # flow prediction for targets
         pred, _ = self.denoiser(
             inputs=denoiser_input, 
-            temporal_downsample=self.dataset_cfg.view_sampler.temporal_downsample
+            temporal_downsample=self.dataset_cfg.view_sampler.temporal_downsample,
+            chunk_targets=getattr(self.dataset_cfg.view_sampler, "chunk_targets", True),
         )
         
         # Get ground truth flow for targets
@@ -715,7 +728,8 @@ class DiffusionWrapper(LightningModule):
             view_type="context", 
             precomputed_latents=self.dataset_cfg.precomputed_latents,
             autoencoder_name=getattr(self.model_cfg.autoencoders, "context").name,
-            scaling_factor=getattr(self.model_cfg.autoencoders, "context").kwargs.scaling_factor
+            scaling_factor=getattr(self.model_cfg.autoencoders, "context").kwargs.scaling_factor,
+            chunk_targets=getattr(self.dataset_cfg.view_sampler, "chunk_targets", True),
         )
         target_views = get_images(
             autoencoder=self.autoencoder, 
@@ -723,7 +737,8 @@ class DiffusionWrapper(LightningModule):
             view_type="target", 
             precomputed_latents=self.dataset_cfg.precomputed_latents,
             autoencoder_name=getattr(self.model_cfg.autoencoders, "target").name,
-            scaling_factor=getattr(self.model_cfg.autoencoders, "target").kwargs.scaling_factor
+            scaling_factor=getattr(self.model_cfg.autoencoders, "target").kwargs.scaling_factor,
+            chunk_targets=getattr(self.dataset_cfg.view_sampler, "chunk_targets", True),
         )
         b, v_c, *_ = context_views.shape
 
@@ -734,8 +749,8 @@ class DiffusionWrapper(LightningModule):
         sampled_views, _, _ = self.generate_batch_with_scene(batch, self.sampler)
         b, v_t, c, h, w = sampled_views.shape
         target_views = target_views[:, :v_t]
-        self.generated.append(sampled_views)
-        self.predicted.append(target_views)
+        self.generated.append(sampled_views.detach().cpu())
+        self.predicted.append(target_views.detach().cpu())
         # Only do remaining on Rank: 0 in case of multi-gpu/node
         if self.global_rank != 0:
             return None
@@ -745,26 +760,27 @@ class DiffusionWrapper(LightningModule):
         for j in range(b):
             scene = batch["scene"][j]
             batch_scene.append(scene)
-            
-        log_tensor_as_video(self.logger, sampled_views, f"Sampled Video", fps=8, step=val_step, caption=batch_scene)        
-        log_tensor_as_video(self.logger, target_views, f"Original Video", fps=8, step=val_step, caption=batch_scene) 
+        
+        if batch_idx == 0:
+            log_tensor_as_video(self.logger, sampled_views, f"Sampled Video", fps=8, step=val_step, caption=batch_scene)        
+            log_tensor_as_video(self.logger, target_views, f"Original Video", fps=8, step=val_step, caption=batch_scene) 
           
-        for j in range(b):
-            scene = batch["scene"][j]
-            context_vis = add_label(hcat(*[context_views[j, i, ...] for i in range(v_c)]), "Context Views")
-            vis = add_label(context_vis, scene)
-            batch_vis.append(prep_image(vis))
-            
-        self.logger.log_image(
-            f"Context ({self.sampler.cfg.name})",
-            batch_vis,
-            step=val_step,
-            caption=batch_scene,
-        )
+            for j in range(b):
+                scene = batch["scene"][j]
+                context_vis = add_label(hcat(*[context_views[j, i, ...] for i in range(v_c)]), "Context Views")
+                vis = add_label(context_vis, scene)
+                batch_vis.append(prep_image(vis))
+                
+            self.logger.log_image(
+                f"Context ({self.sampler.cfg.name})",
+                batch_vis,
+                step=val_step,
+                caption=batch_scene,
+            )
 
         # Do a spline interpolation using context poses as "knot" and sample a video
-        print("Generating Context Interpolation Video...")
-        if self.val_cfg.video:
+        if self.val_cfg.video and batch_idx == 0:
+            print(cyan("Generating Context Interpolation Video..."))
             b, v_c, c, h, w = batch["context"]["latent"].shape
             t = self.val_cfg.video_length
             start = batch["context"]["extrinsics"][:, 0]
@@ -789,21 +805,34 @@ class DiffusionWrapper(LightningModule):
     def on_validation_epoch_end(self):
         
         step = self.step_tracker.get_step()
+        
+        assert len(self.predicted) == len(self.generated)
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        torch.cuda.empty_cache()
+        return None
+
+    def on_validation_end(self):
+        step = self.step_tracker.get_step()
+        # if step == 0:
+        #     return
+
         val_step = (step+1) // self.val_check_interval
 
         if len(self.predicted) == 0 or len(self.generated) == 0:
             return None
-        sampled_views = torch.concat(self.generated)
-        target_views = torch.concat(self.predicted)
+        sampled_views = torch.concat(self.generated).to(self.device, non_blocking=True)
+        target_views = torch.concat(self.predicted).to(self.device, non_blocking=True)
         print(sampled_views.shape)
         print(target_views.shape)
-        metrics = self.metric(sampled_views.flatten(0, 1), target_views.flatten(0, 1), psnr=True, ssim=True, lpips=True)
-        self.log("lpips", metrics["lpips"], on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
-        self.log("ssim", metrics["ssim"], on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
-        self.log("psnr", metrics["psnr"], on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        # metrics = self.metric(sampled_views.flatten(0, 1), target_views.flatten(0, 1), psnr=True, ssim=True, lpips=True)
+        # self.log("lpips", metrics["lpips"], on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        # self.log("ssim", metrics["ssim"], on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+        # self.log("psnr", metrics["psnr"], on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
         
-        for key, value in metrics.items():
-            self.logger.log_metrics({f"full_sequence/{key}": value}, val_step)
+        # for key, value in metrics.items():
+        #     self.logger.log_metrics({f"full_sequence/{key}": value}, val_step)
         
         # --- sequence-level metrics ---
         gathered_sampled = self.all_gather(sampled_views)
@@ -812,7 +841,12 @@ class DiffusionWrapper(LightningModule):
         chunk_size = min(16, num_views)
         if getattr(self.model_cfg.autoencoders, "target") is not None:
             if getattr(self.model_cfg.autoencoders, "target").name == "wan":
-                chunk_size = min(17, num_views)
+                if getattr(self.dataset_cfg.view_sampler, "chunk_targets", True):
+                    chunk_size = min(17, num_views)
+                else:
+                    chunk_size = num_views
+        if num_views % chunk_size != 0:
+            chunk_size = num_views
         
         if gathered_sampled.shape[1] != gathered_target.shape[1]:
             print(pred.shape, gt.shape)
@@ -828,13 +862,20 @@ class DiffusionWrapper(LightningModule):
         gathered_target = rearrange(gathered_target, "... c h w -> (...) c h w")
 
         if self.global_rank == 0:
-            
-            gathered_sampled = gathered_sampled.cpu()
-            gathered_target = gathered_target.cpu()
-
-            general_metrics = self.metric(
+            full_sequence_metrics = self.metric(
                 gathered_sampled,
                 gathered_target,
+                psnr=True,
+                ssim=True,
+                lpips=True,
+            )
+
+            for key, value in full_sequence_metrics.items():
+                self.logger.log_metrics({f"full_sequence/{key}": value}, val_step)
+
+            general_metrics = self.metric(
+                gathered_sampled.cpu(),
+                gathered_target.cpu(),
                 num_views=chunk_size,
                 fvd=True,
                 fid=True,
@@ -842,24 +883,14 @@ class DiffusionWrapper(LightningModule):
             
             self.metric.reset_fid()
             self.metric.reset_fvd()
-            
-            if general_metrics["fid"] is not None:
-                self.log("fid", general_metrics["fid"], on_step=False, on_epoch=True, prog_bar=True, sync_dist=False)
-            
-            if general_metrics["fvd"] is not None:
-                self.log("fvd", general_metrics["fvd"], on_step=False, on_epoch=True, prog_bar=True, sync_dist=False)
-            
+
             for key, value in general_metrics.items():
-                self.logger.log_metrics({f"{key}": value}, val_step)
+                if value is not None:
+                    self.logger.log_metrics({f"{key}": value}, val_step)
 
-        torch.distributed.barrier()
-        torch.cuda.empty_cache()
-        return None
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
-    def on_validation_end(self):
-        step = self.step_tracker.get_step()
-        # if step == 0:
-        #     return
         if len(self.predicted) != 0:
             self.predicted.clear()
         if len(self.generated) != 0:
@@ -885,7 +916,7 @@ class DiffusionWrapper(LightningModule):
         b, v_c, *_ = batch["context"]["extrinsics"].shape
 
         print(f"Number of context views: {v_c}")
-        print(f"Number of target views: {v_t}")
+        print(f"Number of target views: {v_t}\n")
 
         target_views=get_images(
             autoencoder=self.autoencoder,
@@ -893,7 +924,8 @@ class DiffusionWrapper(LightningModule):
             view_type="target",
             precomputed_latents=self.dataset_cfg.precomputed_latents,
             autoencoder_name=getattr(self.model_cfg.autoencoders, "target").name,
-            scaling_factor=getattr(self.model_cfg.autoencoders, "target").kwargs.scaling_factor
+            scaling_factor=getattr(self.model_cfg.autoencoders, "target").kwargs.scaling_factor,
+            chunk_targets=getattr(self.dataset_cfg.view_sampler, "chunk_targets", True),
         )
         context_views=get_images(
             autoencoder=self.autoencoder,
@@ -901,7 +933,8 @@ class DiffusionWrapper(LightningModule):
             view_type="context",
             precomputed_latents=self.dataset_cfg.precomputed_latents,
             autoencoder_name=getattr(self.model_cfg.autoencoders, "context").name,
-            scaling_factor=getattr(self.model_cfg.autoencoders, "context").kwargs.scaling_factor
+            scaling_factor=getattr(self.model_cfg.autoencoders, "context").kwargs.scaling_factor,
+            chunk_targets=getattr(self.dataset_cfg.view_sampler, "chunk_targets", True),
         )
 
         # Relative camera w.r.t middle context camera (can be any other context camera)

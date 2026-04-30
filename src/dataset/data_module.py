@@ -146,8 +146,9 @@ class DataModule(LightningDataModule):
             generator = self.get_generator(cfg)
             dataset = get_dataset(self.dataset_cfg, "val", self.step_tracker, generator, force_shuffle=False)
             dataset = self.dataset_shim(dataset, "val")
+            validation_length = cfg.batch_size * cfg.max_batches if cfg.max_batches > 0 else len(dataset)
             dataloaders[key] = DataLoader(
-                ValidationWrapper(dataset, cfg.batch_size) if i == 0 else dataset,
+                ValidationWrapper(dataset, validation_length) if i == 0 else dataset,
                 cfg.batch_size,
                 num_workers=cfg.num_workers,
                 generator=generator,

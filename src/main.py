@@ -50,9 +50,9 @@ def preprocess_dataset_cache(cfg, step_tracker):
     for stage, loader_cfg in stages:
         generator = data_module.get_generator(loader_cfg)
         print(cyan(f"Building {stage} dataset index..."))
-        if cfg.dataset.name == "dl3dv":
-            meta_path = build_dl3dv_meta(cfg.dataset, stage, force=False)
-            print(cyan(f"Using DL3DV meta: {meta_path}"))
+        # if cfg.dataset.name == "dl3dv":
+        #     meta_path = build_dl3dv_meta(cfg.dataset, stage, force=False)
+        #     print(cyan(f"Using DL3DV meta: {meta_path}"))
         dataset = get_dataset(cfg.dataset, stage, step_tracker, generator, force_shuffle=False)
         print(cyan(f"Preprocessing {stage} dataset: {len(dataset)} scenes with {num_workers} workers."))
 
@@ -143,13 +143,18 @@ def train(cfg_dict: DictConfig):
         callbacks.append(GracefulExitCallback(checkpoint_dir=checkpoint_dir))
 
     # Prepare the checkpoint for loading.
-    checkpoint_path = checkpoint_dir / "last.ckpt"
-    if os.path.exists(checkpoint_path):
-        resume = True
-        print("(Main) Resuming from: ", checkpoint_path)
-    else:
+    if cfg.mode != "train" and cfg.checkpointing.load is not None:
         checkpoint_path = update_checkpoint_path(cfg.checkpointing.load, cfg.wandb)
-        resume = cfg.checkpointing.resume
+        resume = False
+        print("(Main) Loading checkpoint for inference/eval: ", checkpoint_path)
+    else:
+        checkpoint_path = checkpoint_dir / "last.ckpt"
+        if os.path.exists(checkpoint_path):
+            resume = True
+            print("(Main) Resuming from: ", checkpoint_path)
+        else:
+            checkpoint_path = update_checkpoint_path(cfg.checkpointing.load, cfg.wandb)
+            resume = cfg.checkpointing.resume
 
     # This allows the current step to be shared with the data loader processes.
     step_tracker = StepTracker(cfg.train.step_offset)
@@ -201,7 +206,8 @@ def train(cfg_dict: DictConfig):
         num_nodes=cfg.trainer.num_nodes,
         precision=cfg.trainer.precision,
         callbacks=callbacks,
-        limit_val_batches=1 if cfg.trainer.validate else 0,
+        # limit_val_batches=1 if cfg.trainer.validate else 0,
+        limit_val_batches=cfg.trainer.limit_val_batches,
         val_check_interval=cfg.trainer.val_check_interval if cfg.trainer.validate else None,
         check_val_every_n_epoch=None,
         enable_checkpointing=cfg.checkpointing.save,
@@ -211,7 +217,7 @@ def train(cfg_dict: DictConfig):
         max_steps=max_steps,
         strategy=cfg.trainer.strategy,
         accumulate_grad_batches=cfg.trainer.accumulate_grad_batches,
-        # limit_test_batches=cfg.trainer.limit_test_batches,
+        limit_test_batches=cfg.trainer.limit_test_batches,
         profiler=get_profiler(cfg.trainer.profiler)
     )
     # model_wrapper.strict_loading = True

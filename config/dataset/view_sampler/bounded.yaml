@@ -13,6 +13,7 @@ initial_max_distance_to_context_views: 0
 random: false
 num_target_split: 1
 chunk_index_gap: 4
+chunk_targets: true
 target_split_prob: 0.8
 temporal_downsample: 4
 
