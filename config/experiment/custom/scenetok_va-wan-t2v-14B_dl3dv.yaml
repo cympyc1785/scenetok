@@ -4,7 +4,7 @@ defaults:
   - override /dataset: dl3dv
   - override /dataset/view_sampler: bounded
   - override /model/scheduler: rf
-  - override /model/denoiser: wan_ti2v_5b
+  - override /model/denoiser: wan_t2v_14b
   - override /model/autoencoders/context: va
   - override /model/autoencoders/target: wan
   - override /model/compressor: mv_B1
@@ -25,8 +25,12 @@ dataset:
   view_sampler:
     num_context_views: 16
     num_target_views: 10
-    override_context_gap: 36
-    max_distance_to_context_views: 0
+    # min_distance_between_context_views: 64
+    max_distance_between_context_views: 96
+    context_gap_warm_up_steps: 30_000
+    target_gap_warm_up_steps: 30_000
+    # initial_min_distance_between_context_views: 48
+    initial_max_distance_between_context_views: 64
     chunk_targets: false
     offset: 1
 
@@ -38,7 +42,7 @@ data_loader:
       shuffle: false
       batch_size: 8
       max_batches: 4
-      num_workers: 4
+      num_workers: 8
       seed: 0
       interval: 5000
       persistent_workers: false
@@ -56,7 +60,7 @@ val:
   window_shift: 5
 
 wandb:
-  tags: [dl3dv, wan-ti2v, lora, recam]
+  tags: [dl3dv, wan-t2v-14b, lora, recam]
   activated: true
 
 sampler:
@@ -70,17 +74,26 @@ freeze:
 model:
   text_encoder: null
 
+  autoencoders:
+    target:
+      pretrained_from: src/model/DiffSynth-Studio/Wan2.2/Wan2.2-T2V-A14B/Wan2.1_VAE.pth
+      kwargs:
+        latent_channels: 16
+
   scheduler:
     sampling_type: random_uniform
-    num_inference_steps: 25
+    num_inference_steps: 50
     kwargs:
       weighting: shifted
       timestep_shift: 8
 
   denoiser:
-    name: wan_ti2v_5b
-    model_root: src/model/DiffSynth-Studio/Wan2.2/Wan2.2-TI2V-5B
+    name: wan_t2v_14b
+    model_root: src/model/DiffSynth-Studio/Wan2.2/Wan2.2-T2V-A14B
+    high_noise_dit_pattern: high_noise_model/diffusion_pytorch_model*.safetensors
+    low_noise_dit_pattern: low_noise_model/diffusion_pytorch_model*.safetensors
     dit_pattern: diffusion_pytorch_model*.safetensors
+    switch_dit_boundary: 0.875
     text_encoder_path: null
     tokenizer_path: null
     seq_len: 512

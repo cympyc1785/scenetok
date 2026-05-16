@@ -49,10 +49,6 @@ def preprocess_dataset_cache(cfg, step_tracker):
 
     for stage, loader_cfg in stages:
         generator = data_module.get_generator(loader_cfg)
-        print(cyan(f"Building {stage} dataset index..."))
-        # if cfg.dataset.name == "dl3dv":
-        #     meta_path = build_dl3dv_meta(cfg.dataset, stage, force=False)
-        #     print(cyan(f"Using DL3DV meta: {meta_path}"))
         dataset = get_dataset(cfg.dataset, stage, step_tracker, generator, force_shuffle=False)
         print(cyan(f"Preprocessing {stage} dataset: {len(dataset)} scenes with {num_workers} workers."))
 
@@ -175,7 +171,7 @@ def train(cfg_dict: DictConfig):
         val_check_interval=cfg.trainer.val_check_interval,
         mode=cfg.mode,
     )
-    if cfg.model.denoiser.name == "wan_ti2v_5b":
+    if cfg.model.denoiser.name in ("wan_ti2v_5b", "wan_t2v_14b"):
         if cfg.mode == "train" and checkpoint_path is not None and not resume:
             model_wrapper = T2VWrapper.load_from_checkpoint(checkpoint_path, **kwargs)
         else:
@@ -208,6 +204,7 @@ def train(cfg_dict: DictConfig):
         callbacks=callbacks,
         # limit_val_batches=1 if cfg.trainer.validate else 0,
         limit_val_batches=cfg.trainer.limit_val_batches,
+        num_sanity_val_steps=cfg.trainer.num_sanity_val_steps,
         val_check_interval=cfg.trainer.val_check_interval if cfg.trainer.validate else None,
         check_val_every_n_epoch=None,
         enable_checkpointing=cfg.checkpointing.save,
@@ -222,7 +219,7 @@ def train(cfg_dict: DictConfig):
     )
     # model_wrapper.strict_loading = True
     if cfg.mode == "train":
-        trainer.fit(model_wrapper, train_dataloaders=data_module.train_dataloader(), val_dataloaders=val_dataloaders["standard"], ckpt_path=checkpoint_path if resume else None)
+        trainer.fit(model_wrapper, train_dataloaders=data_module.train_dataloader(), val_dataloaders=list(val_dataloaders.values()), ckpt_path=checkpoint_path if resume else None)
     elif cfg.mode == "val":
         trainer.validate(model_wrapper, datamodule=data_module, ckpt_path=checkpoint_path)
     elif cfg.mode == "test":

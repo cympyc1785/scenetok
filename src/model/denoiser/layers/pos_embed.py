@@ -118,11 +118,23 @@ class VisionRotaryEmbeddingFast(nn.Module):
             raise ValueError(f'unknown modality {freqs_for}')
 
         if ft_seq_len is None: ft_seq_len = pt_seq_len
-        t = torch.arange(ft_seq_len) / ft_seq_len * pt_seq_len
+        if isinstance(pt_seq_len, (tuple, list)):
+            assert isinstance(ft_seq_len, (tuple, list)), 'ft_seq_len must be a tuple/list when pt_seq_len is a tuple/list'
+            assert len(pt_seq_len) == 2 and len(ft_seq_len) == 2, '2D RoPE expects (height, width) sequence lengths'
+            pt_seq_len_h, pt_seq_len_w = pt_seq_len
+            ft_seq_len_h, ft_seq_len_w = ft_seq_len
+        else:
+            pt_seq_len_h = pt_seq_len_w = pt_seq_len
+            ft_seq_len_h = ft_seq_len_w = ft_seq_len
 
-        freqs = torch.einsum('..., f -> ... f', t, freqs)
-        freqs = repeat(freqs, '... n -> ... (n r)', r = 2)
-        freqs = broadcat((freqs[:, None, :], freqs[None, :, :]), dim = -1)
+        t_h = torch.arange(ft_seq_len_h) / ft_seq_len_h * pt_seq_len_h
+        t_w = torch.arange(ft_seq_len_w) / ft_seq_len_w * pt_seq_len_w
+
+        freqs_h = torch.einsum('..., f -> ... f', t_h, freqs)
+        freqs_h = repeat(freqs_h, '... n -> ... (n r)', r = 2)
+        freqs_w = torch.einsum('..., f -> ... f', t_w, freqs)
+        freqs_w = repeat(freqs_w, '... n -> ... (n r)', r = 2)
+        freqs = broadcat((freqs_h[:, None, :], freqs_w[None, :, :]), dim = -1)
 
         freqs_cos = freqs.cos().view(-1, freqs.shape[-1])
         freqs_sin = freqs.sin().view(-1, freqs.shape[-1])

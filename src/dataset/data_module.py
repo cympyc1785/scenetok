@@ -1,4 +1,5 @@
 import random
+from copy import copy
 from dataclasses import dataclass, field
 from typing import Callable, Literal
 
@@ -77,8 +78,8 @@ class DataLoaderCfg:
     train: DataLoaderStageCfg
     test: DataLoaderStageCfg
     val: dict[str, DataLoaderStageCfg] = field(default_factory= lambda: {
-        "standard": DataLoaderStageCfg(name="val", interval=5000, max_batches=1, batch_size=8),
-        "evaluate": DataLoaderStageCfg(name="val", interval=50000, max_batches=32, batch_size=32, shuffle=False, seed=0)
+        "standard": DataLoaderStageCfg(name="val", interval=5000, max_batches=4, batch_size=16, shuffle=False, seed=0),
+        "unseen": DataLoaderStageCfg(name="val", interval=5000, max_batches=4, batch_size=16, shuffle=False, seed=0),
     })
 
 
@@ -141,10 +142,13 @@ class DataModule(LightningDataModule):
         
         dataloaders = {}
         for i, (key, cfg) in enumerate(self.data_loader_cfg.val.items()):
-            # if key == "standard":
-            #     continue
             generator = self.get_generator(cfg)
-            dataset = get_dataset(self.dataset_cfg, "val", self.step_tracker, generator, force_shuffle=False)
+            dataset_cfg = copy(self.dataset_cfg)
+            if dataset_cfg.name == "dl3dv":
+                dataset_cfg.val_seen = key != "unseen"
+            elif key == "unseen":
+                continue
+            dataset = get_dataset(dataset_cfg, "val", self.step_tracker, generator, force_shuffle=False)
             dataset = self.dataset_shim(dataset, "val")
             validation_length = cfg.batch_size * cfg.max_batches if cfg.max_batches > 0 else len(dataset)
             dataloaders[key] = DataLoader(

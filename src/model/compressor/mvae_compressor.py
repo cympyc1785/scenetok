@@ -171,7 +171,10 @@ class MVAECompressor(Compressor[MVAECompressorCfg]):
             self.feat_rope = RotaryEmbedding3D(full_head_dim, sizes=(num_views, cfg.input_shape[0] // cfg.kwargs.patch_size, cfg.input_shape[1] // cfg.kwargs.patch_size))
         elif cfg.kwargs.use_rope_2d:
             half_head_dim = cfg.kwargs.hidden_size // cfg.kwargs.num_heads // 2
-            hw_seq_len = cfg.input_shape[0] // cfg.kwargs.patch_size
+            hw_seq_len = (
+                cfg.input_shape[0] // cfg.kwargs.patch_size,
+                cfg.input_shape[1] // cfg.kwargs.patch_size,
+            )
             self.feat_rope = VisionRotaryEmbeddingFast(
                 dim=half_head_dim,
                 pt_seq_len=hw_seq_len,
@@ -316,4 +319,3 @@ class MVAECompressor(Compressor[MVAECompressorCfg]):
                     x = self.norm(x)
 
         return x, None
-

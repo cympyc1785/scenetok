@@ -4,29 +4,34 @@ defaults:
   - override /dataset: dl3dv
   - override /dataset/view_sampler: bounded
   - override /model/scheduler: rf
-  - override /model/denoiser: wan_ti2v_5b
+  - override /model/denoiser: lightningdit_L_1
   - override /model/autoencoders/context: va
   - override /model/autoencoders/target: wan
   - override /model/compressor: mv_B1
   - override /model/compressor/camera: ray
   - override /model/compressor/camera/embedding: lvsm
+  - override /model/denoiser/camera: ray
+  - override /model/denoiser/camera/embedding: lvsm
 
 dataset:
   root: ./DATA/DL3DV/DL3DV-960
   smallset: false
-  target_latent_type: wan
 
   context_shape: [256, 256]
   target_shape: [480, 832]
 
   # NOTE: Allow compatibility with va-wan, refer to docs/KNOWN_BUG.md
-  scale_context_focal_by_256: true
+  scale_context_focal_by_256: true  
 
   view_sampler:
     num_context_views: 16
     num_target_views: 10
-    override_context_gap: 36
-    max_distance_to_context_views: 0
+    # min_distance_between_context_views: 64
+    max_distance_between_context_views: 96
+    context_gap_warm_up_steps: 30_000
+    target_gap_warm_up_steps: 30_000
+    # initial_min_distance_between_context_views: 48
+    initial_max_distance_between_context_views: 64
     chunk_targets: false
     offset: 1
 
@@ -38,7 +43,7 @@ data_loader:
       shuffle: false
       batch_size: 8
       max_batches: 4
-      num_workers: 4
+      num_workers: 8
       seed: 0
       interval: 5000
       persistent_workers: false
@@ -50,72 +55,40 @@ data_loader:
       seed: 0
       interval: 5000
       persistent_workers: false
-
 val:
   video_length: 34
   window_shift: 5
-
 wandb:
-  tags: [dl3dv, wan-ti2v, lora, recam]
+  tags: [dl3dv, 480x832]
+
   activated: true
 
 sampler:
   clean_targets: 5
-
 freeze:
   denoiser: false
   compressor: true
-  autoencoder: true
-
 model:
-  text_encoder: null
-
   scheduler:
     sampling_type: random_uniform
     num_inference_steps: 25
     kwargs:
       weighting: shifted
       timestep_shift: 8
-
   denoiser:
-    name: wan_ti2v_5b
-    model_root: src/model/DiffSynth-Studio/Wan2.2/Wan2.2-TI2V-5B
-    dit_pattern: diffusion_pytorch_model*.safetensors
-    text_encoder_path: null
-    tokenizer_path: null
-    seq_len: 512
-    clean: whitespace
-    gradient_checkpointing: true
-    camera_input_type: none
-    camera_context_spatial_pool: 16
     input_shape: [30, 52]
-    num_target_split: 2
-    ckpt_path: null
-    load_strict: true
-    condition_latents_input_type: none
+    gradient_checkpointing: false
+    num_target_split: 2 # Split 3D RoPE to be applied independently per chunk
     camera:
-      name: ray
       input_shape: [240, 416]
-      normalize: false
-      origin_first: false
-      scale: [1.0, 1.0]
       embedding:
-        name: time_embed
-        in_channels: 6
-        dropout_prob: 0.0
-        fourier: true
-        freq_origin: 15
-        freq_direction: 15
-    lora:
-      enabled: true
-      rank: 32
-      alpha: 32
-      target_modules: q,k,v,o,ffn.0,ffn.2
-      checkpoint: null
+        patch_size: 8
+        in_channels: 24
+    kwargs:
+      use_rope_3d: true
+      in_channels: 48
 
   compressor:
-    ckpt_path: checkpoints/va-wan_dl3dv.ckpt
-    load_strict: false
     kl_weights: [0.0, 0.0]
     input_shape: [16, 16]
     num_scene_tokens: 1024
@@ -135,17 +108,20 @@ model:
       use_rope_3d: false
       patch_size: 2
 
+        
 trainer:
   max_steps: 5_000_001
   val_check_interval: 5000
   task_steps: null
   accumulate_grad_batches: 1
   gradient_clip_val: 0.1
+
   precision: bf16-mixed
 
 optimizer:
   name: AdamW
-  lr: 1.0e-4 # 1.0e-5
+  lr: 1.0e-4
+
   scale_lr: false
   milestones: [2000]
   scheduler:
@@ -155,3 +131,10 @@ optimizer:
       kwargs:
         start_factor: 5.e-4
         total_iters: 2000
+
+    - name: MultiStepLR
+      frequency: 1
+      interval: step
+      kwargs:
+        milestones: [20000, 150000, 500000]
+        gamma: 0.4

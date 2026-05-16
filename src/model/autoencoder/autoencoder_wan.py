@@ -2,11 +2,21 @@ from typing import Literal, Optional, Tuple, List
 from dataclasses import dataclass
 from typing import Union
 import torch
+import sys
+from pathlib import Path
+
 from src.model.autoencoder.wanvae import Wan2_2_VAE
 from typing import Callable, Optional
 from jaxtyping import Float
 from torch import Tensor, nn
 from einops import rearrange
+
+DIFFSYNTH_ROOT = Path(__file__).resolve().parents[1] / "DiffSynth-Studio"
+if str(DIFFSYNTH_ROOT) not in sys.path:
+    sys.path.insert(0, str(DIFFSYNTH_ROOT))
+
+from diffsynth.models.wan_video_vae import WanVideoVAE
+from diffsynth.utils.state_dict_converters.wan_video_vae import WanVideoVAEStateDictConverter
 # Refer to https://github.com/huggingface/diffusers/blob/6131a93b969f87d171148bd367fd9990d5a49b6b/src/diffusers/models/autoencoders/autoencoder_kl.py#L38
 @dataclass
 class WanKwargsCfg:
@@ -32,16 +42,26 @@ class AutoencoderWan(nn.Module):
             config: Configuration dict containing img_size, horizon_flip and fp16 parameters
         """
         super().__init__()
-        self.model = Wan2_2_VAE(
-            vae_pth=None
-        )
+        self.latent_channels = cfg.latent_channels
+        self.uses_diffsynth_vae = self.latent_channels == 16
+        if self.latent_channels == 16:
+            self.model = WanVideoVAE(z_dim=16)
+            self.scale = self.model.scale
+        elif self.latent_channels == 48:
+            vae = Wan2_2_VAE(vae_pth=None)
+            self.scale = vae.scale
+            self.model = vae.model
+        else:
+            raise ValueError(f"Unsupported Wan latent_channels={self.latent_channels}. Expected 16 or 48.")
 
         
 
     def from_pretrained(self, ckpt_path, **kwargs):
         print("(Wan) Loading from pretrained weights from: ", ckpt_path)
-        self.model.model.load_state_dict(
-            torch.load(ckpt_path, map_location=torch.device("cpu")), assign=True)
+        state_dict = torch.load(ckpt_path, map_location=torch.device("cpu"))
+        if self.uses_diffsynth_vae:
+            state_dict = WanVideoVAEStateDictConverter(state_dict)
+        self.model.load_state_dict(state_dict, assign=True)
 
         return self
     
@@ -52,9 +72,10 @@ class AutoencoderWan(nn.Module):
     ) -> Float[Tensor, "batch _ _ height width"]:
         
         b, v, c, h, w = x.shape
-        scale = [self.model.scale[0].to(x.device), self.model.scale[1].to(x.device)]
+        scale = [self.scale[0].to(x.device), self.scale[1].to(x.device)]
         x = rearrange(x, "b v c h w -> b c v h w")
-        x = self.model.model.encode(x, scale)
+        model = self.model.model if self.uses_diffsynth_vae else self.model
+        x = model.encode(x, scale)
         x = rearrange(x, "b c v h w -> b v c h w")
         return x
     
@@ -64,8 +85,9 @@ class AutoencoderWan(nn.Module):
     ) -> Float[Tensor, "batch _ _ height width"]:
         
         b, v, c, h, w = x.shape
-        scale = [self.model.scale[0].to(x.device), self.model.scale[1].to(x.device)]
+        scale = [self.scale[0].to(x.device), self.scale[1].to(x.device)]
         x = rearrange(x, "b v c h w -> b c v h w")
-        x = self.model.model.decode(x, scale)
+        model = self.model.model if self.uses_diffsynth_vae else self.model
+        x = model.decode(x, scale)
         x = rearrange(x, "b c v h w -> b v c h w")
         return x

@@ -59,7 +59,7 @@ def first_stage_encode(
                 inputs_single = inputs[:, i:i+1, :, :, :]
                 latents.append(autoencoder[view_type].encode(inputs_single))
             latents = torch.concat(latents, dim=1)
-            latents = rearrange(inputs, "(b v) c h w -> b v c h w", b=b)
+            # latents = rearrange(inputs, "(b v) c h w -> b v c h w", b=b)
         else:
             latents = autoencoder[view_type].encode(inputs.bfloat16()).latent_dist.sample()
             latents = rearrange(latents, "(b v) c h w -> b v c h w", v=v)
@@ -327,12 +327,26 @@ def sample(
     chunk_index_gap: int=4,
     offset: int=0, 
     chunk_targets: bool=True,
+    first_frame_latents: Optional[Float[Tensor, "batch 1 channel height width"]]=None,
     ):
 
     
     device = x_t.device
     b, v_t, c, h, w = x_t.shape
     pred_conditional = None
+    if first_frame_latents is not None:
+        first_frame_latents = first_frame_latents.to(device=x_t.device, dtype=x_t.dtype)
+        if first_frame_latents.shape[0] != b or first_frame_latents.shape[1] != 1:
+            raise ValueError(
+                "first_frame_latents must have shape (batch, 1, channel, height, width): "
+                f"got {first_frame_latents.shape}, expected batch={b}"
+            )
+        if first_frame_latents.shape[2:] != x_t.shape[2:]:
+            raise ValueError(
+                "first_frame_latents must match sampling latent channel/height/width: "
+                f"first_frame_latents={first_frame_latents.shape}, latents={x_t.shape}"
+            )
+        x_t[:, 0:1] = first_frame_latents
 
 
     pbar = tqdm(range(sampler.global_steps), desc=f"Sampling ({sampler.cfg.name}): ")
@@ -388,6 +402,8 @@ def sample(
             scheduler=scheduler,
             cfg_scale=cfg_scale
         )
+        if first_frame_latents is not None:
+            x_t[:, 0:1] = first_frame_latents
         scheduler.unset_scheduling_matrix()
 
     if pred_conditional is None:

@@ -224,7 +224,7 @@ def rescale_and_crop(
 ]:
     *_, h_in, w_in = images.shape
     h_out, w_out = shape
-    assert h_out <= h_in and w_out <= w_in
+    assert h_out <= h_in and w_out <= w_in, f"{h_in}x{w_in} -> {h_out}x{w_out}"
 
     scale_factor = max(h_out / h_in, w_out / w_in)
     h_scaled = round(h_in * scale_factor)

@@ -30,6 +30,7 @@ class TrainerCfg:
     accumulate_grad_batches: int=1
     limit_test_batches: int | None=32
     limit_val_batches: int | None=8
+    num_sanity_val_steps: int | None = 2
     strategy: str = 'ddp_find_unused_parameters_true'
     devices: int=1
     num_nodes: int=1

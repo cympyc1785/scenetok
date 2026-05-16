@@ -1,5 +1,5 @@
 defaults:
-  - dataset: re10k
+  - dataset: dl3dv
   - optional dataset/view_sampler_dataset_specific_config: ${dataset/view_sampler}_${dataset}
   - model/scheduler: rf
   - model/scene_scheduler: null
@@ -74,21 +74,21 @@ data_loader:
     standard:
       name: val
       shuffle: false
-      batch_size: 4
-      max_batches: 1
+      batch_size: 16
+      max_batches: 4
       num_workers: 4
-      seed: null
-      interval: 2500  
+      seed: 0
+      interval: 5000
       persistent_workers: false
-    # evaluate:
-    #   name: val
-    #   shuffle: false
-    #   batch_size: 32
-    #   max_batches: -1
-    #   num_workers: 8
-    #   seed: 0
-    #   interval: 2500  
-    #   persistent_workers: false
+    unseen:
+      name: val
+      shuffle: false
+      batch_size: 16
+      max_batches: 4
+      num_workers: 4
+      seed: 0
+      interval: 5000
+      persistent_workers: false
 
 
 checkpointing:
@@ -138,6 +138,7 @@ trainer:
   accumulate_grad_batches: 1
   limit_test_batches: 1
   limit_val_batches: 8
+  num_sanity_val_steps: 2
   strategy: 'ddp_find_unused_parameters_true'
   num_nodes: 1
   devices: 1

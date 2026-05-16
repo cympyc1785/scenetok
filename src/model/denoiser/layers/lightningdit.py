@@ -353,9 +353,12 @@ class LitDiT(nn.Module):
         self.hidden_size = hidden_size
         self.use_checkpoint = use_checkpoint
         self.num_split = num_split
-        max_shape = max(input_size)
+        if isinstance(input_size, int):
+            input_hw = (input_size, input_size)
+        else:
+            input_hw = tuple(input_size)
         self.causal_attention=causal_attention
-        self.x_embedder = PatchEmbed(max_shape, patch_size, in_channels, hidden_size, bias=True)
+        self.x_embedder = PatchEmbed(input_hw, patch_size, in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size, frequency_embedding_size=frequency_embedding_size)
         # self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
         # num_patches = self.x_embedder.num_patches
@@ -365,14 +368,14 @@ class LitDiT(nn.Module):
         # use rotary position encoding, borrow from EVA
         if self.use_rope:
             half_head_dim = hidden_size // num_heads // 2
-            hw_seq_len = max_shape // patch_size
+            hw_seq_len = (input_hw[0] // patch_size, input_hw[1] // patch_size)
             self.feat_rope = VisionRotaryEmbeddingFast(
                 dim=half_head_dim,
                 pt_seq_len=hw_seq_len,
             )
         elif self.use_rope_3d:
             half_head_dim = hidden_size // num_heads
-            self.feat_rope = RotaryEmbedding3D(half_head_dim, sizes=(num_views // num_split, input_size[0] // patch_size, input_size[1] // patch_size))
+            self.feat_rope = RotaryEmbedding3D(half_head_dim, sizes=(num_views // num_split, input_hw[0] // patch_size, input_hw[1] // patch_size))
         else:
             self.feat_rope = None
 
@@ -427,19 +430,22 @@ class LitDiT(nn.Module):
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
-    def unpatchify(self, x):
+    def unpatchify(self, x, output_size):
         """
         x: (N, T, patch_size**2 * C)
         imgs: (N, H, W, C)
         """
         c = self.out_channels
-        p = self.x_embedder.patch_size[0]
-        h = w = int(x.shape[1] ** 0.5)
-        assert h * w == x.shape[1]
+        patch_h, patch_w = self.x_embedder.patch_size
+        out_h, out_w = output_size
+        assert out_h % patch_h == 0, f"Output height {out_h} is not a multiple of patch height {patch_h}"
+        assert out_w % patch_w == 0, f"Output width {out_w} is not a multiple of patch width {patch_w}"
+        h, w = out_h // patch_h, out_w // patch_w
+        assert h * w == x.shape[1], f"Token count {x.shape[1]} does not match output grid {h}x{w}"
 
-        x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
+        x = x.reshape(shape=(x.shape[0], h, w, patch_h, patch_w, c))
         x = torch.einsum('nhwpqc->nchpwq', x)
-        imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
+        imgs = x.reshape(shape=(x.shape[0], c, out_h, out_w))
         return imgs
 
     def forward(
@@ -480,7 +486,7 @@ class LitDiT(nn.Module):
 
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
         x = rearrange(x, "b (v n) d -> (b v) n d", v=v)
-        x = self.unpatchify(x)  # (N, out_channels, H, W)
+        x = self.unpatchify(x, output_size=(h, w))  # (N, out_channels, H, W)
         x = rearrange(x, "(b v) c h w -> b v c h w", v=v)
 
         if self.learn_sigma:

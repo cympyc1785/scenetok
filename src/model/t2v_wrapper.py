@@ -1,6 +1,6 @@
 import math
 
-from .diffusion import first_stage_encode
+from .diffusion import first_stage_encode, last_stage_decode
 from .diffusion_wrapper import *
 from einops import repeat
 
@@ -9,8 +9,17 @@ class T2VWrapper(DiffusionWrapper):
     def should_use_condition_latents(self):
         return (
             getattr(self.denoiser, "supports_condition_latents", False)
-            and getattr(self.denoiser, "condition_latents_input_type", "none") != "none"
+            and getattr(self.denoiser, "condition_latents_input_type", "none")
+            not in ("none", "first_frame", "first_frame_random")
         )
+
+    def should_replace_first_frame_latent(self, training: bool = False):
+        condition_type = getattr(self.denoiser, "condition_latents_input_type", "none")
+        if condition_type == "first_frame":
+            return True
+        if condition_type == "first_frame_random":
+            return bool(np.random.choice([True, False])) if training else False
+        return False
 
     def preprocess_scene_tokens(self, scene_tokens, shape, device, token_mask=None):
         if not getattr(self.denoiser, "supports_scene_tokens", True):
@@ -69,6 +78,18 @@ class T2VWrapper(DiffusionWrapper):
         context_views = repeat(context_views, "b v c h w -> b (r v) c h w", r=repeat_count)
         context_views = context_views[:, :target_num_views]
 
+        target_image_shape = batch["target"]["latent"].shape[-2:]
+        if context_views.shape[-2:] != target_image_shape:
+            b, v, c, _, _ = context_views.shape
+            context_views = rearrange(context_views, "b v c h w -> (b v) c h w")
+            context_views = F.interpolate(
+                context_views,
+                size=target_image_shape,
+                mode="bilinear",
+                align_corners=False,
+            )
+            context_views = rearrange(context_views, "(b v) c h w -> b v c h w", b=b, v=v)
+
         condition_latents = first_stage_encode(
             autoencoder=self.autoencoder,
             inputs=context_views,
@@ -82,6 +103,49 @@ class T2VWrapper(DiffusionWrapper):
             condition_latents = condition_latents[:, :1]
 
         return condition_latents.to(device=device, dtype=dtype)
+
+    def get_first_frame_latents(self, batch, device, dtype, repeat_factor: int = 1):
+        target_cfg = getattr(self.model_cfg.autoencoders, "target")
+        if target_cfg is None or target_cfg.name != "wan":
+            raise ValueError("first_frame conditioning currently requires the target Wan autoencoder.")
+        if self.dataset_cfg.precomputed_latents["target"]:
+            raise ValueError("first_frame conditioning requires raw target images, not precomputed target latents.")
+
+        first_frame = batch["target"]["latent"][:, :1].to(device=device, dtype=dtype)
+        padding = torch.zeros(
+            first_frame.shape[0],
+            3,
+            *first_frame.shape[2:],
+            device=device,
+            dtype=dtype,
+        )
+        first_frame_video = torch.cat([first_frame, padding], dim=1)
+        first_frame_latents = first_stage_encode(
+            autoencoder=self.autoencoder,
+            inputs=first_frame_video,
+            view_type="target",
+            autoencoder_name=target_cfg.name,
+            scaling_factor=target_cfg.kwargs.scaling_factor,
+            chunk_targets=False,
+        )[:, :1]
+        if repeat_factor != 1:
+            first_frame_latents = repeat(first_frame_latents, "b ... -> (b r) ...", r=repeat_factor)
+
+        # # Test
+        # decoded = []
+        # for x in torch.split(first_frame_latents, split_size_or_sections=5, dim=1):
+        #     decoded.append(last_stage_decode(
+        #         autoencoder=self.autoencoder,
+        #         latents=x, 
+        #         view_type="target",
+        #         autoencoder_name=target_cfg.name,
+        #         scaling_factor=target_cfg.kwargs.scaling_factor,
+        #         chunk_targets=False,
+        #     ))
+        # decoded = torch.concat(decoded, dim=1)
+        # breakpoint()
+        
+        return first_frame_latents.to(device=device, dtype=dtype)
 
     def prepare_target_pose(self, target, num_latents: Optional[int] = None):
         target_cfg = getattr(self.model_cfg.autoencoders, "target")
@@ -161,6 +225,16 @@ class T2VWrapper(DiffusionWrapper):
 
         x_t = torch.randn((b, num, c, h, w), device=device, dtype=dtype, generator=noise_generator)
         x_t *= self.scheduler.init_noise_sigma
+        first_frame_latents = None
+        if self.should_replace_first_frame_latent():
+            first_frame_latents = self.get_first_frame_latents(
+                batch,
+                device=device,
+                dtype=dtype,
+                repeat_factor=repeat_factor,
+            )
+            if first_frame_latents is not None:
+                x_t[:, 0:1] = first_frame_latents
 
         context_camera = CameraInputs(
             intrinsics=batch["context"]["intrinsics"],
@@ -213,6 +287,7 @@ class T2VWrapper(DiffusionWrapper):
             chunk_index_gap=self.dataset_cfg.view_sampler.chunk_index_gap,
             offset=self.dataset_cfg.view_sampler.offset,
             chunk_targets=getattr(self.dataset_cfg.view_sampler, "chunk_targets", True),
+            first_frame_latents=first_frame_latents,
         ), scene_tokens
 
     def test_step(self, batch, batch_idx):
@@ -415,6 +490,15 @@ class T2VWrapper(DiffusionWrapper):
 
         noise = torch.randn_like(target_latents, device=device)
         noisy_latents = self.scheduler.add_noise(target_latents, noise, timestep)
+        first_frame_latents = None
+        if self.should_replace_first_frame_latent(training=True):
+            first_frame_latents = self.get_first_frame_latents(
+                batch,
+                device=device,
+                dtype=dtype,
+            )
+        if first_frame_latents is not None:
+            noisy_latents[:, 0:1] = first_frame_latents
         condition_latents = self.get_condition_latents(
             batch,
             device=device,
@@ -444,6 +528,9 @@ class T2VWrapper(DiffusionWrapper):
             chunk_targets=getattr(self.dataset_cfg.view_sampler, "chunk_targets", True),
         )
         gt = self.process_gt(target_latents, noise, timestep)
+        if first_frame_latents is not None:
+            pred = pred[:, 1:]
+            gt = gt[:, 1:]
         if pred.shape[1] != gt.shape[1]:
             raise RuntimeError("prediction shape mismatch", pred.shape, gt.shape)
 
@@ -456,7 +543,8 @@ class T2VWrapper(DiffusionWrapper):
             loss = einops.reduce(loss, "b v c h w -> b", "mean")
 
         if self.model_cfg.compressor is not None and self.model_cfg.compressor.scene_token_projection == "kl" and conditional_tokens and not self.frozen_compressor:
-            kl = tokens.kl()
+            kl_raw = tokens.kl()
+            kl = kl_raw / (tokens.mean.shape[1] * tokens.mean.shape[2])
             kl_weight = 0.0
             if self.global_step <= self.model_cfg.compressor.kl_schedule[0]:
                 kl_weight = self.model_cfg.compressor.kl_weights[0]
@@ -467,6 +555,7 @@ class T2VWrapper(DiffusionWrapper):
                 kl_weight = self.model_cfg.compressor.kl_weights[1]
             loss = loss + kl_weight * kl
             self.log("loss/kl", kl.mean())
+            self.log("loss/kl_raw", kl_raw.mean())
 
         loss = loss.mean()
         current_lr = self.optimizers().param_groups[0]["lr"]

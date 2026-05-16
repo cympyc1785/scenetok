@@ -26,22 +26,17 @@ from diffsynth.core import load_state_dict
 from diffsynth.core.gradient.gradient_checkpoint import gradient_checkpoint_forward
 from diffsynth.models.model_loader import ModelPool
 from diffsynth.models.wan_video_text_encoder import HuggingfaceTokenizer
-from diffsynth.models.wan_video_dit import (
-    CrossAttention,
-    GateModule,
-    SelfAttention,
-    WanModel,
-    modulate,
-    sinusoidal_embedding_1d,
-)
+from diffsynth.models.wan_video_dit import WanModel, sinusoidal_embedding_1d
 from diffsynth.pipelines.wan_video import model_fn_wan_video
+
+from .recam_wan import install_recam_attention
 
 from colorama import Fore
 def cyan(text: str) -> str:
     return f"{Fore.CYAN}{text}{Fore.RESET}"
 
 @dataclass
-class WanTI2VLoRACfg:
+class WanT2V14BLoRACfg:
     enabled: bool = False
     rank: int = 32
     alpha: int | None = None
@@ -50,27 +45,30 @@ class WanTI2VLoRACfg:
 
 
 @dataclass
-class WanTI2V5BCfg:
-    name: Literal["wan_ti2v_5b"]
+class WanT2V14BCfg:
+    name: Literal["wan_t2v_14b"]
     camera: CameraCfg | None = None
-    model_root: str | Path = Path("src/model/DiffSynth-Studio/Wan2.2/Wan2.2-TI2V-5B")
+    model_root: str | Path = Path("src/model/DiffSynth-Studio/Wan2.2/Wan2.2-T2V-A14B")
+    high_noise_dit_pattern: str = "high_noise_model/diffusion_pytorch_model*.safetensors"
+    low_noise_dit_pattern: str = "low_noise_model/diffusion_pytorch_model*.safetensors"
     dit_pattern: str = "diffusion_pytorch_model*.safetensors"
+    switch_dit_boundary: float = 0.875
     text_encoder_path: str | Path | None = None
     tokenizer_path: str | Path | None = None
     seq_len: int = 512
     clean: str = "whitespace"
     gradient_checkpointing: bool = True
     condition_latents_input_type: Literal["none", "width", "channel", "temporal", "first_frame", "first_frame_random"] = "none"
-    camera_input_type: Literal["none", "recam_attention", "cross_attention", "new_cross_attention", "adaln"] | None = None
+    camera_input_type: Literal["none", "recam_attention", "cross_attention", "adaln"] | None = None
     enable_recam_attention: bool | None = None
     camera_context_spatial_pool: int = 1
-    scene_input_type: Literal["none", "cross_attention", "new_cross_attention", "latent_concat"] = "cross_attention"
+    scene_input_type: Literal["none", "cross_attention", "latent_concat"] = "cross_attention"
     num_target_split: int = 1
     input_shape: int | list[int] = 16
     noise_seed: int | None = None
     ckpt_path: str | Path | None = None
     load_strict: bool = True
-    lora: WanTI2VLoRACfg = field(default_factory=WanTI2VLoRACfg)
+    lora: WanT2V14BLoRACfg = field(default_factory=WanT2V14BLoRACfg)
 
 
 class BatchHead:
@@ -84,143 +82,11 @@ class BatchHead:
         x = head.norm(x) * (1 + scale) + shift
         return head.head(x)
 
-def _match_sequence_length(embedding: torch.Tensor, seq_len: int) -> torch.Tensor:
-    if embedding.shape[1] == seq_len:
-        return embedding
-    if seq_len % embedding.shape[1] != 0:
-        raise ValueError(
-            "Embedding sequence length must divide self-attention input length: "
-            f"embedding={embedding.shape}, seq_len={seq_len}"
-        )
-    repeat_count = seq_len // embedding.shape[1]
-    return embedding.repeat_interleave(repeat_count, dim=1)
 
-
-class NewDiTBlock(nn.Module):
+class WanT2V14BDenoiser(Denoiser[WanT2V14BCfg]):
     def __init__(
         self,
-        has_image_input: bool,
-        dim: int,
-        num_heads: int,
-        ffn_dim: int,
-        eps: float = 1e-6,
-        camera_input_type: str | None = None,
-        scene_input_type: str = "none",
-    ):
-        super().__init__()
-        self.dim = dim
-        self.num_heads = num_heads
-        self.ffn_dim = ffn_dim
-        self.camera_input_type = camera_input_type or "none"
-        self.scene_input_type = scene_input_type
-
-        self.self_attn = SelfAttention(dim, num_heads, eps)
-        self.cross_attn = CrossAttention(
-            dim, num_heads, eps, has_image_input=has_image_input)
-        self.use_scene_cross_attn = self.scene_input_type == "new_cross_attention"
-        if self.use_scene_cross_attn:
-            self.scene_cross_attn = CrossAttention(dim, num_heads, eps, has_image_input=False)
-            self.scene_cross_attn_proj = nn.Linear(dim, dim)
-            self.norm4 = nn.LayerNorm(dim, eps=eps)
-            nn.init.zeros_(self.scene_cross_attn_proj.weight)
-            nn.init.zeros_(self.scene_cross_attn_proj.bias)
-            self.new_modulation = nn.Parameter(torch.randn(1, 9, dim) / dim**0.5)
-        else:
-            self.scene_cross_attn = None
-            self.scene_cross_attn_proj = None
-            self.norm4 = None
-            self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
-        if self.camera_input_type == "recam_attention":
-            self.recam_projector = nn.Linear(dim, dim)
-        else:
-            self.recam_projector = None
-        self.norm1 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
-        self.norm2 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
-        self.norm3 = nn.LayerNorm(dim, eps=eps)
-        self.ffn = nn.Sequential(nn.Linear(dim, ffn_dim), nn.GELU(
-            approximate='tanh'), nn.Linear(ffn_dim, dim))
-        self.gate = GateModule()
-
-    @classmethod
-    def from_dit_block(
-        cls,
-        block: nn.Module,
-        has_image_input: bool,
-        camera_input_type: str | None,
-        scene_input_type: str,
-    ) -> "NewDiTBlock":
-        new_block = cls(
-            has_image_input=has_image_input,
-            dim=block.dim,
-            num_heads=block.num_heads,
-            ffn_dim=block.ffn_dim,
-            eps=block.norm1.eps,
-            camera_input_type=camera_input_type,
-            scene_input_type=scene_input_type,
-        ).to(device=block.modulation.device, dtype=block.modulation.dtype)
-        new_block.load_state_dict(block.state_dict(), strict=False)
-        if new_block.use_scene_cross_attn:
-            with torch.no_grad():
-                new_block.new_modulation[:, : block.modulation.shape[1]].copy_(block.modulation)
-        return new_block
-
-    def forward(self, x, context, scene_context, t_mod, scene_t_mod, freqs, camera_embedding=None):
-        has_seq = len(t_mod.shape) == 4
-        chunk_dim = 2 if has_seq else 1
-        
-        if self.use_scene_cross_attn:
-            modulation = self.new_modulation.to(dtype=t_mod.dtype, device=t_mod.device)
-            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-                modulation[:, :6] + t_mod).chunk(6, dim=chunk_dim)
-            shift_scene, scale_scene, gate_scene = (
-                modulation[:, 6:] + scene_t_mod).chunk(3, dim=chunk_dim)
-        else:
-            # msa: multi-head self-attention  mlp: multi-layer perceptron
-            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-                self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=chunk_dim)
-        
-        if has_seq:
-            if self.use_scene_cross_attn:
-                shift_msa, scale_msa, gate_msa, \
-                shift_mlp, scale_mlp, gate_mlp, \
-                shift_scene, scale_scene, gate_scene = (
-                    shift_msa.squeeze(2), scale_msa.squeeze(2), gate_msa.squeeze(2),
-                    shift_mlp.squeeze(2), scale_mlp.squeeze(2), gate_mlp.squeeze(2),
-                    shift_scene.squeeze(2), scale_scene.squeeze(2), gate_scene.squeeze(2),
-                )
-            else:
-                shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-                    shift_msa.squeeze(2), scale_msa.squeeze(2), gate_msa.squeeze(2),
-                    shift_mlp.squeeze(2), scale_mlp.squeeze(2), gate_mlp.squeeze(2),
-                )
-        
-        input_x = modulate(self.norm1(x), shift_msa, scale_msa)
-
-        if self.camera_input_type == "recam_attention" and camera_embedding is not None:
-            camera_embedding = camera_embedding.to(device=input_x.device, dtype=input_x.dtype)
-            input_x = input_x + _match_sequence_length(camera_embedding, input_x.shape[1])
-
-        self_attn = self.self_attn(input_x, freqs)
-        if self.recam_projector is not None:
-            self_attn = self.recam_projector(self_attn)
-
-        x = self.gate(x, gate_msa, self_attn)
-        x = x + self.cross_attn(self.norm3(x), context)
-
-        if self.use_scene_cross_attn:
-            input_x = modulate(self.norm4(x), shift_scene, scale_scene)
-            scene_residual = self.scene_cross_attn(input_x, scene_context)
-            scene_residual = self.scene_cross_attn_proj(scene_residual)
-            x = self.gate(x, gate_scene, scene_residual)
-        
-        input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
-        x = self.gate(x, gate_mlp, self.ffn(input_x))
-        return x
-        
-class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
-    def __init__(
-        self,
-        cfg: WanTI2V5BCfg,
+        cfg: WanT2V14BCfg,
         cond_dim: int | None = 1,
         num_scene_tokens: int = 1,
         temporal_downsample: int = 1,
@@ -229,17 +95,16 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
     ) -> None:
         super().__init__(cfg)
         self.model_root = Path(cfg.model_root)
-        self.model = self._load_model("wan_video_dit", self._resolve_dit_paths())
+        self.high_noise_model = self._load_model("wan_video_dit", self._resolve_dit_paths("high"))
+        self.low_noise_model = self._load_model("wan_video_dit", self._resolve_dit_paths("low"))
         self.supports_scene_tokens = True
         self.supports_condition_latents = True
         self.condition_latents_input_type = cfg.condition_latents_input_type
         self.supports_per_view_timestep = False
         self.uses_internal_text_encoder = True
         self.camera_input_type = getattr(cfg, "camera_input_type", None)
-        self.scene_input_type = getattr(cfg, "scene_input_type", None)
         if self.camera_input_type is None and cfg.enable_recam_attention is not None:
             self.camera_input_type = "recam_attention" if cfg.enable_recam_attention else "none"
-        self._replace_dit_blocks_with_new_blocks(self.model)
         self.num_scene_tokens = num_scene_tokens
         self.cond_dim = 1 if cond_dim is None else cond_dim
         self.text_embed_dim = 4096
@@ -250,7 +115,7 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
         self.negative_prompt = None
         if cfg.camera is not None:
             camera_cfg = deepcopy(cfg.camera)
-            if self.camera_input_type in ("cross_attention", "new_cross_attention"):
+            if self.camera_input_type == "cross_attention":
                 pool_size = cfg.camera_context_spatial_pool
                 if pool_size < 1:
                     raise ValueError(f"camera_context_spatial_pool must be >= 1, got {pool_size}.")
@@ -277,20 +142,16 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
         #     nn.GELU(approximate="tanh"),
         #     nn.Linear(self.model.dim, self.model.dim),
         # ).to(device=ref_param.device, dtype=ref_param.dtype)
-        if self.scene_input_type == "new_cross_attention":
-            self.model.scene_time_projection = nn.Sequential(
-                nn.SiLU(), nn.Linear(self.model.dim, self.model.dim * 3))
-        if self.camera_input_type in ("cross_attention", "new_cross_attention"):
-            self.model.camera_embedding = nn.Sequential(
-                nn.Linear(self.text_embed_dim, self.model.dim),
-                nn.GELU(approximate="tanh"),
-                nn.Linear(self.model.dim, self.model.dim),
-            ).to(device=ref_param.device, dtype=ref_param.dtype)
+        if self.camera_input_type == "cross_attention":
+            for model in self._iter_dit_models():
+                model.camera_embedding = nn.Sequential(
+                    nn.Linear(self.text_embed_dim, model.dim),
+                    nn.GELU(approximate="tanh"),
+                    nn.Linear(model.dim, model.dim),
+                ).to(device=ref_param.device, dtype=ref_param.dtype)
         if self.camera_input_type == "recam_attention":
-            self.model.recam_camera_encoder = nn.Linear(12, self.model.dim).to(
-                device=ref_param.device,
-                dtype=ref_param.dtype,
-            )
+            for model in self._iter_dit_models():
+                install_recam_attention(model, camera_dim=12)
         self.text_encoder = self._load_model(
             "wan_video_text_encoder",
             self._resolve_text_encoder_path(),
@@ -304,18 +165,31 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
             clean=cfg.clean,
         )
 
-        if cfg.lora.enabled and cfg.scene_input_type != "new_cross_attention":
+        if cfg.lora.enabled:
             self._enable_lora(cfg.lora)
         if cfg.ckpt_path is not None:
             self.load_weights(cfg.ckpt_path, strict=cfg.load_strict)
         self._set_trainable_parameters()
         self._log_trainable_modules()
 
-    def _resolve_dit_paths(self) -> list[str]:
-        paths = sorted(glob.glob(str(self.model_root / self.cfg.dit_pattern)))
+    @property
+    def model(self) -> WanModel:
+        return self.high_noise_model
+
+    def _iter_dit_models(self) -> tuple[nn.Module, nn.Module]:
+        return self.high_noise_model, self.low_noise_model
+
+    def _resolve_dit_paths(self, noise_level: Literal["high", "low"] | None = None) -> list[str]:
+        if noise_level == "high":
+            pattern = self.cfg.high_noise_dit_pattern
+        elif noise_level == "low":
+            pattern = self.cfg.low_noise_dit_pattern
+        else:
+            pattern = self.cfg.dit_pattern
+        paths = sorted(glob.glob(str(self.model_root / pattern)))
         if not paths:
             raise FileNotFoundError(
-                f"Could not find Wan TI2V weights under {self.model_root / self.cfg.dit_pattern}"
+                f"Could not find Wan T2V 14B weights under {self.model_root / pattern}"
             )
         return paths
 
@@ -337,18 +211,6 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
             raise RuntimeError(f"Failed to load `{model_name}` from {path}.")
         return model
 
-    def _replace_dit_blocks_with_new_blocks(self, model: WanModel) -> None:
-        has_image_input = bool(getattr(model, "has_image_input", False))
-        model.blocks = nn.ModuleList(
-            NewDiTBlock.from_dit_block(
-                block,
-                has_image_input=has_image_input,
-                camera_input_type=self.camera_input_type,
-                scene_input_type=self.cfg.scene_input_type,
-            )
-            for block in model.blocks
-        )
-
     def _map_lora_state_dict(self, state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         mapped = {}
         for key, value in state_dict.items():
@@ -358,53 +220,47 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
             mapped[key] = value
         return mapped
 
-    def _enable_lora(self, lora_cfg: WanTI2VLoRACfg) -> None:
+    def _enable_lora(self, lora_cfg: WanT2V14BLoRACfg) -> None:
         target_modules = [name.strip() for name in lora_cfg.target_modules.split(",") if name.strip()]
         lora_alpha = lora_cfg.alpha if lora_cfg.alpha is not None else lora_cfg.rank
-        self.model = inject_adapter_in_model(
-            LoraConfig(
-                r=lora_cfg.rank,
-                lora_alpha=lora_alpha,
-                target_modules=target_modules,
-            ),
-            self.model,
+        config = LoraConfig(
+            r=lora_cfg.rank,
+            lora_alpha=lora_alpha,
+            target_modules=target_modules,
         )
-        for name, param in self.model.named_parameters():
-            param.requires_grad = "lora_" in name or "recam_" in name
+        self.high_noise_model = inject_adapter_in_model(config, self.high_noise_model)
+        self.low_noise_model = inject_adapter_in_model(deepcopy(config), self.low_noise_model)
+        for model in self._iter_dit_models():
+            for name, param in model.named_parameters():
+                param.requires_grad = "lora_" in name or "recam_" in name
 
         if lora_cfg.checkpoint is not None:
             state_dict = load_state_dict(str(lora_cfg.checkpoint))
             state_dict = self._map_lora_state_dict(state_dict)
-            self.model.load_state_dict(state_dict, strict=False)
+            self.high_noise_model.load_state_dict(state_dict, strict=False)
+            self.low_noise_model.load_state_dict(state_dict, strict=False)
 
     def _set_trainable_parameters(self) -> None:
-        for param in self.model.parameters():
-            param.requires_grad = False
+        for model in self._iter_dit_models():
+            for param in model.parameters():
+                param.requires_grad = False
 
         trainable_model_substrings = ("recam_projector", "recam_camera_encoder", "lora_")
-        for name, param in self.model.named_parameters():
-            trainable = any(key in name for key in trainable_model_substrings)
-            trainable = trainable or (
-                self.camera_input_type == "recam_attention"
-                and ".self_attn." in name
-            )
-            if not self.cfg.lora.enabled:
-                trainable = trainable or name.startswith("text_embedding.")
-            # trainable = trainable or name.startswith("scene_embedding.")
-            trainable = trainable or (
-                self.camera_input_type in ("cross_attention", "new_cross_attention")
-                and name.startswith("camera_embedding.")
-            )
-            trainable = trainable or (
-                self.cfg.scene_input_type == "new_cross_attention"
-                and (
-                    ".scene_cross_attn." in name
-                    or ".scene_cross_attn_proj." in name
-                    or ".norm4." in name
-                    or name.endswith(".new_modulation")
+        for model in self._iter_dit_models():
+            for name, param in model.named_parameters():
+                trainable = any(key in name for key in trainable_model_substrings)
+                trainable = trainable or (
+                    self.camera_input_type == "recam_attention"
+                    and ".self_attn." in name
                 )
-            )
-            param.requires_grad = trainable
+                if not self.cfg.lora.enabled:
+                    trainable = trainable or name.startswith("text_embedding.")
+                # trainable = trainable or name.startswith("scene_embedding.")
+                trainable = trainable or (
+                    self.camera_input_type == "cross_attention"
+                    and name.startswith("camera_embedding.")
+                )
+                param.requires_grad = trainable
 
         for param in self.cnd_proj.parameters():
             param.requires_grad = True
@@ -431,12 +287,6 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
                 group_name = "model.recam_projector"
             elif ".self_attn." in name:
                 group_name = "model.self_attn"
-            elif ".scene_cross_attn." in name:
-                group_name = "model.scene_cross_attn"
-            elif ".scene_cross_attn_proj." in name:
-                group_name = "model.scene_cross_attn_proj"
-            elif name.endswith(".modulation") or name.endswith(".new_modulation"):
-                group_name = "model.modulation"
             # elif name.startswith("model.scene_embedding."):
             #     group_name = "model.scene_embedding"
             # elif name.startswith("model.camera_embedding."):
@@ -458,11 +308,11 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
             total_params += param.numel()
             total_tensors += 1
 
-        print(cyan("\n\n[WanTI2V] Trainable modules:"))
+        print(cyan("\n\n[WanT2V14B] Trainable modules:"))
         for group_name in sorted(grouped):
             stats = grouped[group_name]
             print(f"  - {group_name}: {stats['params']:,} params across {stats['tensors']} tensors")
-        print(cyan(f"[WanTI2V] Total trainable: {total_params:,} params across {total_tensors} tensors\n\n"))
+        print(cyan(f"[WanT2V14B] Total trainable: {total_params:,} params across {total_tensors} tensors\n\n"))
 
     def encode_text_condition(self, text: str | list[str], device: torch.device) -> torch.Tensor | None:
         if text is None:
@@ -475,8 +325,6 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
             seq_lens = mask.gt(0).sum(dim=1).long()
             for i, v in enumerate(seq_lens):
                 text_state[i, v:] = 0
-
-            text_state = self.model.text_embedding(text_state)
         return text_state.to(dtype=next(self.model.parameters()).dtype)
 
     def load_weights(
@@ -487,13 +335,32 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
         state_dict = torch.load(path, map_location=torch.device("cpu"))
         if "state_dict" in state_dict:
             state_dict = state_dict["state_dict"]
+        high_prefix = "denoiser.high_noise_model."
+        low_prefix = "denoiser.low_noise_model."
+        if any(key.startswith(high_prefix) or key.startswith(low_prefix) for key in state_dict):
+            high_state_dict = {
+                key.replace(high_prefix, "", 1): value
+                for key, value in state_dict.items()
+                if key.startswith(high_prefix)
+            }
+            low_state_dict = {
+                key.replace(low_prefix, "", 1): value
+                for key, value in state_dict.items()
+                if key.startswith(low_prefix)
+            }
+            if high_state_dict:
+                self.high_noise_model.load_state_dict(high_state_dict, **kwargs)
+            if low_state_dict:
+                self.low_noise_model.load_state_dict(low_state_dict, **kwargs)
+            return
         if any(key.startswith("denoiser.model.") for key in state_dict):
             state_dict = {
                 key.replace("denoiser.model.", "", 1): value
                 for key, value in state_dict.items()
                 if key.startswith("denoiser.model.")
             }
-        self.model.load_state_dict(state_dict, **kwargs)
+        self.high_noise_model.load_state_dict(state_dict, **kwargs)
+        self.low_noise_model.load_state_dict(state_dict, **kwargs)
 
     def _get_camera_embedding(
         self,
@@ -623,6 +490,49 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
             return pred[..., crop_size:]
         raise ValueError(f"Unsupported condition latent concat dim for crop: {concat_dim}")
 
+    def _slice_batch_tensor(
+        self,
+        tensor: torch.Tensor | None,
+        indices: torch.Tensor,
+        batch_size: int,
+    ) -> torch.Tensor | None:
+        if tensor is None:
+            return None
+        if tensor.shape[0] == batch_size:
+            return tensor[indices]
+        return tensor
+
+    def _run_expert(
+        self,
+        model: WanModel,
+        latents: torch.Tensor,
+        timestep: torch.Tensor,
+        context: torch.Tensor | None,
+        scene_context: torch.Tensor | None,
+        camera_context: torch.Tensor | None,
+        condition_latents: torch.Tensor | None,
+        condition_latents_concat_dim: int | None,
+        target_latent_shape: torch.Size,
+    ) -> torch.Tensor:
+        pred = simple_wan_video_fn(
+            dit=model,
+            latents=latents,
+            timestep=timestep,
+            context=context,
+            scene_context=scene_context,
+            scene_input_type=self.cfg.scene_input_type,
+            camera_context=camera_context,
+            camera_input_type=self.camera_input_type,
+            fuse_vae_embedding_in_latents=False,
+            use_gradient_checkpointing=self.cfg.gradient_checkpointing and self.training,
+        )
+        return self._crop_condition_latents_prediction(
+            pred,
+            condition_latents,
+            condition_latents_concat_dim,
+            target_latent_shape,
+        )
+
     def _forward(
         self,
         inputs: DenoiserInputs,
@@ -645,35 +555,67 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
 
         context = inputs.text
         scene_context = inputs.state
-        # if context is None and self.cfg.scene_input_type != "cross_attention":
-            # context = self.null_tokens.expand(latents.shape[0], -1, -1).to(
-            #     device=latents.device,
-            #     dtype=latents.dtype,
-            # )
-        if context is None:
-            context = self.encode_text_condition("", device=latents.device)
+        if context is None and self.cfg.scene_input_type != "cross_attention":
+            context = self.null_tokens.expand(latents.shape[0], -1, -1).to(
+                device=latents.device,
+                dtype=latents.dtype,
+            )
 
         camera_embedding = self._get_camera_embedding(inputs, temporal_downsample, chunk_targets)
         camera_context = self._get_camera_context(camera_embedding)
 
-        pred = simple_wan_video_fn(
-            dit=self.model,
-            latents=latents,
-            timestep=timestep,
-            context=context,
-            scene_context=scene_context,
-            scene_input_type=self.cfg.scene_input_type,
-            camera_context=camera_context,
-            camera_input_type=self.camera_input_type,
-            fuse_vae_embedding_in_latents=False,
-            use_gradient_checkpointing=self.cfg.gradient_checkpointing and self.training,
-        )
-        pred = self._crop_condition_latents_prediction(
-            pred,
-            condition_latents,
-            condition_latents_concat_dim,
-            target_latent_shape,
-        )
+        boundary = self.cfg.switch_dit_boundary * 1000
+        high_noise_mask = timestep >= boundary
+        if bool(high_noise_mask.all()):
+            pred = self._run_expert(
+                self.high_noise_model,
+                latents,
+                timestep,
+                context,
+                scene_context,
+                camera_context,
+                condition_latents,
+                condition_latents_concat_dim,
+                target_latent_shape,
+            )
+        elif not bool(high_noise_mask.any()):
+            pred = self._run_expert(
+                self.low_noise_model,
+                latents,
+                timestep,
+                context,
+                scene_context,
+                camera_context,
+                condition_latents,
+                condition_latents_concat_dim,
+                target_latent_shape,
+            )
+        else:
+            batch_size = latents.shape[0]
+            if context is not None and context.shape[0] != batch_size:
+                raise ValueError(
+                    "WanT2V14BDenoiser cannot split mixed high/low timestep batches "
+                    f"when context batch differs from latent batch: context={context.shape}, latents={latents.shape}"
+                )
+            pred = torch.empty(target_latent_shape, dtype=latents.dtype, device=latents.device)
+            for model, mask in (
+                (self.high_noise_model, high_noise_mask),
+                (self.low_noise_model, ~high_noise_mask),
+            ):
+                indices = mask.nonzero(as_tuple=True)[0]
+                subset_target_shape = torch.Size([indices.shape[0], *target_latent_shape[1:]])
+                subset_pred = self._run_expert(
+                    model,
+                    latents[indices],
+                    timestep[indices],
+                    self._slice_batch_tensor(context, indices, batch_size),
+                    self._slice_batch_tensor(scene_context, indices, batch_size),
+                    self._slice_batch_tensor(camera_context, indices, batch_size),
+                    self._slice_batch_tensor(condition_latents, indices, batch_size),
+                    condition_latents_concat_dim,
+                    subset_target_shape,
+                )
+                pred[indices] = subset_pred
         pred = rearrange(pred, "b c v h w -> b v c h w")
         return pred, None
 
@@ -683,30 +625,29 @@ def simple_wan_video_fn(
     timestep: torch.Tensor = None,
     context: torch.Tensor = None,
     scene_context: torch.Tensor = None,
-    scene_input_type: Literal["none", "cross_attention", "new_cross_attention", "latent_concat"] = "cross_attention",
+    scene_input_type: Literal["none", "cross_attention", "latent_concat"] = "cross_attention",
     camera_context: torch.Tensor = None,
-    camera_input_type: Literal["none", "recam_attention", "cross_attention", "new_cross_attention", "adaln"] | None = None,
+    camera_input_type: Literal["none", "recam_attention", "cross_attention", "adaln"] | None = None,
     fuse_vae_embedding_in_latents: bool = False,
     use_gradient_checkpointing: bool = False,
     use_gradient_checkpointing_offload: bool = False,
 ):
-    if scene_input_type not in ("none", "cross_attention", "new_cross_attention", "latent_concat"):
+    if scene_input_type not in ("none", "cross_attention", "latent_concat"):
         raise ValueError(
             f"Unsupported scene_input_type={scene_input_type!r}. "
-            "Expected 'none', 'cross_attention', 'new_cross_attention', or 'latent_concat'."
+            "Expected 'none', 'cross_attention', or 'latent_concat'."
         )
     if camera_input_type is None:
         camera_input_type = "none"
-    if camera_input_type not in ("none", "recam_attention", "cross_attention", "new_cross_attention", "adaln"):
+    if camera_input_type not in ("none", "recam_attention", "cross_attention", "adaln"):
         raise ValueError(
             f"Unsupported camera_input_type={camera_input_type!r}. "
-            "Expected 'none', 'recam_attention', 'cross_attention', 'new_cross_attention', or 'adaln'."
+            "Expected 'none', 'recam_attention', 'cross_attention', or 'adaln'."
         )
 
     adaln_camera_embedding = camera_context if camera_input_type == "adaln" else None
     recam_camera_embedding = camera_context if camera_input_type == "recam_attention" else None
     cross_attention_camera_context = camera_context if camera_input_type == "cross_attention" else None
-    cross_attention_scene_context = None
 
     # Timestep
     if dit.seperated_timestep and fuse_vae_embedding_in_latents:
@@ -737,13 +678,9 @@ def simple_wan_video_fn(
             adaln_camera_embedding = adaln_camera_embedding.to(dtype=t.dtype, device=t.device)
             t = t + adaln_camera_embedding
         t_mod = dit.time_projection(t).unflatten(1, (6, dit.dim))
-        scene_t_mod = None
-        if scene_input_type == "new_cross_attention":
-            scene_t_mod = dit.scene_time_projection(t).unflatten(1, (3, dit.dim))
 
-    # embedding해서 넣으쇼
-    # if context is not None:
-    #     context = dit.text_embedding(context)
+    if context is not None and context.shape[-1] != dit.dim:
+        context = dit.text_embedding(context)
     if cross_attention_camera_context is not None:
         cross_attention_camera_context = cross_attention_camera_context.to(dtype=latents.dtype, device=latents.device)
         if context is None:
@@ -766,47 +703,19 @@ def simple_wan_video_fn(
     if scene_context is not None and scene_input_type != "none":
         scene_context = scene_context.to(dtype=latents.dtype, device=latents.device)
         scene_context = dit.embed_scene_context(scene_context)
-        if scene_input_type == "new_cross_attention":
-            cross_attention_scene_context = scene_context
-        elif scene_input_type == "cross_attention":
+        if scene_input_type == "cross_attention":
             if context is None:
                 context = scene_context
             else:
                 context = torch.cat([context, scene_context], dim=1)
         else:
             scene_latent_tokens = scene_context
-    if context is None and cross_attention_scene_context is None:
-        raise ValueError("simple_wan_video_fn requires `context` or `scene_context` for cross-attention.")
+    if context is None:
+        raise ValueError("simple_wan_video_fn requires `context` for cross-attention.")
 
     x = latents
-    conditioning_batch = x.shape[0]
-    if context is not None:
-        conditioning_batch = max(conditioning_batch, context.shape[0])
-    if cross_attention_scene_context is not None:
-        conditioning_batch = max(conditioning_batch, cross_attention_scene_context.shape[0])
-
-    if context is not None and context.shape[0] != conditioning_batch:
-        if context.shape[0] != 1:
-            raise ValueError(
-                "context batch size must match latent batch size or be broadcastable: "
-                f"context={context.shape[0]}, latents={x.shape[0]}, conditioning_batch={conditioning_batch}"
-            )
-        context = context.expand(conditioning_batch, -1, -1)
-    if cross_attention_scene_context is not None and cross_attention_scene_context.shape[0] != conditioning_batch:
-        if cross_attention_scene_context.shape[0] != 1:
-            raise ValueError(
-                "scene_context batch size must match latent batch size or be broadcastable: "
-                f"scene_context={cross_attention_scene_context.shape[0]}, latents={x.shape[0]}, "
-                f"conditioning_batch={conditioning_batch}"
-            )
-        cross_attention_scene_context = cross_attention_scene_context.expand(conditioning_batch, -1, -1)
-    if x.shape[0] != conditioning_batch:
-        if conditioning_batch % x.shape[0] != 0:
-            raise ValueError(
-                "latent batch size must divide conditioning batch size: "
-                f"latents={x.shape[0]}, conditioning_batch={conditioning_batch}"
-            )
-        x = torch.cat([x] * (conditioning_batch // x.shape[0]), dim=0)
+    if x.shape[0] != context.shape[0]:
+        x = torch.cat([x] * context.shape[0], dim=0)
 
     x = dit.patchify(x)
     f, h, w = x.shape[2:]
@@ -843,12 +752,20 @@ def simple_wan_video_fn(
         freqs = torch.cat([freqs, scene_freqs], dim=0)
 
     for block_id, block in enumerate(dit.blocks):
-        x = gradient_checkpoint_forward(
-            block,
-            use_gradient_checkpointing,
-            use_gradient_checkpointing_offload,
-            x, context, cross_attention_scene_context, t_mod, scene_t_mod, freqs, recam_camera_embedding
-        )
+        if recam_camera_embedding is not None:
+            x = gradient_checkpoint_forward(
+                block,
+                use_gradient_checkpointing,
+                use_gradient_checkpointing_offload,
+                x, context, t_mod, freqs, recam_camera_embedding
+            )
+        else:
+            x = gradient_checkpoint_forward(
+                block,
+                use_gradient_checkpointing,
+                use_gradient_checkpointing_offload,
+                x, context, t_mod, freqs
+            )
 
     x = BatchHead.forward(dit.head, x, t)
     if scene_latent_token_count:

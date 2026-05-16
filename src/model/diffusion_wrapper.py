@@ -39,6 +39,57 @@ from ..visualization.camera_trajectory.spline import interpolate_extrinsics_batc
 def cyan(text: str) -> str:
     return f"{Fore.CYAN}{text}{Fore.RESET}"
 
+def get_target_latent_shape(dataset_cfg: DatasetCfg, model_cfg: ModelCfg) -> list[int] | None:
+    target_shape = getattr(dataset_cfg, "target_shape", None)
+    if target_shape is None:
+        return None
+
+    target_cfg = getattr(model_cfg.autoencoders, "target", None)
+    target_name = None if target_cfg is None else target_cfg.name
+    if target_name is None:
+        spatial_compression_ratio = 1
+    elif target_name in {"wan", "wan_single"}:
+        spatial_compression_ratio = 8 if target_cfg.kwargs.latent_channels == 16 else 16
+    elif target_name == "va":
+        spatial_compression_ratio = 16
+    elif target_name == "video_dc":
+        spatial_compression_ratio = target_cfg.kwargs.spatial_compression_ratio
+    else:
+        print(
+            cyan(
+                f"Skipping automatic denoiser input_shape for unsupported "
+                f"target autoencoder: {target_name}"
+            )
+        )
+        return None
+
+    h, w = target_shape
+    if h % spatial_compression_ratio != 0 or w % spatial_compression_ratio != 0:
+        raise ValueError(
+            "target_shape must be divisible by the target autoencoder spatial "
+            f"compression ratio: target_shape={target_shape}, "
+            f"spatial_compression_ratio={spatial_compression_ratio}"
+        )
+    return [h // spatial_compression_ratio, w // spatial_compression_ratio]
+
+def set_denoiser_input_shape_from_target(dataset_cfg: DatasetCfg, model_cfg: ModelCfg) -> None:
+    target_latent_shape = get_target_latent_shape(dataset_cfg, model_cfg)
+    if target_latent_shape is None:
+        return
+
+    old_shape = model_cfg.denoiser.input_shape
+    old_shape_list = list(old_shape) if isinstance(old_shape, (list, tuple)) else [old_shape, old_shape]
+    if old_shape_list == target_latent_shape:
+        return
+
+    print(
+        cyan(
+            "Setting denoiser input_shape from dataset target_shape: "
+            f"{old_shape} -> {target_latent_shape}"
+        )
+    )
+    model_cfg.denoiser.input_shape = target_latent_shape
+
 class DiffusionWrapper(LightningModule):
     logger: Optional[WandbLogger]
     model_cfg: ModelCfg
@@ -78,6 +129,7 @@ class DiffusionWrapper(LightningModule):
         self.batch_size = batch_size
         self.val_check_interval = val_check_interval
         self.mode = mode
+        set_denoiser_input_shape_from_target(self.dataset_cfg, self.model_cfg)
         self.text_tokenizer = None
         self.text_encoder = None
         self.text_condition_proj = None
@@ -180,8 +232,9 @@ class DiffusionWrapper(LightningModule):
         self.unfrozen_compressor = False
         self.frozen_scene_query = False
         self.test_step_outputs = []
-        self.predicted = []
-        self.generated = []
+        self.validation_loader_names = {0: "standard", 1: "unseen"}
+        self.predicted = {name: [] for name in self.validation_loader_names.values()}
+        self.generated = {name: [] for name in self.validation_loader_names.values()}
 
 
 
@@ -415,6 +468,7 @@ class DiffusionWrapper(LightningModule):
             c = 3
 
         temporal_downsample = 1
+        num = v_t
         if getattr(self.model_cfg.autoencoders, "target") is not None:
             if getattr(self.model_cfg.autoencoders, "target").name == "video_dc":
                 temporal_downsample = 4
@@ -434,8 +488,12 @@ class DiffusionWrapper(LightningModule):
                 target["extrinsics"] = target["extrinsics"][:, :num_pose_views]
                 target["intrinsics"] = target["intrinsics"][:, :num_pose_views]
 
-        h, w = self.model_cfg.denoiser.input_shape
-        x_t = torch.randn((b, num, c, h, w)).to(device)  
+        input_shape = self.model_cfg.denoiser.input_shape
+        if isinstance(input_shape, int):
+            h = w = input_shape
+        else:
+            h, w = input_shape
+        x_t = torch.randn((b, num, c, h, w), device=device, dtype=dtype)
         x_t *= self.scheduler.init_noise_sigma 
         
         context_camera = CameraInputs(
@@ -679,7 +737,8 @@ class DiffusionWrapper(LightningModule):
         # Apply KL divergence weighting and scheduling
         kl_weight = 0.0
         if self.model_cfg.compressor.scene_token_projection == "kl" and conditional_tokens and self.model_cfg.compressor is not None and not self.frozen_compressor:
-            kl = tokens.kl()
+            kl_raw = tokens.kl()
+            kl = kl_raw / (tokens.mean.shape[1] * tokens.mean.shape[2])
             if self.global_step <= self.model_cfg.compressor.kl_schedule[0]:
                 kl_weight = self.model_cfg.compressor.kl_weights[0]
             elif self.global_step <= self.model_cfg.compressor.kl_schedule[1] and self.global_step > self.model_cfg.compressor.kl_schedule[0]:
@@ -688,7 +747,8 @@ class DiffusionWrapper(LightningModule):
             else:
                 kl_weight = self.model_cfg.compressor.kl_weights[1]
             loss = loss + kl_weight * kl
-            self.log("loss/kl", kl.mean())   
+            self.log("loss/kl", kl.mean())
+            self.log("loss/kl_raw", kl_raw.mean())
         loss = loss.mean()
 
         opt = self.optimizers()
@@ -710,9 +770,12 @@ class DiffusionWrapper(LightningModule):
 
         step = self.step_tracker.get_step()
         val_step = (step+1) // self.val_check_interval
+        loader_name = self.validation_loader_names.get(dataloader_idx or 0, f"val_{dataloader_idx}")
+        self.predicted.setdefault(loader_name, [])
+        self.generated.setdefault(loader_name, [])
 
         print(
-            f"Name = Standard; "
+            f"Name = {loader_name}; "
             f"Validation Step {val_step}; "
             f"Step {batch_idx}; "
             f"Scene = {batch['scene']}; "
@@ -749,8 +812,8 @@ class DiffusionWrapper(LightningModule):
         sampled_views, _, _ = self.generate_batch_with_scene(batch, self.sampler)
         b, v_t, c, h, w = sampled_views.shape
         target_views = target_views[:, :v_t]
-        self.generated.append(sampled_views.detach().cpu())
-        self.predicted.append(target_views.detach().cpu())
+        self.generated[loader_name].append(sampled_views.detach().cpu())
+        self.predicted[loader_name].append(target_views.detach().cpu())
         # Only do remaining on Rank: 0 in case of multi-gpu/node
         if self.global_rank != 0:
             return None
@@ -762,8 +825,11 @@ class DiffusionWrapper(LightningModule):
             batch_scene.append(scene)
         
         if batch_idx == 0:
-            log_tensor_as_video(self.logger, sampled_views, f"Sampled Video", fps=8, step=val_step, caption=batch_scene)        
-            log_tensor_as_video(self.logger, target_views, f"Original Video", fps=8, step=val_step, caption=batch_scene) 
+            log_tensor_as_video(self.logger, sampled_views, f"{loader_name}/Sampled Video", fps=8, step=val_step, caption=batch_scene)        
+            log_tensor_as_video(self.logger, target_views, f"{loader_name}/Original Video", fps=8, step=val_step, caption=batch_scene)
+            if dataloader_idx == 0:
+                log_tensor_as_video(self.logger, sampled_views, f"Sampled Video", fps=8, step=val_step, caption=batch_scene)        
+                log_tensor_as_video(self.logger, target_views, f"Original Video", fps=8, step=val_step, caption=batch_scene)
           
             for j in range(b):
                 scene = batch["scene"][j]
@@ -772,11 +838,18 @@ class DiffusionWrapper(LightningModule):
                 batch_vis.append(prep_image(vis))
                 
             self.logger.log_image(
-                f"Context ({self.sampler.cfg.name})",
+                f"{loader_name}/Context ({self.sampler.cfg.name})",
                 batch_vis,
                 step=val_step,
                 caption=batch_scene,
             )
+            if dataloader_idx == 0:
+                self.logger.log_image(
+                    f"Context ({self.sampler.cfg.name})",
+                    batch_vis,
+                    step=val_step,
+                    caption=batch_scene,
+                )
 
         # Do a spline interpolation using context poses as "knot" and sample a video
         if self.val_cfg.video and batch_idx == 0:
@@ -795,7 +868,7 @@ class DiffusionWrapper(LightningModule):
             batch["target"] = new_target  
             try:    
                 sampled_views, _, _ = self.generate_batch_with_scene(batch, self.sampler)
-                log_tensor_as_video(self.logger, sampled_views, f"Context Interpolation ({self.sampler.cfg.name})", fps=24, step=val_step, caption=batch_scene)
+                log_tensor_as_video(self.logger, sampled_views, f"{loader_name}/Context Interpolation ({self.sampler.cfg.name})", fps=24, step=val_step, caption=batch_scene)
             except:
                 pass
         torch.cuda.empty_cache()
@@ -806,7 +879,7 @@ class DiffusionWrapper(LightningModule):
         
         step = self.step_tracker.get_step()
         
-        assert len(self.predicted) == len(self.generated)
+        assert self.predicted.keys() == self.generated.keys()
 
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
@@ -820,81 +893,85 @@ class DiffusionWrapper(LightningModule):
 
         val_step = (step+1) // self.val_check_interval
 
-        if len(self.predicted) == 0 or len(self.generated) == 0:
-            return None
-        sampled_views = torch.concat(self.generated).to(self.device, non_blocking=True)
-        target_views = torch.concat(self.predicted).to(self.device, non_blocking=True)
-        print(sampled_views.shape)
-        print(target_views.shape)
-        # metrics = self.metric(sampled_views.flatten(0, 1), target_views.flatten(0, 1), psnr=True, ssim=True, lpips=True)
-        # self.log("lpips", metrics["lpips"], on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
-        # self.log("ssim", metrics["ssim"], on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
-        # self.log("psnr", metrics["psnr"], on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
-        
-        # for key, value in metrics.items():
-        #     self.logger.log_metrics({f"full_sequence/{key}": value}, val_step)
-        
-        # --- sequence-level metrics ---
-        gathered_sampled = self.all_gather(sampled_views)
-        gathered_target = self.all_gather(target_views)
-        num_views = gathered_sampled.shape[-4]
-        chunk_size = min(16, num_views)
-        if getattr(self.model_cfg.autoencoders, "target") is not None:
-            if getattr(self.model_cfg.autoencoders, "target").name == "wan":
-                if getattr(self.dataset_cfg.view_sampler, "chunk_targets", True):
-                    chunk_size = min(17, num_views)
-                else:
-                    chunk_size = num_views
-        if num_views % chunk_size != 0:
-            chunk_size = num_views
-        
-        if gathered_sampled.shape[1] != gathered_target.shape[1]:
-            print(pred.shape, gt.shape)
-            breakpoint()
-            raise RuntimeError("prediction shape mismatch", pred.shape, gt.shape)
-
-        # flatten across world size
-        gathered_sampled = rearrange(gathered_sampled, "... (k v) c h w -> (... k) v c h w", v=chunk_size)
-        gathered_target = rearrange(gathered_target, "... (k v) c h w -> (... k) v c h w", v=chunk_size)
-
-        # flatten views for metric
-        gathered_sampled = rearrange(gathered_sampled, "... c h w -> (...) c h w")
-        gathered_target = rearrange(gathered_target, "... c h w -> (...) c h w")
-
-        if self.global_rank == 0:
-            full_sequence_metrics = self.metric(
-                gathered_sampled,
-                gathered_target,
-                psnr=True,
-                ssim=True,
-                lpips=True,
-            )
-
-            for key, value in full_sequence_metrics.items():
-                self.logger.log_metrics({f"full_sequence/{key}": value}, val_step)
-
-            general_metrics = self.metric(
-                gathered_sampled.cpu(),
-                gathered_target.cpu(),
-                num_views=chunk_size,
-                fvd=True,
-                fid=True,
-            )
+        for loader_name in self.predicted.keys():
+            if len(self.predicted[loader_name]) == 0 or len(self.generated[loader_name]) == 0:
+                continue
+            sampled_views = torch.concat(self.generated[loader_name]).to(self.device, non_blocking=True)
+            target_views = torch.concat(self.predicted[loader_name]).to(self.device, non_blocking=True)
+            print(loader_name, sampled_views.shape)
+            print(loader_name, target_views.shape)
+            # metrics = self.metric(sampled_views.flatten(0, 1), target_views.flatten(0, 1), psnr=True, ssim=True, lpips=True)
+            # self.log("lpips", metrics["lpips"], on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+            # self.log("ssim", metrics["ssim"], on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+            # self.log("psnr", metrics["psnr"], on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
             
-            self.metric.reset_fid()
-            self.metric.reset_fvd()
+            # for key, value in metrics.items():
+            #     self.logger.log_metrics({f"{loader_name}/full_sequence/{key}": value}, val_step)
+            
+            # --- sequence-level metrics ---
+            gathered_sampled = self.all_gather(sampled_views)
+            gathered_target = self.all_gather(target_views)
+            num_views = gathered_sampled.shape[-4]
+            chunk_size = min(16, num_views)
+            if getattr(self.model_cfg.autoencoders, "target") is not None:
+                if getattr(self.model_cfg.autoencoders, "target").name == "wan":
+                    if getattr(self.dataset_cfg.view_sampler, "chunk_targets", True):
+                        chunk_size = min(17, num_views)
+                    else:
+                        chunk_size = num_views
+            if num_views % chunk_size != 0:
+                chunk_size = num_views
+            
+            if gathered_sampled.shape[1] != gathered_target.shape[1]:
+                print(pred.shape, gt.shape)
+                breakpoint()
+                raise RuntimeError("prediction shape mismatch", pred.shape, gt.shape)
 
-            for key, value in general_metrics.items():
-                if value is not None:
-                    self.logger.log_metrics({f"{key}": value}, val_step)
+            # flatten across world size
+            gathered_sampled = rearrange(gathered_sampled, "... (k v) c h w -> (... k) v c h w", v=chunk_size)
+            gathered_target = rearrange(gathered_target, "... (k v) c h w -> (... k) v c h w", v=chunk_size)
+
+            # flatten views for metric
+            gathered_sampled = rearrange(gathered_sampled, "... c h w -> (...) c h w")
+            gathered_target = rearrange(gathered_target, "... c h w -> (...) c h w")
+
+            if self.global_rank == 0:
+                full_sequence_metrics = self.metric(
+                    gathered_sampled,
+                    gathered_target,
+                    psnr=True,
+                    ssim=True,
+                    lpips=True,
+                )
+
+                for key, value in full_sequence_metrics.items():
+                    self.logger.log_metrics({f"{loader_name}/full_sequence/{key}": value}, val_step)
+                    if loader_name == "standard":
+                        self.logger.log_metrics({f"full_sequence/{key}": value}, val_step)
+
+                general_metrics = self.metric(
+                    gathered_sampled.cpu(),
+                    gathered_target.cpu(),
+                    num_views=chunk_size,
+                    fvd=True,
+                    fid=True,
+                )
+                
+                self.metric.reset_fid()
+                self.metric.reset_fvd()
+
+                for key, value in general_metrics.items():
+                    if value is not None:
+                        self.logger.log_metrics({f"{loader_name}/{key}": value}, val_step)
+                        if loader_name == "standard":
+                            self.logger.log_metrics({f"{key}": value}, val_step)
 
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
 
-        if len(self.predicted) != 0:
-            self.predicted.clear()
-        if len(self.generated) != 0:
-            self.generated.clear()
+        for loader_name in self.predicted.keys():
+            self.predicted[loader_name].clear()
+            self.generated[loader_name].clear()
 
         print("Setting Max Timesteps for training to: ", self.model_cfg.scheduler.num_train_timesteps)
         self.scheduler.set_timesteps(self.model_cfg.scheduler.num_train_timesteps)

@@ -1,0 +1,41 @@
+name: wan_t2v_14b
+
+camera:
+  name: ray
+  input_shape: [8, 8]
+  normalize: false
+  origin_first: false
+  scale: [1.0, 1.0]
+  embedding:
+    name: time_embed
+    in_channels: 6
+    dropout_prob: 0.0
+    fourier: true
+    freq_origin: 15
+    freq_direction: 15
+
+model_root: src/model/DiffSynth-Studio/Wan2.2/Wan2.2-T2V-A14B
+high_noise_dit_pattern: high_noise_model/diffusion_pytorch_model*.safetensors
+low_noise_dit_pattern: low_noise_model/diffusion_pytorch_model*.safetensors
+dit_pattern: diffusion_pytorch_model*.safetensors
+switch_dit_boundary: 0.875
+text_encoder_path: null
+tokenizer_path: null
+seq_len: 512
+clean: whitespace
+gradient_checkpointing: true
+condition_latents_input_type: none
+camera_input_type: none
+camera_context_spatial_pool: 1
+scene_input_type: none
+num_target_split: 1
+noise_seed: null
+ckpt_path: null
+load_strict: true
+
+lora:
+  enabled: false
+  rank: 32
+  alpha: 32
+  target_modules: q,k,v,o,ffn.0,ffn.2
+  checkpoint: null
