@@ -72,7 +72,7 @@ model:
 
   scheduler:
     sampling_type: random_uniform
-    num_inference_steps: 25
+    num_inference_steps: 50
     kwargs:
       weighting: shifted
       timestep_shift: 8

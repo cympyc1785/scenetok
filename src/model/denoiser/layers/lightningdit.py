@@ -90,15 +90,21 @@ class Attention(nn.Module):
 
         if rope is not None:
             if self.is_3d_rope:
-                q = rearrange(q, "b h (r v n) d -> (b r) h (v n) d", v=num_views, r=num_split)
+                if num_views % num_split != 0:
+                    raise ValueError(
+                        f"num_views must be divisible by num_split for 3D RoPE: "
+                        f"num_views={num_views}, num_split={num_split}"
+                    )
+                views_per_split = num_views // num_split
+                q = rearrange(q, "b h (r v n) d -> (b r) h (v n) d", v=views_per_split, r=num_split)
                 q = rope(q)
-                q = rearrange(q, "(b r) h (v n) d -> b h (r v n) d ", v=num_views, r=num_split)
+                q = rearrange(q, "(b r) h (v n) d -> b h (r v n) d ", v=views_per_split, r=num_split)
 
                 # NOTE: RoPE is not applied on scene tokens
                 if not self.cross_atten:
-                    k = rearrange(k, "b h (r v n) d -> (b r) h (v n) d", v=num_views, r=num_split)
+                    k = rearrange(k, "b h (r v n) d -> (b r) h (v n) d", v=views_per_split, r=num_split)
                     k = rope(k)
-                    k = rearrange(k, "(b r) h (v n) d -> b h (r v n) d ", v=num_views, r=num_split)
+                    k = rearrange(k, "(b r) h (v n) d -> b h (r v n) d ", v=views_per_split, r=num_split)
             else:
 
                 q = rearrange(q, "b h (v n) d -> (b v) h n d", v=num_views)
@@ -358,6 +364,9 @@ class LitDiT(nn.Module):
         else:
             input_hw = tuple(input_size)
         self.causal_attention=causal_attention
+        self.input_hw = input_hw
+        self.rope_dim = hidden_size // num_heads
+        self.rope_sizes = None
         self.x_embedder = PatchEmbed(input_hw, patch_size, in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size, frequency_embedding_size=frequency_embedding_size)
         # self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
@@ -374,8 +383,13 @@ class LitDiT(nn.Module):
                 pt_seq_len=hw_seq_len,
             )
         elif self.use_rope_3d:
-            half_head_dim = hidden_size // num_heads
-            self.feat_rope = RotaryEmbedding3D(half_head_dim, sizes=(num_views // num_split, input_hw[0] // patch_size, input_hw[1] // patch_size))
+            self.feat_rope = self.build_3d_rope(
+                sizes=(
+                    num_views // num_split,
+                    input_hw[0] // patch_size,
+                    input_hw[1] // patch_size,
+                )
+            )
         else:
             self.feat_rope = None
 
@@ -393,6 +407,23 @@ class LitDiT(nn.Module):
         ])
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels, use_rmsnorm=use_rmsnorm)
         self.initialize_weights()
+
+    def build_3d_rope(self, sizes):
+        self.rope_sizes = tuple(sizes)
+        return RotaryEmbedding3D(self.rope_dim, sizes=self.rope_sizes)
+
+    def ensure_3d_rope(self, num_views: int, height: int, width: int, device: torch.device) -> None:
+        if not self.use_rope_3d:
+            return
+        patch_h, patch_w = self.x_embedder.patch_size
+        if num_views % self.num_split != 0:
+            raise ValueError(
+                f"num_views must be divisible by num_split for 3D RoPE: "
+                f"num_views={num_views}, num_split={self.num_split}"
+            )
+        sizes = (num_views // self.num_split, height // patch_h, width // patch_w)
+        if self.rope_sizes != sizes:
+            self.feat_rope = self.build_3d_rope(sizes).to(device)
 
     def initialize_weights(self):
         # Initialize transformer layers:
@@ -465,6 +496,7 @@ class LitDiT(nn.Module):
         x, t, p, y = latents, timestep, pose, cond_state
         use_checkpoint = self.use_checkpoint
         b, v, _, h, w = x.shape
+        self.ensure_3d_rope(v, h, w, x.device)
 
         x = rearrange(x, "b v c h w -> (b v) c h w")
         x = self.x_embedder(x)  # (N, T, D), where T = H * W / patch_size ** 2

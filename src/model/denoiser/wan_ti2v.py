@@ -35,6 +35,7 @@ from diffsynth.models.wan_video_dit import (
     sinusoidal_embedding_1d,
 )
 from diffsynth.pipelines.wan_video import model_fn_wan_video
+from diffsynth.models.wan_video_camera_controller import SimpleAdapter
 
 from colorama import Fore
 def cyan(text: str) -> str:
@@ -61,7 +62,7 @@ class WanTI2V5BCfg:
     clean: str = "whitespace"
     gradient_checkpointing: bool = True
     condition_latents_input_type: Literal["none", "width", "channel", "temporal", "first_frame", "first_frame_random"] = "none"
-    camera_input_type: Literal["none", "recam_attention", "cross_attention", "new_cross_attention", "adaln"] | None = None
+    camera_input_type: Literal["none", "recam_attention", "cross_attention", "new_cross_attention", "adaln", "wan_control"] | None = None
     enable_recam_attention: bool | None = None
     camera_context_spatial_pool: int = 1
     scene_input_type: Literal["none", "cross_attention", "new_cross_attention", "latent_concat"] = "cross_attention"
@@ -124,12 +125,12 @@ class NewDiTBlock(nn.Module):
             self.norm4 = nn.LayerNorm(dim, eps=eps)
             nn.init.zeros_(self.scene_cross_attn_proj.weight)
             nn.init.zeros_(self.scene_cross_attn_proj.bias)
-            self.new_modulation = nn.Parameter(torch.randn(1, 9, dim) / dim**0.5)
+            # self.new_modulation = nn.Parameter(torch.randn(1, 9, dim) / dim**0.5)
         else:
             self.scene_cross_attn = None
             self.scene_cross_attn_proj = None
             self.norm4 = None
-            self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
+        self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
         if self.camera_input_type == "recam_attention":
             self.recam_projector = nn.Linear(dim, dim)
         else:
@@ -159,40 +160,40 @@ class NewDiTBlock(nn.Module):
             scene_input_type=scene_input_type,
         ).to(device=block.modulation.device, dtype=block.modulation.dtype)
         new_block.load_state_dict(block.state_dict(), strict=False)
-        if new_block.use_scene_cross_attn:
-            with torch.no_grad():
-                new_block.new_modulation[:, : block.modulation.shape[1]].copy_(block.modulation)
+        # if new_block.use_scene_cross_attn:
+        #     with torch.no_grad():
+        #         new_block.new_modulation[:, : block.modulation.shape[1]].copy_(block.modulation)
         return new_block
 
     def forward(self, x, context, scene_context, t_mod, scene_t_mod, freqs, camera_embedding=None):
         has_seq = len(t_mod.shape) == 4
         chunk_dim = 2 if has_seq else 1
         
-        if self.use_scene_cross_attn:
-            modulation = self.new_modulation.to(dtype=t_mod.dtype, device=t_mod.device)
-            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-                modulation[:, :6] + t_mod).chunk(6, dim=chunk_dim)
-            shift_scene, scale_scene, gate_scene = (
-                modulation[:, 6:] + scene_t_mod).chunk(3, dim=chunk_dim)
-        else:
-            # msa: multi-head self-attention  mlp: multi-layer perceptron
-            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-                self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=chunk_dim)
+        # if self.use_scene_cross_attn:
+        #     # modulation = self.new_modulation.to(dtype=t_mod.dtype, device=t_mod.device)
+        #     shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+        #         modulation[:, :6] + t_mod).chunk(6, dim=chunk_dim)
+        #     shift_scene, scale_scene, gate_scene = (
+        #         modulation[:, 6:] + scene_t_mod).chunk(3, dim=chunk_dim)
+        # else:
+        # msa: multi-head self-attention  mlp: multi-layer perceptron
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod).chunk(6, dim=chunk_dim)
         
         if has_seq:
-            if self.use_scene_cross_attn:
-                shift_msa, scale_msa, gate_msa, \
-                shift_mlp, scale_mlp, gate_mlp, \
-                shift_scene, scale_scene, gate_scene = (
-                    shift_msa.squeeze(2), scale_msa.squeeze(2), gate_msa.squeeze(2),
-                    shift_mlp.squeeze(2), scale_mlp.squeeze(2), gate_mlp.squeeze(2),
-                    shift_scene.squeeze(2), scale_scene.squeeze(2), gate_scene.squeeze(2),
-                )
-            else:
-                shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-                    shift_msa.squeeze(2), scale_msa.squeeze(2), gate_msa.squeeze(2),
-                    shift_mlp.squeeze(2), scale_mlp.squeeze(2), gate_mlp.squeeze(2),
-                )
+            # if self.use_scene_cross_attn:
+            #     shift_msa, scale_msa, gate_msa, \
+            #     shift_mlp, scale_mlp, gate_mlp, \
+            #     shift_scene, scale_scene, gate_scene = (
+            #         shift_msa.squeeze(2), scale_msa.squeeze(2), gate_msa.squeeze(2),
+            #         shift_mlp.squeeze(2), scale_mlp.squeeze(2), gate_mlp.squeeze(2),
+            #         shift_scene.squeeze(2), scale_scene.squeeze(2), gate_scene.squeeze(2),
+            #     )
+            # else:
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+                shift_msa.squeeze(2), scale_msa.squeeze(2), gate_msa.squeeze(2),
+                shift_mlp.squeeze(2), scale_mlp.squeeze(2), gate_mlp.squeeze(2),
+            )
         
         input_x = modulate(self.norm1(x), shift_msa, scale_msa)
 
@@ -208,10 +209,12 @@ class NewDiTBlock(nn.Module):
         x = x + self.cross_attn(self.norm3(x), context)
 
         if self.use_scene_cross_attn:
-            input_x = modulate(self.norm4(x), shift_scene, scale_scene)
+            input_x = self.norm4(x)
+            # input_x = modulate(self.norm4(x), shift_scene, scale_scene)
             scene_residual = self.scene_cross_attn(input_x, scene_context)
             scene_residual = self.scene_cross_attn_proj(scene_residual)
-            x = self.gate(x, gate_scene, scene_residual)
+            # x = self.gate(x, gate_scene, scene_residual)
+            x = x + scene_residual
         
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
@@ -291,6 +294,16 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
                 device=ref_param.device,
                 dtype=ref_param.dtype,
             )
+        if self.camera_input_type == "wan_control" and getattr(self.model, "control_adapter", None) is None:
+            patch_size = tuple(getattr(self.model, "patch_size", (1, 2, 2)))
+            spatial_patch = patch_size[1:] if len(patch_size) == 3 else patch_size
+            self.model.control_adapter = SimpleAdapter(
+                in_dim=6 * max(temporal_downsample, 1),
+                out_dim=self.model.dim,
+                kernel_size=tuple(spatial_patch),
+                stride=tuple(spatial_patch),
+                num_residual_blocks=1,
+            ).to(device=ref_param.device, dtype=ref_param.dtype)
         self.text_encoder = self._load_model(
             "wan_video_text_encoder",
             self._resolve_text_encoder_path(),
@@ -388,6 +401,10 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
                 self.camera_input_type == "recam_attention"
                 and ".self_attn." in name
             )
+            trainable = trainable or (
+                self.camera_input_type == "wan_control"
+                and name.startswith("control_adapter.")
+            )
             if not self.cfg.lora.enabled:
                 trainable = trainable or name.startswith("text_embedding.")
             # trainable = trainable or name.startswith("scene_embedding.")
@@ -429,6 +446,8 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
                 group_name = "model.recam_camera_encoder"
             elif "recam_projector" in name:
                 group_name = "model.recam_projector"
+            elif name.startswith("model.control_adapter."):
+                group_name = "model.control_adapter"
             elif ".self_attn." in name:
                 group_name = "model.self_attn"
             elif ".scene_cross_attn." in name:
@@ -522,6 +541,13 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
                 extrinsics = extrinsics[:, indices]
             return extrinsics.flatten(-2)
 
+        if self.camera_input_type == "wan_control":
+            return self.pose_embed(
+                inputs.pose,
+                temporal_downsample=temporal_downsample,
+                chunk_targets=chunk_targets,
+            )
+
         pose_tokens = self.pose_embed(
             inputs.pose,
             temporal_downsample=temporal_downsample,
@@ -546,6 +572,8 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
             return None
         if self.camera_input_type == "adaln":
             return rearrange(camera_embedding, "b v c h w -> b v (h w) c")
+        if self.camera_input_type == "wan_control":
+            return camera_embedding
         ref_param = next(self.model.parameters())
         camera_embedding = camera_embedding.to(device=ref_param.device, dtype=ref_param.dtype)
         return camera_embedding
@@ -685,7 +713,7 @@ def simple_wan_video_fn(
     scene_context: torch.Tensor = None,
     scene_input_type: Literal["none", "cross_attention", "new_cross_attention", "latent_concat"] = "cross_attention",
     camera_context: torch.Tensor = None,
-    camera_input_type: Literal["none", "recam_attention", "cross_attention", "new_cross_attention", "adaln"] | None = None,
+    camera_input_type: Literal["none", "recam_attention", "cross_attention", "new_cross_attention", "adaln", "wan_control"] | None = None,
     fuse_vae_embedding_in_latents: bool = False,
     use_gradient_checkpointing: bool = False,
     use_gradient_checkpointing_offload: bool = False,
@@ -697,15 +725,16 @@ def simple_wan_video_fn(
         )
     if camera_input_type is None:
         camera_input_type = "none"
-    if camera_input_type not in ("none", "recam_attention", "cross_attention", "new_cross_attention", "adaln"):
+    if camera_input_type not in ("none", "recam_attention", "cross_attention", "new_cross_attention", "adaln", "wan_control"):
         raise ValueError(
             f"Unsupported camera_input_type={camera_input_type!r}. "
-            "Expected 'none', 'recam_attention', 'cross_attention', 'new_cross_attention', or 'adaln'."
+            "Expected 'none', 'recam_attention', 'cross_attention', 'new_cross_attention', 'adaln', or 'wan_control'."
         )
 
     adaln_camera_embedding = camera_context if camera_input_type == "adaln" else None
     recam_camera_embedding = camera_context if camera_input_type == "recam_attention" else None
     cross_attention_camera_context = camera_context if camera_input_type == "cross_attention" else None
+    wan_control_camera_input = camera_context if camera_input_type == "wan_control" else None
     cross_attention_scene_context = None
 
     # Timestep
@@ -808,7 +837,30 @@ def simple_wan_video_fn(
             )
         x = torch.cat([x] * (conditioning_batch // x.shape[0]), dim=0)
 
-    x = dit.patchify(x)
+    if wan_control_camera_input is not None:
+        wan_control_camera_input = wan_control_camera_input.to(
+            dtype=latents.dtype, device=latents.device
+        )
+        if wan_control_camera_input.shape[0] != x.shape[0]:
+            if wan_control_camera_input.shape[0] == 1:
+                wan_control_camera_input = wan_control_camera_input.expand(
+                    x.shape[0], -1, -1, -1, -1
+                )
+            elif x.shape[0] % wan_control_camera_input.shape[0] == 0:
+                repeat = x.shape[0] // wan_control_camera_input.shape[0]
+                wan_control_camera_input = wan_control_camera_input.repeat_interleave(
+                    repeat, dim=0
+                )
+            else:
+                raise ValueError(
+                    "wan_control camera input batch must match or divide latent batch: "
+                    f"camera={wan_control_camera_input.shape[0]}, latent={x.shape[0]}"
+                )
+        x = dit.patch_embedding(x)
+        y_camera = dit.control_adapter(wan_control_camera_input)
+        x = x + y_camera
+    else:
+        x = dit.patchify(x)
     f, h, w = x.shape[2:]
     x = rearrange(x, "b c f h w -> b (f h w) c").contiguous()
 

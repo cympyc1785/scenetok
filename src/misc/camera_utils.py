@@ -11,6 +11,8 @@ from typing import Optional, Union
 from einops import rearrange, repeat
 from ..geometry.projection import get_world_rays, sample_image_grid
 
+import torch.nn.functional as F
+
 
 def absolute_to_relative_camera(
     tform: Float[Tensor, "batch v 4 4"],
@@ -239,6 +241,63 @@ def rescale_and_crop(
     images = images.reshape(*batch, c, h_scaled, w_scaled)
 
     return center_crop(images, intrinsics, shape)
+
+def rescale_and_pad(
+    images: Float[Tensor, "*#batch c h w"],
+    intrinsics: Float[Tensor, "*#batch 3 3"],
+    shape: tuple[int, int],
+) -> tuple[
+    Float[Tensor, "*#batch c h_out w_out"],  # updated images
+    Float[Tensor, "*#batch 3 3"],  # updated intrinsics
+]:
+    *_, h_in, w_in = images.shape
+    h_out, w_out = shape
+    assert h_out <= h_in and w_out <= w_in, f"{h_in}x{w_in} -> {h_out}x{w_out}"
+
+    scale_factor = min(h_out / h_in, w_out / w_in)
+    h_scaled = round(h_in * scale_factor)
+    w_scaled = round(w_in * scale_factor)
+    assert h_scaled == h_out or w_scaled == w_out
+
+    # Reshape the images to the correct size. Assume we don't have to worry about
+    # changing the intrinsics based on how the images are rounded.
+    *batch, c, h, w = images.shape
+    images = images.reshape(-1, c, h, w)
+    images = torch.stack([rescale(image, (h_scaled, w_scaled)) for image in images])
+
+    # padding 계산
+    pad_h = h_out - h_scaled
+    pad_w = w_out - w_scaled
+
+    pad_top = pad_h // 2
+    pad_bottom = pad_h - pad_top
+
+    pad_left = pad_w // 2
+    pad_right = pad_w - pad_left
+
+    # F.pad format: (left, right, top, bottom)
+    images = F.pad(
+        images,
+        (pad_left, pad_right, pad_top, pad_bottom),
+        mode="constant",
+        value=0
+    )
+
+    images = images.reshape(*batch, c, h_out, w_out)
+
+    # intrinsics update
+    updated_intrinsics = intrinsics.clone()
+
+    updated_intrinsics[..., 0, 0] *= scale_factor  # fx
+    updated_intrinsics[..., 1, 1] *= scale_factor  # fy
+    updated_intrinsics[..., 0, 2] = (
+        updated_intrinsics[..., 0, 2] * scale_factor + pad_left
+    )
+    updated_intrinsics[..., 1, 2] = (
+        updated_intrinsics[..., 1, 2] * scale_factor + pad_top
+    )
+
+    return images, updated_intrinsics
 
 def reflect_extrinsics(
     extrinsics: Float[Tensor, "*batch 4 4"],

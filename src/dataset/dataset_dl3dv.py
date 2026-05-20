@@ -1,5 +1,6 @@
 
 import csv
+import json
 import os
 import torch
 import numpy as np
@@ -18,8 +19,9 @@ from tqdm import tqdm
 from .dataset import DatasetCfgCommon
 from .dtypes import Stage
 from .view_sampler import ViewSampler
+from .view_sampler.view_sampler import ViewIndex
 from src.misc.dl3dv_utils import load_metadata
-from src.misc.camera_utils import rescale_and_crop, reflect_views, convert_poses
+from src.misc.camera_utils import rescale_and_crop, reflect_views, convert_poses, rescale_and_pad
 
 from .shims.augmentation_shim import apply_augmentation_shim
 from .shims.crop_shim import apply_crop_shim
@@ -176,6 +178,8 @@ class DatasetDL3DVCfg(DatasetCfgCommon):
     stage_override: Literal["train", "val", "test"] | None = None
     scene_id: str | None = None
     val_seen: bool = False
+    do_scale_and_pad: bool = False
+    evaluation_index_path: Path | None = None
 
 class DatasetDL3DV(Dataset):
     cfg: DatasetDL3DVCfg
@@ -201,6 +205,8 @@ class DatasetDL3DV(Dataset):
         self.root = cfg.root / "train"
         # Collect chunks.
         self.chunks = []
+        self.preprocess = rescale_and_pad if cfg.do_scale_and_pad else rescale_and_crop
+        self.evaluation_index = self.load_evaluation_index()
 
         if self.cfg.scene_id is not None:
             scene_id = Path(self.cfg.scene_id)
@@ -228,6 +234,39 @@ class DatasetDL3DV(Dataset):
                 desired_prefix = ["11K"]
 
         self.chunks = [chunk for chunk in self.chunks if chunk.parts and chunk.parts[0] in desired_prefix]
+        if self.stage in {"val", "test"} and self.evaluation_index is not None:
+            self.chunks = [chunk for chunk in self.chunks if chunk.name in self.evaluation_index]
+
+    def load_evaluation_index(self) -> dict[str, dict[str, list[int]]] | None:
+        if self.cfg.evaluation_index_path is None:
+            return None
+        with self.cfg.evaluation_index_path.open("r") as f:
+            return json.load(f)
+
+    def sample_evaluation_index_views(self, scene: str) -> ViewIndex:
+        if self.evaluation_index is None:
+            raise ValueError("evaluation_index is not loaded")
+        entry = self.evaluation_index.get(scene)
+        if entry is None:
+            raise ValueError(f"No evaluation indices available for scene {scene}.")
+        return ViewIndex(
+            torch.tensor(entry["context"], dtype=torch.long),
+            torch.tensor(entry["target"], dtype=torch.long),
+        )
+
+    def validate_view_shape(
+        self,
+        images: torch.Tensor,
+        expected_shape: tuple[int, int],
+        view_type: str,
+        chunk_path: Path,
+    ) -> None:
+        actual_shape = tuple(images.shape[-2:])
+        if actual_shape != expected_shape:
+            raise ValueError(
+                f"{view_type} images have shape {actual_shape}, expected "
+                f"{expected_shape}: {chunk_path}"
+            )
 
     def __getitem__(self, idx):
         chunk_name = self.chunks[idx]
@@ -263,13 +302,16 @@ class DatasetDL3DV(Dataset):
         if num_views < 34:
             raise ValueError("not enough views", chunk_path)
 
-        view_indices, upsampled_indices = self.view_sampler.sample(
-            num_views=num_views, 
-            num_latents=num_views, 
-            stage=self.stage, 
-            extrinsics=extrinsics, 
-            scene=scene
-        )
+        if self.stage in {"val", "test"} and self.evaluation_index is not None:
+            view_indices = self.sample_evaluation_index_views(scene)
+        else:
+            view_indices, upsampled_indices = self.view_sampler.sample(
+                num_views=num_views,
+                num_latents=num_views,
+                stage=self.stage,
+                extrinsics=extrinsics,
+                scene=scene,
+            )
 
         view_index_items = []
         for view_type, indices in asdict(view_indices).items():
@@ -318,11 +360,13 @@ class DatasetDL3DV(Dataset):
             view_images = images[image_positions]
 
             if view_type == "context":
-                view_images, view_intrinsics = rescale_and_crop(
+                context_shape = tuple(self.cfg.context_shape)
+                view_images, view_intrinsics = self.preprocess(
                     view_images,
                     intrinsics[indices],
-                    tuple(self.cfg.context_shape),
+                    context_shape,
                 )
+                self.validate_view_shape(view_images, context_shape, view_type, chunk_path)
                 view_extrinsics = extrinsics[indices]
                 if flip:
                     view_images, view_extrinsics = reflect_views(view_images, view_extrinsics)
@@ -333,11 +377,13 @@ class DatasetDL3DV(Dataset):
                     "index": indices.clone().contiguous()
                 }
             elif view_type == "target":
-                view_images, view_intrinsics = rescale_and_crop(
+                target_shape = tuple(self.cfg.target_shape)
+                view_images, view_intrinsics = self.preprocess(
                     view_images,
                     intrinsics[indices],
-                    tuple(self.cfg.target_shape),
+                    target_shape,
                 )
+                self.validate_view_shape(view_images, target_shape, view_type, chunk_path)
                 view_extrinsics = extrinsics[indices]
                 if flip:
                     view_images, view_extrinsics = reflect_views(view_images, view_extrinsics)

@@ -27,11 +27,11 @@ dataset:
   view_sampler:
     num_context_views: 16
     num_target_views: 10
-    # min_distance_between_context_views: 64
+    min_distance_between_context_views: 64
     max_distance_between_context_views: 96
     context_gap_warm_up_steps: 30_000
     target_gap_warm_up_steps: 30_000
-    # initial_min_distance_between_context_views: 48
+    initial_min_distance_between_context_views: 48
     initial_max_distance_between_context_views: 64
     chunk_targets: false
     offset: 1
@@ -44,7 +44,7 @@ data_loader:
       shuffle: false
       batch_size: 8
       max_batches: 4
-      num_workers: 8
+      num_workers: 4
       seed: 0
       interval: 5000
       persistent_workers: false
@@ -79,8 +79,8 @@ model:
       timestep_shift: 4
   denoiser:
     input_shape: [30, 52]
-    gradient_checkpointing: false
-    num_target_split: 2 # Split 3D RoPE to be applied independently per chunk
+    gradient_checkpointing: true
+    num_target_split: 1 # Split 3D RoPE to be applied independently per chunk
     camera:
       input_shape: [240, 416]
       embedding:
@@ -95,7 +95,7 @@ model:
     input_shape: [30, 52]
     num_scene_tokens: 1024
     causal_self_atten: false
-    gradient_checkpointing: false
+    gradient_checkpointing: true
     token_dim: 64
     init_large: true
     camera_conditioning: adaLN

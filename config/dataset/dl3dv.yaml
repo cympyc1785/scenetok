@@ -18,6 +18,7 @@ cameras_are_circular: false
 fps: 24
 stage_override: null
 scene_id: null
+do_scale_and_pad: false
 
 # Kown Bug: refer to docs/KNOWN_BUGS.md
 scale_focal_by_256: false

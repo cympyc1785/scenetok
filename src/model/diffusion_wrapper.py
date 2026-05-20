@@ -258,7 +258,16 @@ class DiffusionWrapper(LightningModule):
 
 
     def load_state_dict(self, state_dict, strict: bool = True):
-        super().load_state_dict(state_dict, strict=False)
+        result = super().load_state_dict(state_dict, strict=False)
+        missing = list(result.missing_keys)
+        unexpected = list(result.unexpected_keys)
+        print(f"[load_state_dict] ckpt={len(state_dict)} keys; "
+              f"missing={len(missing)}, unexpected={len(unexpected)}")
+        if missing:
+            print(f"  missing[:8]: {missing[:8]}")
+        if unexpected:
+            print(f"  unexpected[:8]: {unexpected[:8]}")
+        return result
 
     
     def set_timesteps(self, num: Optional[int]=None, name: str="validation"):

@@ -15,6 +15,7 @@ dataset:
   root: ./DATA/DL3DV/DL3DV-960
   smallset: false
   target_latent_type: wan
+  evaluation_index_path: assets/evaluation_index/dl3dv_c16_37.json
 
   context_shape: [256, 256]
   target_shape: [480, 832]
@@ -42,7 +43,7 @@ data_loader:
       shuffle: false
       batch_size: 8
       max_batches: 4
-      num_workers: 8
+      num_workers: 4
       seed: 0
       interval: 5000
       persistent_workers: false

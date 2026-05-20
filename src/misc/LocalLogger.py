@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 import shutil
 from typing import Any, Optional
@@ -38,7 +39,17 @@ class LocalLogger(Logger):
 
     @rank_zero_only
     def log_metrics(self, metrics, step):
-        pass
+        path = self._log_dir / "metrics.jsonl"
+        path.parent.mkdir(exist_ok=True, parents=True)
+        record = {"step": step}
+        for k, v in metrics.items():
+            if isinstance(v, torch.Tensor):
+                v = v.detach().cpu().item() if v.numel() == 1 else v.detach().cpu().tolist()
+            elif isinstance(v, np.ndarray):
+                v = v.item() if v.size == 1 else v.tolist()
+            record[k] = v
+        with open(path, "a") as f:
+            f.write(json.dumps(record) + "\n")
 
     @rank_zero_only
     def log_image(

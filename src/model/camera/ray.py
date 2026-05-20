@@ -77,7 +77,14 @@ class Ray(Camera[RayCfg]):
             # First video token encodes one image
             # Need to pad it
             if chunk_targets:
-                n = ray_encodings.shape[1] // 17
+                num_frames = ray_encodings.shape[1]
+                if num_frames < 17 or num_frames % 17 != 0:
+                    raise ValueError(
+                        "Wan chunked ray encoding expects target poses in 17-frame chunks, "
+                        f"but got {num_frames} frames. Check dataset.view_sampler.chunk_index_gap "
+                        "for chunk_targets=true; Wan chunked training should use chunk_index_gap=5."
+                    )
+                n = num_frames // 17
                 ray_encodings = torch.chunk(ray_encodings, n, dim=1)
             else:
                 ray_encodings = (ray_encodings,)
