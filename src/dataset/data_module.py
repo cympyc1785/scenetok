@@ -166,7 +166,7 @@ class DataModule(LightningDataModule):
 
     def test_dataloader(self):
         generator = self.get_generator(self.data_loader_cfg.test)
-        dataset = get_dataset(self.dataset_cfg, "test", self.step_tracker, generator, force_shuffle=True)
+        dataset = get_dataset(self.dataset_cfg, "test", self.step_tracker, generator, force_shuffle=False)
         dataset = self.dataset_shim(dataset, "test")
         return DataLoader(
             dataset,
@@ -178,7 +178,7 @@ class DataModule(LightningDataModule):
             prefetch_factor=self.data_loader_cfg.test.prefetch_factor,
             pin_memory=self.data_loader_cfg.test.pin_memory
         )
-        
+
     def predict_dataloader(self):
         generator = self.get_generator(self.data_loader_cfg.test)
         dataset = get_dataset(self.dataset_cfg, "test", self.step_tracker, generator, force_shuffle=False)

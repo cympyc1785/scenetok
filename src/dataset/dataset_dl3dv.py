@@ -238,9 +238,15 @@ class DatasetDL3DV(Dataset):
             self.chunks = [chunk for chunk in self.chunks if chunk.name in self.evaluation_index]
 
     def load_evaluation_index(self) -> dict[str, dict[str, list[int]]] | None:
-        if self.cfg.evaluation_index_path is None:
-            return None
-        with self.cfg.evaluation_index_path.open("r") as f:
+        path = self.cfg.evaluation_index_path
+        if path is None:
+            chunk_targets = getattr(self.view_sampler.cfg, "chunk_targets", None)
+            if chunk_targets is None:
+                return None
+            size = "34" if chunk_targets else "37"
+            split = "standard" if self.cfg.val_seen else "unseen"
+            path = Path(f"assets/evaluation_index/dl3dv_c16_{size}_{split}.json")
+        with Path(path).open("r") as f:
             return json.load(f)
 
     def sample_evaluation_index_views(self, scene: str) -> ViewIndex:
