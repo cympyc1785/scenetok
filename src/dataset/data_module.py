@@ -14,6 +14,12 @@ from . import DatasetCfg, get_dataset
 from .dtypes import DataShim, Stage
 from .validation_wrapper import ValidationWrapper
 def safe_collate(batch):
+    # Drop None samples (re10k __getitem__ returns None for bad-baseline / bad-shape /
+    # view-sampler failure scenes). If the whole batch was None we return None so the
+    # caller can skip it instead of hitting `default_collate([])`.
+    batch = [b for b in batch if b is not None]
+    if len(batch) == 0:
+        return None
     try:
         return torch.utils.data.default_collate(batch)
     except RuntimeError as e:
@@ -160,7 +166,8 @@ class DataModule(LightningDataModule):
                 persistent_workers=self.get_persistent(cfg),
                 prefetch_factor=cfg.prefetch_factor,
                 pin_memory=cfg.pin_memory,
-                shuffle=cfg.shuffle
+                shuffle=cfg.shuffle,
+                collate_fn=safe_collate,
             )
         return dataloaders
 
@@ -176,7 +183,8 @@ class DataModule(LightningDataModule):
             worker_init_fn=worker_init_fn,
             persistent_workers=self.get_persistent(self.data_loader_cfg.test),
             prefetch_factor=self.data_loader_cfg.test.prefetch_factor,
-            pin_memory=self.data_loader_cfg.test.pin_memory
+            pin_memory=self.data_loader_cfg.test.pin_memory,
+            collate_fn=safe_collate,
         )
 
     def predict_dataloader(self):
@@ -189,5 +197,6 @@ class DataModule(LightningDataModule):
             num_workers=self.data_loader_cfg.test.num_workers,
             generator=generator,
             worker_init_fn=worker_init_fn,
-            persistent_workers=self.get_persistent(self.data_loader_cfg.test)
+            persistent_workers=self.get_persistent(self.data_loader_cfg.test),
+            collate_fn=safe_collate,
         )

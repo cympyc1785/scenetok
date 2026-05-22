@@ -95,18 +95,36 @@ class Metric(nn.Module):
         return torch.tensor(ssim, dtype=pred.dtype, device=pred.device).mean()
     
     def update_fid(self, pred, gt, num_views: int=16):
-        pred = (pred * 255).to(torch.uint8)
-        gt = (gt * 255).to(torch.uint8)
         pred = rearrange(pred, "(b v) c h w -> b v c h w", v=num_views)
         gt = rearrange(gt, "(b v) c h w -> b v c h w", v=num_views)
+        finite = (
+            torch.isfinite(pred).reshape(pred.shape[0], -1).all(dim=1)
+            & torch.isfinite(gt).reshape(gt.shape[0], -1).all(dim=1)
+        )
+        if not finite.all():
+            print(f"[FID] dropping {(~finite).sum().item()}/{pred.shape[0]} non-finite samples")
+            pred, gt = pred[finite], gt[finite]
+        if pred.shape[0] == 0:
+            return
+        pred = (pred * 255).to(torch.uint8)
+        gt = (gt * 255).to(torch.uint8)
         for i in range(pred.shape[0]):   # or even 8
             self.fid.update(gt[i].to("cuda:0"), real=True)
             self.fid.update(pred[i].to("cuda:0"), real=False)
-    
+
     def update_fvd(self, pred, gt, num_views: int=16):
 
         pred = rearrange(pred, "(b v) c h w -> b v h w c", v=num_views)
         gt = rearrange(gt, "(b v) c h w -> b v h w c", v=num_views)
+        finite = (
+            torch.isfinite(pred).reshape(pred.shape[0], -1).all(dim=1)
+            & torch.isfinite(gt).reshape(gt.shape[0], -1).all(dim=1)
+        )
+        if not finite.all():
+            print(f"[FVD] dropping {(~finite).sum().item()}/{pred.shape[0]} non-finite samples")
+            pred, gt = pred[finite], gt[finite]
+        if pred.shape[0] == 0:
+            return
         pred = (pred * 255).float()
         gt = (gt * 255).float()
 

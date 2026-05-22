@@ -235,6 +235,9 @@ class DiffusionWrapper(LightningModule):
         self.validation_loader_names = {0: "standard", 1: "unseen"}
         self.predicted = {name: [] for name in self.validation_loader_names.values()}
         self.generated = {name: [] for name in self.validation_loader_names.values()}
+        # Loss NaN/Inf occurrence counter (process-lifetime cumulative).
+        # Used by training_step to drop into pdb after 3 occurrences.
+        self.nan_loss_count = 0
 
 
 
@@ -573,6 +576,8 @@ class DiffusionWrapper(LightningModule):
         ), scene_tokens
     
     def training_step(self, batch, batch_idx):
+        if batch is None:  # safe_collate returned None (entire batch was None-filtered)
+            return None
         # Tell the data loader processes about the current step.
         if self.step_tracker is not None:
             self.step_tracker.set_step(self.global_step)
@@ -760,6 +765,21 @@ class DiffusionWrapper(LightningModule):
             self.log("loss/kl_raw", kl_raw.mean())
         loss = loss.mean()
 
+        # Loss NaN/Inf tracking. Counter is process-lifetime cumulative; 3rd
+        # occurrence drops into pdb so we can inspect model state, batch, scene
+        # etc. at the moment of divergence. Skip by `continue` from pdb to keep
+        # training (the downstream gradient guard at line ~1144 will skip the
+        # optimizer step for that batch anyway).
+        if torch.isnan(loss).any() or torch.isinf(loss).any():
+            self.nan_loss_count += 1
+            print(
+                f"[NaN loss #{self.nan_loss_count}] step={self.step_tracker.get_step()} "
+                f"loss={loss.item()} batch_idx={batch_idx} scenes={batch['scene']}"
+            )
+            if self.nan_loss_count >= 3:
+                print(f"[NaN loss] 누적 {self.nan_loss_count}회 → breakpoint() — pdb로 진입")
+                breakpoint()
+
         opt = self.optimizers()
         current_lr = opt.param_groups[0]["lr"]
         if self.global_rank == 0:
@@ -776,6 +796,8 @@ class DiffusionWrapper(LightningModule):
     
     # @rank_zero_only
     def validation_step(self, batch, batch_idx, dataloader_idx: Optional[int]=None):
+        if batch is None:
+            return None
 
         step = self.step_tracker.get_step()
         val_step = (step+1) // self.val_check_interval
@@ -821,6 +843,28 @@ class DiffusionWrapper(LightningModule):
         sampled_views, _, _ = self.generate_batch_with_scene(batch, self.sampler)
         b, v_t, c, h, w = sampled_views.shape
         target_views = target_views[:, :v_t]
+
+        # Diagnostic + finite-mask guard. NaN/Inf in sampled_views poisons FVD's
+        # linalg.sqrtm via NaN activations → covariance → Schur decomposition hang.
+        # Training-side already skips NaN gradients (line 1144); val side previously
+        # had no sanitize, so this closes the loop.
+        nan_count = torch.isnan(sampled_views).sum().item()
+        inf_count = torch.isinf(sampled_views).sum().item()
+        if nan_count or inf_count:
+            print(
+                f"[Sample guard] {loader_name} batch {batch_idx}: "
+                f"nan={nan_count} inf={inf_count} "
+                f"min={sampled_views.float().min().item():.3f} "
+                f"max={sampled_views.float().max().item():.3f}"
+            )
+        finite_mask = torch.isfinite(sampled_views).reshape(b, -1).all(dim=1)
+        if not finite_mask.all():
+            sampled_views = sampled_views[finite_mask]
+            target_views = target_views[finite_mask]
+        if sampled_views.shape[0] == 0:
+            print(f"[Sample guard] {loader_name} batch {batch_idx}: entire batch dropped (all NaN/Inf)")
+            return None
+
         self.generated[loader_name].append(sampled_views.detach().cpu())
         self.predicted[loader_name].append(target_views.detach().cpu())
         # Only do remaining on Rank: 0 in case of multi-gpu/node
@@ -945,6 +989,14 @@ class DiffusionWrapper(LightningModule):
             gathered_target = rearrange(gathered_target, "... c h w -> (...) c h w")
 
             if self.global_rank == 0:
+                # DEBUG (remove after LPIPS-saturation diagnosis): show LPIPS internal dtypes
+                _lpips_param_dtypes = {p.dtype for p in self.metric.lpips.parameters()}
+                _lpips_buf_dtypes = {b.dtype for b in self.metric.lpips.buffers()}
+                print(
+                    f"[LPIPS dtype] params={_lpips_param_dtypes} "
+                    f"buffers={_lpips_buf_dtypes} "
+                    f"pred={gathered_sampled.dtype} gt={gathered_target.dtype}"
+                )
                 full_sequence_metrics = self.metric(
                     gathered_sampled,
                     gathered_target,
@@ -987,9 +1039,11 @@ class DiffusionWrapper(LightningModule):
         return None
 
     def test_step(self, batch, batch_idx):
-        
+        if batch is None:
+            return None
+
         step = self.step_tracker.get_step()
-        
+
         print(
             f"Current epoch {step}; "
             f"Step {batch_idx}; "

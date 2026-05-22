@@ -1,0 +1,141 @@
+# @package _global_
+
+defaults:
+  - override /dataset: re10k
+  - override /dataset/view_sampler: unbounded
+  - override /model/scheduler: rf
+  - override /model/denoiser: lightningdit_L_1
+  - override /model/autoencoders/context: va
+  - override /model/autoencoders/target: video_dc
+  - override /model/compressor: mv_B1
+  - override /model/compressor/camera: ray
+  - override /model/compressor/camera/embedding: lvsm
+  - override /model/denoiser/camera: ray
+  - override /model/denoiser/camera/embedding: lvsm
+
+dataset:
+  root: ./DATA/re10k/re10k
+  shape: [256, 256]
+  random_transform_extrinsics: false
+
+  view_sampler:
+    num_context_views: 16
+    num_target_views: 10
+    temporal_downsample: 4
+    chunk_index_gap: 4
+    target_split_prob: 1.0
+    num_target_split: 1
+    offset: 0          # VideoDCAE: legacy 4N frames per N latents (no +1 prefix)
+    chunk_targets: false
+
+data_loader:
+  train:
+    batch_size: 16
+  val:
+    standard:
+      shuffle: false
+      batch_size: 8
+      max_batches: 4
+      num_workers: 4
+      seed: 0
+      interval: 5000
+      persistent_workers: false
+    unseen:
+      shuffle: false
+      batch_size: 8
+      max_batches: 4
+      num_workers: 4
+      seed: 0
+      interval: 5000
+      persistent_workers: false
+
+val:
+  video_length: 34
+  window_shift: 5
+
+wandb:
+  tags: [re10k, 256x256, va-vdc]
+  activated: true
+
+sampler:
+  clean_targets: 4
+
+freeze:
+  denoiser: false
+  compressor: false
+
+model:
+
+  cfg_scale: 1.0
+  cfg_train: true
+
+  scheduler:
+    sampling_type: random_chunked_uniform
+    num_inference_steps: 25
+    kwargs:
+      weighting: logit_normal
+      num_chunks: 2
+
+  denoiser:
+    input_shape: [8, 8]
+    load_strict: false # Backward compatibility: only for provided checkpoints
+    gradient_checkpointing: false
+    num_target_split: 1
+    camera:
+      input_shape: [128, 128]
+      embedding:
+        patch_size: 16
+        in_channels: 24
+    kwargs:
+      use_rope_3d: true
+      in_channels: 128
+
+  compressor:
+    load_strict: false # Backward compatibility: only for provided checkpoints
+    freeze_after: 150000 # Afterwards finetune the decoder only
+    kl_weights: [1e-10, 1e-10] # Adds a small reglurization for stabilizing the token space (Only for RE10k)
+    input_shape: [16, 16]
+    num_scene_tokens: 512
+    gradient_checkpointing: false
+    token_dim: 64
+    camera_conditioning: adaLN
+    scene_token_projection: kl
+
+    camera:
+      input_shape: [128, 128]
+      embedding:
+        patch_size: 16
+    kwargs:
+      use_rope_2d: true
+      use_rope_3d: false
+      patch_size: 2
+
+trainer:
+  max_steps: 5_000_001
+  val_check_interval: 5000
+  task_steps: null
+  accumulate_grad_batches: 1
+
+
+  precision: bf16-mixed
+
+optimizer:
+  name: AdamW
+  lr: 1.0e-4
+
+  scale_lr: false
+  milestones: [2000]
+  scheduler:
+    - name: LinearLR
+      frequency: 1
+      interval: step
+      kwargs:
+        start_factor: 5.e-4
+        total_iters: 2000
+
+    - name: MultiStepLR
+      frequency: 1
+      interval: step
+      kwargs:
+        milestones: [20000, 150000, 500000]
+        gamma: 0.4

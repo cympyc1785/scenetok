@@ -10,17 +10,33 @@ Dynamic video generation with scene tokens. Built on top of SceneTok (CVPR '26):
 
 ## Commands
 
+이 레포는 두 개의 평행한 학습 라인이 동시에 존재한다. 작업 대상이 어느 쪽인지 먼저 확인할 것.
+
+**A. SceneTok (scene autoencoder) 학습 — 현재 active focus**
+- `bash train_scenetok.sh` — DL3DV wan-wan scratch (480×832 large)
+- `bash train_scenetok_256.sh` — DL3DV 256×448
+- `bash train_scenetok_re10k.sh` — RealEstate10K va-vdc lognorm scratch
+- `bash train_scenetok_wan.sh` — DL3DV wan-wan shift4 scratch
+- `bash train_scenetok_re10k_vavdc.sh` — re10k va-vdc variant
+- `bash train_scenetok_chunked.sh` — chunked-target ablation
+
+**B. TI2V/T2V denoiser (scene-token-conditioned video gen)**
 - 학습: `bash train_ti2vgen_recon_overfit.sh` (single-view-conditioned recon overfit)
-- 학습 (interp variant): `bash train_ti2vgen_recon_overfit_interp.sh`
+- 학습 (interp): `bash train_ti2vgen_recon_overfit_interp.sh`
 - 검증: `bash val_ti2vgen_recon_overfit.sh`
+- 14B variant: `bash train_t2vgen_14B_recon_overfit.sh`
 - Smoke / load test: `bash load_ti2v_test.sh`
+
+**기타**
+- Eval: `bash eval_scenetok_{re10k,dl3dv}.sh`, inference: `bash infer_scenetok_{re10k,dl3dv,davis}.sh`
+- Latent precompute: `bash convert_{dl3dv,re10k}_{vavae,videodc}.sh`
 
 All shells call `python -m src.main +experiment=<config> ...` (Hydra). `src.main` is the standard entry; `src.main_scene` is used only for SceneGen.
 
 Required env vars in the shells:
 - `WANDB_API_KEY` — already inlined in each script
 - `DEBUG=1` — disables `torch.compile` for all modules (set in every current shell). Drop it only when actually benchmarking compiled training.
-- `CUDA_VISIBLE_DEVICES` — pinned (most shells use device `1`). Override at the shell level before invoking, do not delete from the script.
+- `CUDA_VISIBLE_DEVICES` — pinned per-shell (often `1`, `2`, or `3` depending on which run a script is for). Override at the shell level before invoking, do not delete from the script.
 
 ### Modes
 The `mode=` Hydra arg routes the trainer:
@@ -51,7 +67,9 @@ The `mode=` Hydra arg routes the trainer:
 ### Configs (Hydra, config/)
 - `config/main.yaml` — defaults composition (dataset, autoencoders, scheduler, denoiser, …)
 - `config/experiment/*.yaml` — published SceneTok / SceneGen experiments. **Do not edit these.**
-- `config/experiment/custom/*.yaml` — in-house experiments for this project. The active one is `scenetok_va-wan-ti2v_dl3dv.yaml` (and `_interp` variant); both override `denoiser=wan_ti2v_5b` and target the Wan VAE.
+- `config/experiment/custom/*.yaml` — in-house experiments for this project. Two groups:
+  - **SceneTok-side (active):** `scenetok_va-vdc_lognorm_re10k_scratch.yaml`, `scenetok_wan-wan_lognorm_re10k_scratch.yaml`, `scenetok_wan-wan_shift4_dl3dv_scratch.yaml`, `scenetok_va-vdc_shift{4,8}_dl3dv_finetuned_fixed.yaml`, `scenetok_va-wan_shift8_dl3dv_scratch.yaml`, plus DAVIS finetune variants. These train the autoencoder (compressor + decoder denoiser).
+  - **TI2V denoiser-side:** `scenetok_va-wan-ti2v_dl3dv.yaml` (+ `_interp`), `scenetok_va-wan-t2v-14B_dl3dv.yaml`, `scenetok_va-wan-ti2v_davis.yaml` — override `denoiser=wan_ti2v_5b` / `wan_t2v_14b`.
 
 Key knobs exposed on the denoiser side (driven from the shell scripts):
 - `model.denoiser.scene_input_type` ∈ `{none, cross_attention, new_cross_attention, latent_concat}` — how scene tokens enter the DiT
@@ -70,9 +88,14 @@ Pretrained weights live under `checkpoints/` (downloaded SceneTok/VAE/SceneGen w
 
 ### Data
 - `src/dataset/__init__.py` registers `re10k`, `dl3dv`, `latent`, `davis`.
-- `src/dataset/dataset_dl3dv.py` is the primary loader; `build_dl3dv_meta` is invoked from `src/main.py`.
-- View samplers in `config/dataset/view_sampler/` — `bounded` is used for training; `evaluation_video_wan` / `evaluation_video` for eval depending on target autoencoder.
-- `dataset.smallset=true` is the overfit/dev subset used in every current train script.
+- `dl3dv` and `re10k` 둘 다 `meta.csv` 기반 — 첫 init 시 `build_{dl3dv,re10k}_meta`가 split별로 모든 chunk를 스캔해서 `DATA/{ds}/.../meta.csv (chunk, key, num_images)`를 작성하고, 이후엔 csv만 읽어 `num_images >= cfg.min_frames` scene만 사용. rebuild 필요 시 csv 삭제.
+- View samplers (`src/dataset/view_sampler/`): training은 `bounded` (dl3dv) 또는 `unbounded` (re10k 등). `unbounded`는 `offset != 0`이면 Wan 4N+1 chunk 레이아웃을 따른다 (chunk당 raw `4N-3` 프레임). `chunk_targets`는 sampler 자체 동작은 그대로지만 downstream wrapper가 raw→latent 변환 경로를 선택하는 플래그.
+- Eval은 `assets/evaluation_index/{ds}_c{NC}_{NT}_{standard,unseen}.json` 사전 샘플 파일을 사용. `(chunk_targets, val_seen)` 조합으로 자동 선택되며 (`load_evaluation_index`), `chunk_targets=true`면 `_34`, false면 `_37` (raw frame count). `standard`는 train pool, `unseen`은 test pool. config에서 `evaluation_index_path`를 명시하면 그 값이 우선.
+- `dataset.smallset=true` is the overfit/dev subset; 일부 SceneTok 학습은 `smallset=false`로 full split 사용.
+
+### Known gotchas
+- **Wan 2.2 VAE + 1024 scene_tokens (wan-wan scratch):** published va-vdc는 512 tokens + `kl_weights=1e-10`로 안정했지만, 1024 tokens 환경에선 동일 anchor가 부족해 step ~2k–20k 사이에 cascading gradient NaN으로 발산한다. 대응: compressor `init_large=false, init_small=true` (scene_tokens 초기 std 5.0 → 0.02) + `kl_weights` 단계적 상향 (1e-10 → 1e-7 → 1e-6 → 1e-5). 새 wan-wan 학습 시작 전에 `scenetok_wan-wan_lognorm_re10k_scratch.yaml`의 현재 값을 그대로 따라가는 게 안전. 진단 스크립트: `python scripts/check_wan_vae_outliers.py`.
+- **FVD `sqrtm` hang:** `submodules/fvd/frechet_video_distance.py`의 `calculate_fvd_from_activations`는 rank-deficient I3D feature cov에서 scipy `sqrtm`이 무한 스핀할 수 있음. 현재는 원본대로 두고 NaN/Inf fallback만 활용 (사용자 요청으로 1e-6 regularization은 revert됨). validation hang 보이면 sample 수 늘리거나 ε 패치 부활 검토.
 
 ## Don't
 

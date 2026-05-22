@@ -1,0 +1,137 @@
+# @package _global_
+
+defaults:
+  - override /dataset: re10k
+  - override /dataset/view_sampler: unbounded
+  - override /model/scheduler: rf
+  - override /model/denoiser: lightningdit_L_1
+  - override /model/autoencoders/context: wan_single
+  - override /model/autoencoders/target: wan
+  - override /model/compressor: mv_B1
+  - override /model/compressor/camera: ray
+  - override /model/compressor/camera/embedding: lvsm
+  - override /model/denoiser/camera: ray
+  - override /model/denoiser/camera/embedding: lvsm
+
+dataset:
+  root: ./DATA/re10k/re10k
+  shape: [256, 448]
+
+  view_sampler:
+    num_context_views: 12
+    num_target_views: 10           # 1 chunk of 10 latents → 4*10-3 = 37 raw frames (Wan 4N+1)
+    temporal_downsample: 4
+    chunk_index_gap: 4
+    target_split_prob: 1.0         # no random split-to-1 forcing
+    num_target_split: 1            # single Wan chunk per __getitem__
+    offset: 1                      # enables Wan 4N+1 raw-frame layout
+    chunk_targets: false           # wrapper else-branch: num = 1 + (v_t-1)//4 (diffusion_wrapper.py:494-495)
+
+data_loader:
+  train:
+    batch_size: 4
+  val:
+    standard:
+      shuffle: false
+      batch_size: 8
+      max_batches: 4
+      num_workers: 4
+      seed: 0
+      interval: 5000
+      persistent_workers: false
+    unseen:
+      shuffle: false
+      batch_size: 8
+      max_batches: 4
+      num_workers: 4
+      seed: 0
+      interval: 5000
+      persistent_workers: false
+val:
+  video_length: 34
+  window_shift: 5
+wandb:
+  tags: [re10k, 256x448]
+
+  activated: true
+
+sampler:
+  clean_targets: 4
+freeze:
+  denoiser: false
+  compressor: false
+model:
+
+  cfg_scale: 1.0
+  cfg_train: true
+
+  scheduler:
+    sampling_type: random_chunked_uniform
+    num_inference_steps: 25
+    kwargs:
+      weighting: logit_normal
+      num_chunks: 2
+  denoiser:
+    input_shape: [16, 28]
+    gradient_checkpointing: true
+    num_target_split: 1 # Split 3D RoPE to be applied independently per chunk
+    camera:
+      input_shape: [128, 224]
+      embedding:
+        patch_size: 8
+        in_channels: 24
+    kwargs:
+      use_rope_3d: true
+      in_channels: 48
+
+  compressor:
+    kl_weights: [1e-10, 1e-10]
+    input_shape: [16, 28]
+    num_scene_tokens: 512
+    causal_self_atten: false
+    gradient_checkpointing: true
+    token_dim: 64
+    init_large: false           # default true initializes scene_tokens with std=5.0 — too aggressive for scratch wan-wan
+    init_small: true            # std=0.02 instead
+    camera_conditioning: adaLN
+    scene_token_projection: kl
+    mask_context: false
+    camera:
+      input_shape: [128, 224]
+      embedding:
+        patch_size: 16
+    kwargs:
+      use_rope_2d: true
+      use_rope_3d: false
+      patch_size: 2
+
+
+trainer:
+  max_steps: 5_000_001
+  val_check_interval: 5000
+  task_steps: null
+  accumulate_grad_batches: 1
+  gradient_clip_val: 0.1
+
+  precision: bf16-mixed
+
+optimizer:
+  name: AdamW
+  lr: 1.0e-4
+
+  scale_lr: false
+  milestones: [2000]
+  scheduler:
+    - name: LinearLR
+      frequency: 1
+      interval: step
+      kwargs:
+        start_factor: 5.e-4
+        total_iters: 2000
+
+    - name: MultiStepLR
+      frequency: 1
+      interval: step
+      kwargs:
+        milestones: [20000, 150000, 500000]
+        gamma: 0.4

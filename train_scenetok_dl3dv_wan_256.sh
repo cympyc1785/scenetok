@@ -8,7 +8,7 @@ exp_name="scenetok_wan-wan_dl3dv_256_scratch_large"
 export WANDB_API_KEY=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
 export DEBUG=1
 
-CUDA_VISIBLE_DEVICES=1 python -m src.main +experiment=${config} \
+CUDA_VISIBLE_DEVICES=0 python -m src.main +experiment=${config} \
   data_loader.train.num_workers=${num_workers} \
   mode=train \
   dataset.smallset=false \
@@ -18,6 +18,7 @@ CUDA_VISIBLE_DEVICES=1 python -m src.main +experiment=${config} \
   model.denoiser.camera.input_shape=[128,224] \
   model.compressor.input_shape=[16,28] \
   model.compressor.camera.input_shape=[128,224] \
+  model.compressor.kl_weights=[1e-10,1e-10] \
   data_loader.train.batch_size=4 \
   trainer.devices=${gpus} \
   trainer.num_nodes=${num_nodes} \

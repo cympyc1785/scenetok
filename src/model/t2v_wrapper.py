@@ -291,9 +291,11 @@ class T2VWrapper(DiffusionWrapper):
         ), scene_tokens
 
     def test_step(self, batch, batch_idx):
-        
+        if batch is None:
+            return None
+
         step = self.step_tracker.get_step()
-        
+
         prompt = getattr(self.test_cfg, "prompt", None)
         negative_prompt = getattr(self.test_cfg, "negative_prompt", None)
 
@@ -377,6 +379,8 @@ class T2VWrapper(DiffusionWrapper):
         return None
 
     def training_step(self, batch, batch_idx):
+        if batch is None:  # safe_collate returned None (entire batch was None-filtered)
+            return None
         if self.step_tracker is not None:
             self.step_tracker.set_step(self.global_step)
             self.log("step_tracker/step", self.step_tracker.get_step())
