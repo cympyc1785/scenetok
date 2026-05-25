@@ -17,6 +17,7 @@ from torch.utils.data import IterableDataset
 from tqdm import tqdm
 from ..geometry.projection import get_fov
 from .dataset import DatasetCfgCommon
+from .dataset_dl3dv import _resolve_blacklist_path, load_blacklist
 from .shims.augmentation_shim import apply_augmentation_shim
 from .shims.random_transform_shim import apply_random_transform_shim
 from .shims.crop_shim import apply_crop_shim
@@ -25,9 +26,40 @@ from .view_sampler import ViewSampler, ViewSamplerEvaluation
 from torch.utils.data import Dataset
 
 
+def _re10k_cameras_to_c2w(cameras: Tensor) -> Tensor:
+    """RE10K stores per-frame poses as (N, 18): fx, fy, cx, cy, 2 reserved,
+    then a 3x4 w2c block (row-major). Return c2w of shape (N, 4, 4)."""
+    n = cameras.shape[0]
+    w2c = torch.eye(4, dtype=torch.float32).unsqueeze(0).repeat(n, 1, 1)
+    w2c[:, :3] = cameras[:, 6:].reshape(n, 3, 4)
+    return w2c.inverse()
+
+
+def check_teleport_camera(extrinsics: Tensor) -> bool:
+    """Return True if the camera trajectory looks broken: non-finite, huge
+    per-axis frame-to-frame jump, huge translation-magnitude jump, or absurd
+    absolute translation. Mirrors `check_teleport_camera` in dataset_dl3dv;
+    same thresholds (YouTube-scale scenes for both datasets)."""
+    c2w = extrinsics
+    w2c = c2w.inverse()
+    t_c2w = c2w[:, :3, 3]
+    t_w2c = w2c[:, :3, 3]
+    if not torch.isfinite(t_c2w).all() or not torch.isfinite(t_w2c).all():
+        return True
+    diff = t_w2c[1:] - t_w2c[:-1]
+    mag = torch.linalg.norm(diff, dim=1)
+    if (torch.abs(diff) > 10).any(dim=1).any() or (mag > 15).any():
+        return True
+    if (torch.abs(t_c2w) > 50).any(dim=1).any():
+        return True
+    return False
+
+
 def build_re10k_meta(root: Path, min_frames: int = 37, num_workers: int = 8) -> Path:
     """Scan all .torch chunks under `root` and write meta.csv listing scenes where
-    len(images) == len(cameras) AND >= min_frames. CSV columns: chunk, key, num_images.
+    len(images) == len(cameras) AND >= min_frames AND cameras pass
+    `check_teleport_camera` (no NaN/Inf, no teleport jumps, no absurd
+    translations). CSV columns: chunk, key, num_images.
     """
     meta_path = root / "meta.csv"
     if meta_path.exists():
@@ -40,26 +72,47 @@ def build_re10k_meta(root: Path, min_frames: int = 37, num_workers: int = 8) -> 
             data = torch.load(chunk_path, weights_only=False)
         except Exception as e:
             print(f"  failed to load {chunk_path}: {e}")
-            return []
+            return [], {"length": 0, "camera": 0}
         out = []
+        skipped = {"length": 0, "camera": 0}
         for x in data:
             n_img = len(x["images"])
             n_cam = len(x["cameras"])
             if n_img != n_cam or n_img < min_frames:
+                skipped["length"] += 1
+                continue
+            cameras = x["cameras"]
+            if not torch.is_tensor(cameras) or cameras.ndim != 2 or cameras.shape[1] < 18:
+                skipped["camera"] += 1
+                continue
+            try:
+                extrinsics = _re10k_cameras_to_c2w(cameras)
+            except Exception:
+                skipped["camera"] += 1
+                continue
+            if check_teleport_camera(extrinsics):
+                skipped["camera"] += 1
                 continue
             out.append({"chunk": chunk_path.name, "key": x["key"], "num_images": n_img})
-        return out
+        return out, skipped
 
     rows = []
+    total_skipped = {"length": 0, "camera": 0}
     with ThreadPoolExecutor(max_workers=num_workers) as ex:
-        for chunk_rows in tqdm(ex.map(scan, chunks), total=len(chunks), desc="scanning chunks"):
+        for chunk_rows, sk in tqdm(ex.map(scan, chunks), total=len(chunks), desc="scanning chunks"):
             rows.extend(chunk_rows)
+            for k, v in sk.items():
+                total_skipped[k] += v
 
     with open(meta_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["chunk", "key", "num_images"])
         writer.writeheader()
         writer.writerows(rows)
-    print(f"Wrote {meta_path}: {len(rows)} valid scenes\n")
+    print(
+        f"Wrote {meta_path}: {len(rows)} valid scenes "
+        f"(skipped {total_skipped['length']} length-mismatch / "
+        f"{total_skipped['camera']} bad-camera)\n"
+    )
     return meta_path
 
 @dataclass
@@ -70,6 +123,8 @@ class DatasetRE10kCfg(DatasetCfgCommon):
     max_fov: float
     make_baseline: bool
     random_transform_extrinsics = False
+    blacklist_path: Path | None = None
+    val_seen: bool = False
 
 
 class DatasetRE10k(Dataset):
@@ -98,8 +153,14 @@ class DatasetRE10k(Dataset):
         if cfg.root is None:
             raise Exception("Root directory of dataset is not defined. Please specify in your argument as dataset.root=<path-to-root-directory>")
 
-        # train stage reads root/train, val/test read root/test.
-        stage_subdir = "train" if stage == "train" else "test"
+        # train stage reads root/train. For val/test, `val_seen=True` mirrors
+        # DL3DV's "standard" split semantics by routing to the train pool
+        # (potential train leakage, used for sanity-check style val); default
+        # `val_seen=False` reads the held-out test pool ("unseen").
+        if stage == "train":
+            stage_subdir = "train"
+        else:
+            stage_subdir = "train" if cfg.val_seen else "test"
         root = cfg.root / stage_subdir
         with open(root / "index.json") as f:
             self.map_dict = json.load(f)
@@ -108,6 +169,14 @@ class DatasetRE10k(Dataset):
         meta_path = build_re10k_meta(root)
         with open(meta_path, newline="") as f:
             valid_keys = {row["key"] for row in csv.DictReader(f)}
+
+        # Filter blacklisted scenes (sibling blacklist.csv next to meta.csv;
+        # appended either manually or by diffusion_wrapper's NaN-loss hook).
+        blacklist = load_blacklist(_resolve_blacklist_path(cfg, root))
+        if blacklist:
+            before = len(valid_keys)
+            valid_keys = {k for k in valid_keys if k not in blacklist}
+            print(f"[RE10K] blacklist drop: {before - len(valid_keys)} / {before}")
 
         # Eval samplers (evaluation_video / evaluation_video_wan) expose `.index` to pin
         # which scenes to load; training samplers (unbounded, bounded) don't.

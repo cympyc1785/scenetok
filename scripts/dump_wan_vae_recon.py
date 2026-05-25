@@ -21,7 +21,7 @@ from PIL import Image
 from src.model.autoencoder.autoencoder_wan import AutoencoderWan, WanKwargsCfg
 
 N_SCENES = 10
-RESOLUTIONS = [(256, 448), (480, 832)]
+RESOLUTIONS = [(256, 256), (256, 448), (480, 832)]
 OUT_DIR = REPO_ROOT / "tmp" / "wan_vae_recon"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 

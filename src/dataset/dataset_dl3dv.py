@@ -42,26 +42,71 @@ def get_dl3dv_image_folder(data_dir: Path, folder_key: str) -> Path | None:
     )
 
 def check_teleport_camera(extrinsics):
-    c2w = extrinsics
+    # `extrinsics` is (N, 4, 4). Previous slicing `c2w[:3, 3]` accidentally
+    # picked the first 3 frames' homogeneous row [0,0,0,1] (shape (3, 4))
+    # instead of the per-frame translation, so the magnitude checks always
+    # passed for any data. Fix: take col-3 of the first three rows for every
+    # frame to recover the translation vector of shape (N, 3).
+    c2w = extrinsics                          # (N, 4, 4)
     w2c = c2w.inverse()
 
-    t_c2w = c2w[:3, 3]
-    t_w2c = w2c[:3, 3]
+    t_c2w = c2w[:, :3, 3]                     # (N, 3)
+    t_w2c = w2c[:, :3, 3]                     # (N, 3)
 
-    diff = t_w2c[1:] - t_w2c[:-1]
-    mag = torch.linalg.norm(diff, dim=1)
-    invalid_indices_w2c = torch.where(
-        (torch.abs(diff) > 10).any(dim=1) | (mag > 15)
-    )[0]
-    if len(invalid_indices_w2c) > 0:
+    diff = t_w2c[1:] - t_w2c[:-1]             # (N-1, 3)
+    mag = torch.linalg.norm(diff, dim=1)      # (N-1,)
+    if (torch.abs(diff) > 10).any(dim=1).any() or (mag > 15).any():
         return True
-    
-    invalid_indices_c2w = torch.where(
-        (torch.abs(t_c2w) > 50).any(dim=1)
-    )[0]
-    if len(invalid_indices_c2w) > 0:
+    if (torch.abs(t_c2w) > 50).any(dim=1).any():
+        return True
+    if not torch.isfinite(t_c2w).all() or not torch.isfinite(t_w2c).all():
         return True
     return False
+
+BLACKLIST_FILENAME = "blacklist.csv"
+_BLACKLIST_FIELDNAMES = ["scene", "reason", "step", "loss", "detail"]
+
+
+def _resolve_blacklist_path(cfg: "DatasetDL3DVCfg", root: Path) -> Path:
+    """`{cfg.blacklist_path}` if set, else `{root}/blacklist.csv` (sibling of meta.csv)."""
+    path = getattr(cfg, "blacklist_path", None)
+    return Path(path) if path else Path(root) / BLACKLIST_FILENAME
+
+
+def load_blacklist(path: Path | str | None) -> set[str]:
+    """Return the set of blacklisted scene basenames; tolerate missing file."""
+    if path is None:
+        return set()
+    path = Path(path)
+    if not path.exists():
+        return set()
+    with open(path, "r", newline="") as f:
+        return {row["scene"] for row in csv.DictReader(f) if row.get("scene")}
+
+
+def append_blacklist(path: Path | str, entries: list[dict]) -> int:
+    """Append entries to the blacklist CSV (dedup against existing). Returns # new rows."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = load_blacklist(path)
+    new = []
+    seen_local: set[str] = set()
+    for e in entries:
+        s = e.get("scene")
+        if not s or s in existing or s in seen_local:
+            continue
+        seen_local.add(s)
+        new.append({k: e.get(k, "") for k in _BLACKLIST_FIELDNAMES})
+    if not new:
+        return 0
+    write_header = not path.exists()
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=_BLACKLIST_FIELDNAMES)
+        if write_header:
+            writer.writeheader()
+        writer.writerows(new)
+    return len(new)
+
 
 def build_dl3dv_meta_row(
     cfg: "DatasetDL3DVCfg",
@@ -140,7 +185,13 @@ def build_dl3dv_meta(cfg: "DatasetDL3DVCfg", root, force: bool = False) -> Path:
         for scene_dir in chunk_root.iterdir()
         if scene_dir.is_dir()
     ]
-    
+
+    blacklist = load_blacklist(_resolve_blacklist_path(cfg, root))
+    if blacklist:
+        before = len(scene_dirs)
+        scene_dirs = [d for d in scene_dirs if d.name not in blacklist]
+        print(f"Blacklist filter: dropped {before - len(scene_dirs)} / {before} scenes")
+
     rows = []
     total_cnt = len(scene_dirs)
     num_workers = 8
@@ -180,6 +231,7 @@ class DatasetDL3DVCfg(DatasetCfgCommon):
     val_seen: bool = False
     do_scale_and_pad: bool = False
     evaluation_index_path: Path | None = None
+    blacklist_path: Path | None = None
 
 class DatasetDL3DV(Dataset):
     cfg: DatasetDL3DVCfg
@@ -220,6 +272,14 @@ class DatasetDL3DV(Dataset):
         
         with open(meta_path, "r", newline="") as f:
             self.chunks = [Path(row["chunk"]) for row in csv.DictReader(f) if row.get("chunk")]
+
+        # Filter blacklisted scenes (also handles entries that slipped into a
+        # pre-existing meta.csv from before the blacklist was populated).
+        blacklist = load_blacklist(_resolve_blacklist_path(cfg, self.root))
+        if blacklist:
+            before = len(self.chunks)
+            self.chunks = [c for c in self.chunks if c.name not in blacklist]
+            print(f"[DL3DV] blacklist drop: {before - len(self.chunks)} / {before}")
 
         # Filter dir
         if self.data_stage_override == "train":

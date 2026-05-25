@@ -1,8 +1,8 @@
 # @package _global_
 
 defaults:
-  - override /dataset: dl3dv
-  - override /dataset/view_sampler: bounded
+  - override /dataset: re10k
+  - override /dataset/view_sampler: unbounded
   - override /model/scheduler: rf
   - override /model/denoiser: lightningdit_L_1
   - override /model/autoencoders/context: va
@@ -14,26 +14,18 @@ defaults:
   - override /model/denoiser/camera/embedding: lvsm
 
 dataset:
-  root: ./DATA/DL3DV/DL3DV-960
-  smallset: false
-
-  context_shape: [256, 448]
-  target_shape: [256, 448]
-
-  # NOTE: Allow compatibility with va-wan, refer to docs/KNOWN_BUG.md
-  scale_context_focal_by_256: true  
+  root: ./DATA/re10k/re10k
+  shape: [256, 448]
 
   view_sampler:
-    num_context_views: 16
-    num_target_views: 10
-    min_distance_between_context_views: 64
-    max_distance_between_context_views: 96
-    context_gap_warm_up_steps: 30_000
-    target_gap_warm_up_steps: 30_000
-    initial_min_distance_between_context_views: 48
-    initial_max_distance_between_context_views: 64
-    chunk_targets: false
-    offset: 1
+    num_context_views: 12
+    num_target_views: 10           # 1 chunk of 10 latents → 4*10-3 = 37 raw frames (Wan 4N+1)
+    temporal_downsample: 4
+    chunk_index_gap: 4
+    target_split_prob: 1.0         # no random split-to-1 forcing
+    num_target_split: 1            # single Wan chunk per __getitem__
+    offset: 1                      # enables Wan 4N+1 raw-frame layout
+    chunk_targets: false           # wrapper else-branch: num = 1 + (v_t-1)//4 (diffusion_wrapper.py:494-495)
 
 data_loader:
   train:
@@ -43,7 +35,7 @@ data_loader:
       shuffle: false
       batch_size: 8
       max_batches: 4
-      num_workers: 8
+      num_workers: 4
       seed: 0
       interval: 5000
       persistent_workers: false
@@ -59,26 +51,30 @@ val:
   video_length: 34
   window_shift: 5
 wandb:
-  tags: [dl3dv, 256x448]
+  tags: [re10k, 256x448]
 
   activated: true
 
 sampler:
-  clean_targets: 5
+  clean_targets: 4
 freeze:
   denoiser: false
   compressor: false
 model:
+
+  cfg_scale: 1.0
+  cfg_train: true
+
   scheduler:
-    sampling_type: random_uniform
+    sampling_type: random_chunked_uniform
     num_inference_steps: 25
     kwargs:
-      weighting: shifted
-      timestep_shift: 8
+      weighting: logit_normal
+      num_chunks: 2
   denoiser:
     input_shape: [16, 28]
-    gradient_checkpointing: false
-    num_target_split: 2 # Split 3D RoPE to be applied independently per chunk
+    gradient_checkpointing: true
+    num_target_split: 1 # Split 3D RoPE to be applied independently per chunk
     camera:
       input_shape: [128, 224]
       embedding:
@@ -89,15 +85,14 @@ model:
       in_channels: 48
 
   compressor:
-    kl_weights: [1e-10, 1e-5]
-    kl_schedule: [0, 2000]
+    kl_weights: [1e-10, 1e-10]
     input_shape: [16, 28]
-    num_scene_tokens: 1024
+    num_scene_tokens: 512
     causal_self_atten: false
-    gradient_checkpointing: false
+    gradient_checkpointing: true
     token_dim: 64
-    init_large: false
-    init_small: true
+    init_large: false           # default true initializes scene_tokens with std=5.0 — too aggressive for scratch wan-wan
+    init_small: true            # std=0.02 instead
     camera_conditioning: adaLN
     scene_token_projection: kl
     mask_context: false
@@ -110,7 +105,7 @@ model:
       use_rope_3d: false
       patch_size: 2
 
-        
+
 trainer:
   max_steps: 5_000_001
   val_check_interval: 5000

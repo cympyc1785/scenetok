@@ -571,10 +571,81 @@ class DiffusionWrapper(LightningModule):
             autoencoder_name=getattr(self.model_cfg.autoencoders, "target").name,
             scaling_factor=getattr(self.model_cfg.autoencoders, "target").kwargs.scaling_factor,
             chunk_index_gap=self.dataset_cfg.view_sampler.chunk_index_gap,
-            offset=self.dataset_cfg.view_sampler.offset, 
+            offset=self.dataset_cfg.view_sampler.offset,
             chunk_targets=getattr(self.dataset_cfg.view_sampler, "chunk_targets", True),
         ), scene_tokens
-    
+
+    @staticmethod
+    def _diagnose_batch_for_blacklist(batch, target_latents) -> list[dict]:
+        """Inspect a NaN-loss batch and return per-scene anomaly entries.
+
+        Checks per-sample (i in 0..B-1):
+          - extrinsics/intrinsics: non-finite, or |translation| > 50
+          - raw input ("latent" key — actually pre-VAE RGB for DL3DV): non-finite,
+            or |val| > 5 (post-augmentation RGB should stay in roughly [-2, 2])
+          - encoded `target_latents`: non-finite, or |val| > 200
+        """
+        scenes_field = batch.get("scene", [])
+        scenes = list(scenes_field) if isinstance(scenes_field, (list, tuple)) else [scenes_field]
+        B = len(scenes)
+        if B == 0:
+            return []
+        issues: list[dict] = []
+
+        def _per_sample_flatten(t):
+            return t.reshape(t.shape[0], -1) if t.ndim > 1 else t.reshape(t.shape[0], 1)
+
+        for view_key in ("context", "target"):
+            view = batch.get(view_key)
+            if not isinstance(view, dict):
+                continue
+            ext = view.get("extrinsics")
+            if ext is not None and torch.is_tensor(ext) and ext.shape[0] == B:
+                t = ext[..., :3, 3]  # (B, V, 3)
+                finite = torch.isfinite(ext).reshape(B, -1).all(dim=1)
+                max_t = t.abs().reshape(B, -1).amax(dim=1)
+                for i in range(B):
+                    if not bool(finite[i]):
+                        issues.append({"scene": scenes[i], "reason": f"{view_key}_extrinsics_nonfinite", "detail": ""})
+                    elif float(max_t[i]) > 50.0:
+                        issues.append({"scene": scenes[i], "reason": f"{view_key}_extrinsics_large", "detail": f"max|t|={float(max_t[i]):.3g}"})
+            intr = view.get("intrinsics")
+            if intr is not None and torch.is_tensor(intr) and intr.shape[0] == B:
+                finite = torch.isfinite(intr).reshape(B, -1).all(dim=1)
+                for i in range(B):
+                    if not bool(finite[i]):
+                        issues.append({"scene": scenes[i], "reason": f"{view_key}_intrinsics_nonfinite", "detail": ""})
+            lat = view.get("latent")
+            if lat is not None and torch.is_tensor(lat) and lat.shape[0] == B:
+                finite = torch.isfinite(lat).reshape(B, -1).all(dim=1)
+                max_v = lat.abs().reshape(B, -1).amax(dim=1)
+                for i in range(B):
+                    if not bool(finite[i]):
+                        issues.append({"scene": scenes[i], "reason": f"{view_key}_input_nonfinite", "detail": ""})
+                    elif float(max_v[i]) > 5.0:
+                        issues.append({"scene": scenes[i], "reason": f"{view_key}_input_huge", "detail": f"max|x|={float(max_v[i]):.3g}"})
+
+        if target_latents is not None and torch.is_tensor(target_latents) and target_latents.shape[0] == B:
+            tl = target_latents
+            finite = torch.isfinite(tl).reshape(B, -1).all(dim=1)
+            max_v = tl.abs().reshape(B, -1).amax(dim=1)
+            for i in range(B):
+                if not bool(finite[i]):
+                    issues.append({"scene": scenes[i], "reason": "encoded_target_latents_nonfinite", "detail": ""})
+                elif float(max_v[i]) > 200.0:
+                    issues.append({"scene": scenes[i], "reason": "encoded_target_latents_huge", "detail": f"max|z|={float(max_v[i]):.3g}"})
+
+        # Dedup by (scene, reason) keeping first detail.
+        seen: set[tuple[str, str]] = set()
+        deduped: list[dict] = []
+        for iss in issues:
+            key = (iss["scene"], iss["reason"])
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(iss)
+        return deduped
+
     def training_step(self, batch, batch_idx):
         if batch is None:  # safe_collate returned None (entire batch was None-filtered)
             return None
@@ -765,20 +836,51 @@ class DiffusionWrapper(LightningModule):
             self.log("loss/kl_raw", kl_raw.mean())
         loss = loss.mean()
 
-        # Loss NaN/Inf tracking. Counter is process-lifetime cumulative; 3rd
-        # occurrence drops into pdb so we can inspect model state, batch, scene
-        # etc. at the moment of divergence. Skip by `continue` from pdb to keep
-        # training (the downstream gradient guard at line ~1144 will skip the
-        # optimizer step for that batch anyway).
+        # Loss NaN/Inf tracking. On every NaN we (a) diagnose the batch for
+        # data-side anomalies (huge extrinsics translations, non-finite inputs,
+        # exploded latents) and (b) append offending scenes to a per-dataset
+        # blacklist CSV so subsequent runs filter them out via
+        # `load_blacklist(...)` in dataset_dl3dv. Auto-continue is fine — the
+        # gradient guard around line 1144 zeros the bad step's grads.
         if torch.isnan(loss).any() or torch.isinf(loss).any():
             self.nan_loss_count += 1
+            step = self.step_tracker.get_step() if self.step_tracker is not None else -1
+            scenes_field = batch.get("scene", [])
+            scenes = list(scenes_field) if isinstance(scenes_field, (list, tuple)) else [scenes_field]
+            loss_str = f"{loss.item():.3g}" if torch.isfinite(loss).all() else "nan"
             print(
-                f"[NaN loss #{self.nan_loss_count}] step={self.step_tracker.get_step()} "
-                f"loss={loss.item()} batch_idx={batch_idx} scenes={batch['scene']}"
+                f"[NaN loss #{self.nan_loss_count}] step={step} "
+                f"loss={loss_str} batch_idx={batch_idx} scenes={scenes}"
             )
-            if self.nan_loss_count >= 3:
-                print(f"[NaN loss] 누적 {self.nan_loss_count}회 → breakpoint() — pdb로 진입")
-                breakpoint()
+            try:
+                issues = self._diagnose_batch_for_blacklist(batch, target_latents)
+                if issues:
+                    for iss in issues:
+                        iss["step"] = str(step)
+                        iss["loss"] = loss_str
+                    if getattr(self.dataset_cfg, "name", None) == "dl3dv":
+                        from src.dataset.dataset_dl3dv import (
+                            append_blacklist,
+                            _resolve_blacklist_path,
+                        )
+                        bl_path = _resolve_blacklist_path(
+                            self.dataset_cfg, Path(self.dataset_cfg.root) / "train"
+                        )
+                        n_added = append_blacklist(bl_path, issues)
+                        print(
+                            f"[NaN loss] blacklist += {n_added} (of {len(issues)} flagged) → {bl_path}"
+                        )
+                    else:
+                        print(
+                            f"[NaN loss] {len(issues)} anomalies flagged but dataset is "
+                            f"{getattr(self.dataset_cfg, 'name', None)!r} (blacklist unsupported); just logging"
+                        )
+                    for iss in issues:
+                        print(f"  - {iss['scene']}: {iss['reason']} ({iss['detail']})")
+                else:
+                    print(f"[NaN loss] no data anomaly detected — likely model-side/transient, not blacklisting")
+            except Exception as e:
+                print(f"[NaN loss] blacklist diagnostic failed: {e!r}")
 
         opt = self.optimizers()
         current_lr = opt.param_groups[0]["lr"]

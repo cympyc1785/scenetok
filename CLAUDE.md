@@ -13,23 +13,26 @@ Dynamic video generation with scene tokens. Built on top of SceneTok (CVPR '26):
 이 레포는 두 개의 평행한 학습 라인이 동시에 존재한다. 작업 대상이 어느 쪽인지 먼저 확인할 것.
 
 **A. SceneTok (scene autoencoder) 학습 — 현재 active focus**
-- `bash train_scenetok.sh` — DL3DV wan-wan scratch (480×832 large)
-- `bash train_scenetok_256.sh` — DL3DV 256×448
-- `bash train_scenetok_re10k.sh` — RealEstate10K va-vdc lognorm scratch
-- `bash train_scenetok_wan.sh` — DL3DV wan-wan shift4 scratch
-- `bash train_scenetok_re10k_vavdc.sh` — re10k va-vdc variant
-- `bash train_scenetok_chunked.sh` — chunked-target ablation
+- `bash train_scenetok.sh` — RE10K va-vdc scratch (`scenetok_va-vdc_re10k_scratch`)
+- `bash train_scenetok_re10k_256.sh` — RE10K wan-wan 256 scratch
+- `bash train_scenetok_re10k_vavdc.sh` — RE10K va-vdc 256 scratch
+- `bash train_scenetok_dl3dv_256.sh` — DL3DV va-wan 256 scratch (large)
+- `bash train_scenetok_dl3dv_wan_256.sh` — DL3DV wan-wan 256 scratch (large)
+- `bash train_scenetok_dl3dv_wan_480.sh` — DL3DV wan-wan 480 scratch (large)
+- `bash train_scenetok_chunked.sh` — DL3DV wan-wan 480 chunked-target ablation
+- `bash train_dynvidgen.sh` / `train_dynvidgen_exp_1.sh` — DAVIS dynvid finetune (`scenetok_va-wan_shift8_davis_finetuned_dynvid`); data root `./WorldTraj/dynamicverse/DAVIS`
 
 **B. TI2V/T2V denoiser (scene-token-conditioned video gen)**
-- 학습: `bash train_ti2vgen_recon_overfit.sh` (single-view-conditioned recon overfit)
-- 학습 (interp): `bash train_ti2vgen_recon_overfit_interp.sh`
-- 검증: `bash val_ti2vgen_recon_overfit.sh`
+- Single-view recon overfit: `bash train_ti2vgen_recon_overfit.sh` / `_interp.sh`; validate with `val_ti2vgen_recon_overfit.sh`
+- Full TI2V/T2V (non-overfit): `bash train_t2vgen.sh` (DAVIS, `scenetok_va-wan-ti2v_davis`), `bash train_t2vgen_recon.sh` (DL3DV, `scenetok_va-wan-ti2v_dl3dv`)
 - 14B variant: `bash train_t2vgen_14B_recon_overfit.sh`
+- Inference: `bash infer_t2vgen_recon.sh` (recon-style), `bash infer_t2vgen_text.sh` (text-conditioned)
 - Smoke / load test: `bash load_ti2v_test.sh`
 
 **기타**
 - Eval: `bash eval_scenetok_{re10k,dl3dv}.sh`, inference: `bash infer_scenetok_{re10k,dl3dv,davis}.sh`
 - Latent precompute: `bash convert_{dl3dv,re10k}_{vavae,videodc}.sh`
+- Dataset cache precompute (`mode=preprocess_data`): `bash preprocess_{dl3dv,re10k}.sh`
 
 All shells call `python -m src.main +experiment=<config> ...` (Hydra). `src.main` is the standard entry; `src.main_scene` is used only for SceneGen.
 
@@ -68,7 +71,7 @@ The `mode=` Hydra arg routes the trainer:
 - `config/main.yaml` — defaults composition (dataset, autoencoders, scheduler, denoiser, …)
 - `config/experiment/*.yaml` — published SceneTok / SceneGen experiments. **Do not edit these.**
 - `config/experiment/custom/*.yaml` — in-house experiments for this project. Two groups:
-  - **SceneTok-side (active):** `scenetok_va-vdc_lognorm_re10k_scratch.yaml`, `scenetok_wan-wan_lognorm_re10k_scratch.yaml`, `scenetok_wan-wan_shift4_dl3dv_scratch.yaml`, `scenetok_va-vdc_shift{4,8}_dl3dv_finetuned_fixed.yaml`, `scenetok_va-wan_shift8_dl3dv_scratch.yaml`, plus DAVIS finetune variants. These train the autoencoder (compressor + decoder denoiser).
+  - **SceneTok-side (active):** `scenetok_va-vdc_lognorm_re10k_scratch.yaml`, `scenetok_wan-wan_lognorm_re10k_scratch.yaml`, `scenetok_wan-wan_shift4_dl3dv_scratch.yaml`, `scenetok_va-vdc_shift{4,8}_dl3dv_finetuned_fixed.yaml`, `scenetok_va-wan_shift8_dl3dv_scratch{,_wide}.yaml`, plus DAVIS finetune variants (`*_davis_finetuned_dynvid.yaml`). These train the autoencoder (compressor + decoder denoiser).
   - **TI2V denoiser-side:** `scenetok_va-wan-ti2v_dl3dv.yaml` (+ `_interp`), `scenetok_va-wan-t2v-14B_dl3dv.yaml`, `scenetok_va-wan-ti2v_davis.yaml` — override `denoiser=wan_ti2v_5b` / `wan_t2v_14b`.
 
 Key knobs exposed on the denoiser side (driven from the shell scripts):

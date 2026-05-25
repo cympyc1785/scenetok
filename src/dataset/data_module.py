@@ -150,10 +150,8 @@ class DataModule(LightningDataModule):
         for i, (key, cfg) in enumerate(self.data_loader_cfg.val.items()):
             generator = self.get_generator(cfg)
             dataset_cfg = copy(self.dataset_cfg)
-            if dataset_cfg.name == "dl3dv":
+            if dataset_cfg.name in {"dl3dv", "re10k"}:
                 dataset_cfg.val_seen = key != "unseen"
-            elif key == "unseen":
-                continue
             dataset = get_dataset(dataset_cfg, "val", self.step_tracker, generator, force_shuffle=False)
             dataset = self.dataset_shim(dataset, "val")
             validation_length = cfg.batch_size * cfg.max_batches if cfg.max_batches > 0 else len(dataset)

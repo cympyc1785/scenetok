@@ -1,4 +1,8 @@
 # @package _global_
+# va-wan dl3dv 256x448 scratch — aligned with `scenetok_wan-wan_shift4_dl3dv_scratch`
+# (and its `train_scenetok_dl3dv_wan_256.sh` overrides) so only the context
+# autoencoder differs (`va` instead of `wan_single`). Use for the
+# va-wan vs wan-wan apples-to-apples comparison.
 
 defaults:
   - override /dataset: dl3dv
@@ -16,12 +20,13 @@ defaults:
 dataset:
   root: ./DATA/DL3DV/DL3DV-960
   smallset: false
+  target_latent_type: wan
 
   context_shape: [256, 448]
   target_shape: [256, 448]
 
   # NOTE: Allow compatibility with va-wan, refer to docs/KNOWN_BUG.md
-  scale_context_focal_by_256: true  
+  scale_context_focal_by_256: true
 
   view_sampler:
     num_context_views: 16
@@ -43,7 +48,7 @@ data_loader:
       shuffle: false
       batch_size: 8
       max_batches: 4
-      num_workers: 8
+      num_workers: 4
       seed: 0
       interval: 5000
       persistent_workers: false
@@ -59,8 +64,7 @@ val:
   video_length: 34
   window_shift: 5
 wandb:
-  tags: [dl3dv, 256x448]
-
+  tags: [dl3dv, 256x448, va-wan]
   activated: true
 
 sampler:
@@ -74,11 +78,11 @@ model:
     num_inference_steps: 25
     kwargs:
       weighting: shifted
-      timestep_shift: 8
+      timestep_shift: 4
   denoiser:
     input_shape: [16, 28]
-    gradient_checkpointing: false
-    num_target_split: 2 # Split 3D RoPE to be applied independently per chunk
+    gradient_checkpointing: true
+    num_target_split: 1
     camera:
       input_shape: [128, 224]
       embedding:
@@ -89,15 +93,13 @@ model:
       in_channels: 48
 
   compressor:
-    kl_weights: [1e-10, 1e-5]
-    kl_schedule: [0, 2000]
+    kl_weights: [1e-10, 1e-10]
     input_shape: [16, 28]
     num_scene_tokens: 1024
     causal_self_atten: false
-    gradient_checkpointing: false
+    gradient_checkpointing: true
     token_dim: 64
-    init_large: false
-    init_small: true
+    init_large: true
     camera_conditioning: adaLN
     scene_token_projection: kl
     mask_context: false
@@ -110,20 +112,18 @@ model:
       use_rope_3d: false
       patch_size: 2
 
-        
+
 trainer:
   max_steps: 5_000_001
   val_check_interval: 5000
   task_steps: null
   accumulate_grad_batches: 1
   gradient_clip_val: 0.1
-
   precision: bf16-mixed
 
 optimizer:
   name: AdamW
   lr: 1.0e-4
-
   scale_lr: false
   milestones: [2000]
   scheduler:
@@ -138,5 +138,5 @@ optimizer:
       frequency: 1
       interval: step
       kwargs:
-        milestones: [20000, 150000, 500000]
+        milestones: [5000, 8000]
         gamma: 0.4
