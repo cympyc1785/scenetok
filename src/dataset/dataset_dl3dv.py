@@ -232,6 +232,12 @@ class DatasetDL3DVCfg(DatasetCfgCommon):
     do_scale_and_pad: bool = False
     evaluation_index_path: Path | None = None
     blacklist_path: Path | None = None
+    # If true, additionally load DA3 depth + cameras from
+    # `<scene>/da3/exports/mini_npz/results.npz` for every sampled view.
+    # Adds `context["depth"], context["da3_w2c"], context["da3_intrinsics"]`
+    # and `target["da3_w2c_first"], target["da3_intrinsics_first"]` to the
+    # sample. Used by `condition_latents_input_type=first_frame_depth`.
+    load_da3_depth: bool = False
 
 class DatasetDL3DV(Dataset):
     cfg: DatasetDL3DVCfg
@@ -463,6 +469,69 @@ class DatasetDL3DV(Dataset):
             if view_type == "context" and self.cfg.scale_context_focal_by_256:
                 sample[view_type]["intrinsics"][..., 0, 0] *= 3840/256
                 sample[view_type]["intrinsics"][..., 1, 1] *= 2160/256
+
+        if self.cfg.load_da3_depth:
+            # DA3 depth + npz cameras, lazily loaded per scene. Stored on the
+            # dataset instance keyed by scene basename so subsequent samples
+            # from the same chunk don't reload. mini_npz keeps frame order in
+            # the same indexing as transforms.json (sorted by file_path).
+            # `chunk_path` may have been re-rooted into `<scene>/nerfstudio`
+            # above; DA3 outputs live at scene root regardless, so re-derive.
+            depth_root = (self.root / chunk_name) / "da3" / "exports" / "mini_npz" / "results.npz"
+            if not depth_root.exists():
+                # Drop scenes without DA3 outputs — `first_frame_depth`
+                # needs them. `safe_collate` filters None out of the batch.
+                return None
+            else:
+                cache = getattr(self, "_da3_cache", None)
+                if cache is None or cache.get("__scene__") != scene:
+                    npz = np.load(depth_root)
+                    cache = {
+                        "__scene__": scene,
+                        "depth": torch.from_numpy(npz["depth"]).float(),         # (N, Hd, Wd)
+                        "extr34": torch.from_numpy(npz["extrinsics"]).float(),    # (N, 3, 4) w2c
+                        "intr": torch.from_numpy(npz["intrinsics"]).float(),      # (N, 3, 3) at (Hd, Wd)
+                    }
+                    self._da3_cache = cache
+                depths = cache["depth"]
+                extr34 = cache["extr34"]
+                intr_npz = cache["intr"]
+                _Hd, _Wd = depths.shape[-2], depths.shape[-1]
+
+                def _select_npz(idx_long, target_hw):
+                    """Resize depth + scale intrinsics to target_hw, build (V, 4, 4) w2c."""
+                    th, tw = target_hw
+                    d = depths[idx_long].unsqueeze(1)                              # (V, 1, Hd, Wd)
+                    d = torch.nn.functional.interpolate(d, size=(th, tw), mode="bilinear", align_corners=False)
+                    K = intr_npz[idx_long].clone()                                  # (V, 3, 3)
+                    sx, sy = tw / _Wd, th / _Hd
+                    K[..., 0, 0] *= sx
+                    K[..., 1, 1] *= sy
+                    K[..., 0, 2] *= sx
+                    K[..., 1, 2] *= sy
+                    E = torch.eye(4).unsqueeze(0).repeat(idx_long.shape[0], 1, 1)   # (V, 4, 4)
+                    E[:, :3] = extr34[idx_long]
+                    return d, K, E
+
+                # Context: at context_shape (matches sample["context"]["latent"])
+                ctx_indices_long = sample["context"]["index"].long()
+                d_ctx, K_ctx, W_ctx = _select_npz(ctx_indices_long, tuple(self.cfg.context_shape))
+                sample["context"]["depth"] = d_ctx.contiguous()
+                sample["context"]["da3_intrinsics"] = K_ctx.contiguous()
+                sample["context"]["da3_w2c"] = W_ctx.contiguous()
+
+                # Target first frame: at target_shape (matches sample["target"]["latent"])
+                tgt_indices_long = sample["target"]["index"].long()
+                tgt_first_idx = tgt_indices_long[:1]
+                d_tgt, K_tgt, W_tgt = _select_npz(tgt_first_idx, tuple(self.cfg.target_shape))
+                # And context at target shape (for use by the warp module at target res)
+                d_ctx_t, K_ctx_t, W_ctx_t = _select_npz(ctx_indices_long, tuple(self.cfg.target_shape))
+                sample["context"]["depth_at_target_shape"] = d_ctx_t.contiguous()
+                sample["context"]["da3_intrinsics_at_target_shape"] = K_ctx_t.contiguous()
+                # Same extrinsics, but include for symmetry
+                sample["context"]["da3_w2c_at_target_shape"] = W_ctx_t.contiguous()
+                sample["target"]["da3_w2c_first"] = W_tgt[0].contiguous()           # (4, 4)
+                sample["target"]["da3_intrinsics_first"] = K_tgt[0].contiguous()    # (3, 3)
 
         return sample
     

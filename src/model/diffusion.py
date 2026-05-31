@@ -328,9 +328,10 @@ def sample(
     offset: int=0, 
     chunk_targets: bool=True,
     first_frame_latents: Optional[Float[Tensor, "batch 1 channel height width"]]=None,
+    first_frame_mask_latent: Optional[Tensor]=None,
     ):
 
-    
+
     device = x_t.device
     b, v_t, c, h, w = x_t.shape
     pred_conditional = None
@@ -346,7 +347,15 @@ def sample(
                 "first_frame_latents must match sampling latent channel/height/width: "
                 f"first_frame_latents={first_frame_latents.shape}, latents={x_t.shape}"
             )
-        x_t[:, 0:1] = first_frame_latents
+        if first_frame_mask_latent is None:
+            # Hard replace — direct assignment, no blend.
+            x_t[:, 0:1] = first_frame_latents
+        else:
+            first_frame_mask_latent = first_frame_mask_latent.to(
+                device=x_t.device, dtype=x_t.dtype
+            )
+            _m = first_frame_mask_latent
+            x_t[:, 0:1] = _m * first_frame_latents + (1.0 - _m) * x_t[:, 0:1]
 
 
     pbar = tqdm(range(sampler.global_steps), desc=f"Sampling ({sampler.cfg.name}): ")
@@ -403,7 +412,12 @@ def sample(
             cfg_scale=cfg_scale
         )
         if first_frame_latents is not None:
-            x_t[:, 0:1] = first_frame_latents
+            if first_frame_mask_latent is None:
+                # Hard replace — direct assignment, no blend.
+                x_t[:, 0:1] = first_frame_latents
+            else:
+                _m = first_frame_mask_latent
+                x_t[:, 0:1] = _m * first_frame_latents + (1.0 - _m) * x_t[:, 0:1]
         scheduler.unset_scheduling_matrix()
 
     if pred_conditional is None:

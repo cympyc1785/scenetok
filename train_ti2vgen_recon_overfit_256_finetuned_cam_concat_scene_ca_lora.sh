@@ -1,14 +1,14 @@
 config=custom/scenetok_va-wan-ti2v_dl3dv
-num_workers=8
+num_workers=4
 gpus=1
 num_nodes=1
-exp_name="va-wan-ti2v_recon_aggressive_train_256-480_finetuned_scene_new_ca_wan_control_small"
+exp_name="va-wan-ti2v_recon_aggressive_train_256-480_finetuned_scene_ca_cam_channel_small"
 # exp_name="test_lora_no_ffn"
 resume_lora_ckpt=null
 
 export WANDB_API_KEY=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
 export DEBUG=1
-CUDA_VISIBLE_DEVICES=3 exec -a dynamic_scenetok_lets_go python -m src.main +experiment=${config} \
+CUDA_VISIBLE_DEVICES=1 exec -a dynamic_scenetok_lets_go python -m src.main +experiment=${config} \
   data_loader.train.num_workers=${num_workers} \
   mode=train \
   dataset.smallset=true \
@@ -18,7 +18,7 @@ CUDA_VISIBLE_DEVICES=3 exec -a dynamic_scenetok_lets_go python -m src.main +expe
   model.compressor.input_shape=[16,28] \
   model.compressor.camera.input_shape=[128,224] \
   model.denoiser.input_shape=[30,52] \
-  model.denoiser.camera.input_shape=[240,416] \
+  model.denoiser.camera.input_shape=[30,52] \
   dataset.do_scale_and_pad=false \
   trainer.devices=${gpus} \
   trainer.num_nodes=${num_nodes} \
@@ -27,13 +27,12 @@ CUDA_VISIBLE_DEVICES=3 exec -a dynamic_scenetok_lets_go python -m src.main +expe
   freeze.compressor=true \
   freeze.autoencoder=true \
   model.text_encoder=null \
-  model.denoiser.scene_input_type=new_cross_attention \
+  model.denoiser.scene_input_type=cross_attention \
+  +model.denoiser.scene_projection=mlp \
   model.denoiser.condition_latents_input_type=none \
-  model.denoiser.camera_input_type=wan_control \
-  model.denoiser.lora.enabled=false \
+  model.denoiser.camera_input_type=channel_concat \
+  model.denoiser.lora.enabled=true \
   model.denoiser.lora.checkpoint=${resume_lora_ckpt} \
-  model.denoiser.gradient_checkpointing=false \
-  model.compressor.gradient_checkpointing=false \
   wandb.activated=true \
   hydra.run.dir=exp/${exp_name} \
   checkpointing.dirpath=my_checkpoints/${exp_name}

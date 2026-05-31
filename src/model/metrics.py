@@ -75,24 +75,34 @@ class Metric(nn.Module):
             l += self.lpips(p[None].to(torch.float16), g[None].to(torch.float16), normalize=True).to(pred.dtype)
         return (l / pred.shape[0]).mean()
     
-    def compute_ssim(self, pred, gt, num_views: int=16):
+    def compute_ssim(self, pred, gt, num_views: int=16, chunk: int=8):
         if pred.ndim == 3:
             pred = pred[None]
         if gt.ndim == 3:
             gt = gt[None]
-        ssim = [
-            structural_similarity(
-                gt.float().detach().cpu().numpy(),
-                hat.float().detach().cpu().numpy(),
-                win_size=11,
-                gaussian_weights=True,
-                channel_axis=0,
+        # Chunk along N to bound peak memory. torchmetrics SSIM creates several
+        # tensors the same size as input internally (mu, sigma², sigma_xy, ...).
+        # On val end the model is still resident on GPU so a single full-batch
+        # call OOMs (e.g. 320 frames × 5–10× ≈ 10–15 GB intermediate).
+        N = pred.shape[0]
+        if N == 0:
+            return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
+        total = 0.0
+        count = 0
+        for i in range(0, N, chunk):
+            p = pred[i : i + chunk].float()
+            g = gt[i : i + chunk].float()
+            s = structural_similarity_index_measure(
+                p,
+                g,
+                gaussian_kernel=True,
+                kernel_size=11,
+                sigma=1.5,
                 data_range=1.0,
             )
-            for gt, hat in zip(gt, pred)
-        ]
-
-        return torch.tensor(ssim, dtype=pred.dtype, device=pred.device).mean()
+            total = total + s.item() * p.shape[0]
+            count += p.shape[0]
+        return torch.tensor(total / count, device=pred.device, dtype=pred.dtype)
     
     def update_fid(self, pred, gt, num_views: int=16):
         pred = rearrange(pred, "(b v) c h w -> b v c h w", v=num_views)
@@ -106,11 +116,12 @@ class Metric(nn.Module):
             pred, gt = pred[finite], gt[finite]
         if pred.shape[0] == 0:
             return
-        pred = (pred * 255).to(torch.uint8)
-        gt = (gt * 255).to(torch.uint8)
-        for i in range(pred.shape[0]):   # or even 8
-            self.fid.update(gt[i].to("cuda:0"), real=True)
-            self.fid.update(pred[i].to("cuda:0"), real=False)
+        pred = (pred * 255).to(torch.uint8).to("cuda:0")
+        gt = (gt * 255).to(torch.uint8).to("cuda:0")
+        pred_flat = rearrange(pred, "b v c h w -> (b v) c h w")
+        gt_flat = rearrange(gt, "b v c h w -> (b v) c h w")
+        self.fid.update(gt_flat, real=True)
+        self.fid.update(pred_flat, real=False)
 
     def update_fvd(self, pred, gt, num_views: int=16):
 
@@ -155,7 +166,8 @@ class Metric(nn.Module):
         pred_tensor = torch.cat(self.pred_list, dim=0)
         gt_tensor = torch.cat(self.gt_list, dim=0)
 
-        fvd = frechet_video_distance(pred_tensor, gt_tensor, "submodules/fvd/pytorch_i3d_model/models/rgb_imagenet.pt")
+        fvd_device = "cuda" if torch.cuda.is_available() else "cpu"
+        fvd = frechet_video_distance(pred_tensor, gt_tensor, "submodules/fvd/pytorch_i3d_model/models/rgb_imagenet.pt", device=fvd_device)
 
         return torch.tensor(fvd)
 

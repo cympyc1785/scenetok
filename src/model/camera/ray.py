@@ -57,6 +57,7 @@ class Ray(Camera[RayCfg]):
         inputs: CameraInputs,
         temporal_downsample: int=1,
         chunk_targets: bool=True,
+        skip_embedding: bool=False,
     ) -> Float[Tensor, "batch ... channel _ _"]:
         
         intrinsics, extrinsics = inputs.intrinsics, inputs.extrinsics
@@ -103,4 +104,11 @@ class Ray(Camera[RayCfg]):
         if temporal_downsample > 1:
             ray_encodings = rearrange(ray_encodings, "b (v t) c h w -> b v (t c) h w", t=temporal_downsample)
 
+        if skip_embedding:
+            # Return raw 6*temporal_downsample-channel Plücker encoding without
+            # `self.model` (time_embed) projection. Used by wan_control which
+            # feeds raw rays into a DiffSynth SimpleAdapter expecting low
+            # channel count; running the projection here blows up the
+            # activation by `dit.dim / 6` (~512x) and triggers OOM.
+            return ray_encodings.to(orig_dtype)
         return self.model(ray_encodings).to(orig_dtype)

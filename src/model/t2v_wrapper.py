@@ -2,6 +2,7 @@ import math
 
 from .diffusion import first_stage_encode, last_stage_decode
 from .diffusion_wrapper import *
+from .warp import multi_view_warp_to_target
 from einops import repeat
 
 
@@ -10,7 +11,7 @@ class T2VWrapper(DiffusionWrapper):
         return (
             getattr(self.denoiser, "supports_condition_latents", False)
             and getattr(self.denoiser, "condition_latents_input_type", "none")
-            not in ("none", "first_frame", "first_frame_random")
+            not in ("none", "first_frame", "first_frame_random", "first_frame_depth", "first_frame_depth_soft")
         )
 
     def should_replace_first_frame_latent(self, training: bool = False):
@@ -19,6 +20,8 @@ class T2VWrapper(DiffusionWrapper):
             return True
         if condition_type == "first_frame_random":
             return bool(np.random.choice([True, False])) if training else False
+        if condition_type in ("first_frame_depth", "first_frame_depth_soft"):
+            return True
         return False
 
     def preprocess_scene_tokens(self, scene_tokens, shape, device, token_mask=None):
@@ -104,6 +107,62 @@ class T2VWrapper(DiffusionWrapper):
 
         return condition_latents.to(device=device, dtype=dtype)
 
+    def _build_first_frame_from_depth(self, batch, device, dtype):
+        """Forward-warp context views into target view's first frame using DA3
+        depth + npz cameras (loaded by `dataset.load_da3_depth=true`). Returns
+        a (B, 3, H_target, W_target) image in [-1, 1] to be used in place of
+        the GT target first frame for `first_frame_depth` conditioning."""
+        ctx = batch["context"]
+        tgt = batch["target"]
+        required = ("depth_at_target_shape", "da3_w2c_at_target_shape", "da3_intrinsics_at_target_shape")
+        for k in required:
+            if k not in ctx:
+                raise KeyError(
+                    f"first_frame_depth requires `context['{k}']` from `dataset.load_da3_depth=true`."
+                )
+        if "da3_w2c_first" not in tgt or "da3_intrinsics_first" not in tgt:
+            raise KeyError(
+                "first_frame_depth requires `target['da3_w2c_first']`/`da3_intrinsics_first` "
+                "from `dataset.load_da3_depth=true`."
+            )
+
+        # Context RGB at target shape — resize on the fly (context["latent"]
+        # was preprocessed to context_shape).
+        ctx_imgs = ctx["latent"].to(device=device, dtype=dtype)
+        b, v, c, ch, cw = ctx_imgs.shape
+        target_shape = tuple(batch["target"]["latent"].shape[-2:])
+        if (ch, cw) != target_shape:
+            ctx_imgs = rearrange(ctx_imgs, "b v c h w -> (b v) c h w")
+            ctx_imgs = F.interpolate(ctx_imgs, size=target_shape, mode="bilinear", align_corners=False)
+            ctx_imgs = rearrange(ctx_imgs, "(b v) c h w -> b v c h w", b=b, v=v)
+        # `forward_warp` operates in [-1, 1] (holes filled with -1 when
+        # is_image=True); our dataset RGB lives in [0, 1]. Convert before warp
+        # and convert back so the downstream `first_stage_encode` (which does
+        # `inputs * 2 - 1` internally) sees a clean [0, 1] tensor with
+        # 0-valued (black) holes — not double-converted -3 garbage.
+        ctx_imgs = ctx_imgs * 2.0 - 1.0
+
+        ctx_depth = ctx["depth_at_target_shape"].to(device=device, dtype=dtype)
+        ctx_w2c = ctx["da3_w2c_at_target_shape"].to(device=device, dtype=dtype)
+        ctx_intr = ctx["da3_intrinsics_at_target_shape"].to(device=device, dtype=dtype)
+        tgt_w2c = tgt["da3_w2c_first"].to(device=device, dtype=dtype)
+        tgt_intr = tgt["da3_intrinsics_first"].to(device=device, dtype=dtype)
+
+        warped, mask = multi_view_warp_to_target(
+            context_images=ctx_imgs,
+            context_depths=ctx_depth,
+            context_w2cs=ctx_w2c,
+            context_intrinsics=ctx_intr,
+            target_w2c=tgt_w2c,
+            target_intrinsics=tgt_intr,
+            topk=2,
+        )
+        # warped: (B, 3, H, W) in [-1, 1], holes are -1. mask: {0, 1}.
+        # Bring back to dataset's [0, 1] convention (holes → 0, "black").
+        # `first_stage_encode` will subsequently re-shift to [-1, 1] for VAE.
+        warped = ((warped + 1.0) / 2.0).clamp(0.0, 1.0)
+        return warped, mask
+
     def get_first_frame_latents(self, batch, device, dtype, repeat_factor: int = 1):
         target_cfg = getattr(self.model_cfg.autoencoders, "target")
         if target_cfg is None or target_cfg.name != "wan":
@@ -111,7 +170,17 @@ class T2VWrapper(DiffusionWrapper):
         if self.dataset_cfg.precomputed_latents["target"]:
             raise ValueError("first_frame conditioning requires raw target images, not precomputed target latents.")
 
-        first_frame = batch["target"]["latent"][:, :1].to(device=device, dtype=dtype)
+        condition_type = getattr(self.denoiser, "condition_latents_input_type", "none")
+        first_frame_mask = None  # pixel-space visibility, used for soft blend
+        if condition_type in ("first_frame_depth", "first_frame_depth_soft"):
+            warped, vis_mask = self._build_first_frame_from_depth(batch, device=device, dtype=dtype)
+            first_frame = warped.unsqueeze(1)                                 # (B, 1, 3, H, W)
+            # `first_frame_depth`      → hard replacement (mask = 1 everywhere)
+            # `first_frame_depth_soft` → soft blend with the actual visibility
+            if condition_type == "first_frame_depth_soft":
+                first_frame_mask = vis_mask
+        else:
+            first_frame = batch["target"]["latent"][:, :1].to(device=device, dtype=dtype)
         padding = torch.zeros(
             first_frame.shape[0],
             3,
@@ -131,21 +200,29 @@ class T2VWrapper(DiffusionWrapper):
         if repeat_factor != 1:
             first_frame_latents = repeat(first_frame_latents, "b ... -> (b r) ...", r=repeat_factor)
 
-        # # Test
-        # decoded = []
-        # for x in torch.split(first_frame_latents, split_size_or_sections=5, dim=1):
-        #     decoded.append(last_stage_decode(
-        #         autoencoder=self.autoencoder,
-        #         latents=x, 
-        #         view_type="target",
-        #         autoencoder_name=target_cfg.name,
-        #         scaling_factor=target_cfg.kwargs.scaling_factor,
-        #         chunk_targets=False,
-        #     ))
-        # decoded = torch.concat(decoded, dim=1)
-        # breakpoint()
-        
-        return first_frame_latents.to(device=device, dtype=dtype)
+        # Build per-latent-token blend mask **only** for the soft variant.
+        # For hard replacement (`first_frame` / `first_frame_random` /
+        # `first_frame_depth`) we return mask_latent=None so the downstream
+        # blend short-circuits to direct assignment `x_t[:, 0:1] = first_frame_latents`.
+        latent_h, latent_w = first_frame_latents.shape[-2:]
+        if first_frame_mask is not None:
+            mask_latent = F.avg_pool2d(first_frame_mask.float(), kernel_size=16, stride=16)
+            # Match latent grid even if H/16 != latent_h (e.g., Wan VAE quirks).
+            if mask_latent.shape[-2:] != (latent_h, latent_w):
+                mask_latent = F.interpolate(
+                    mask_latent, size=(latent_h, latent_w), mode="bilinear", align_corners=False
+                )
+            mask_latent = mask_latent.clamp(0, 1).unsqueeze(1)  # (B, 1, 1, h, w)
+            if repeat_factor != 1:
+                mask_latent = repeat(mask_latent, "b ... -> (b r) ...", r=repeat_factor)
+            mask_latent = mask_latent.to(device=device, dtype=dtype)
+        else:
+            mask_latent = None   # → caller does hard replace
+
+        return (
+            first_frame_latents.to(device=device, dtype=dtype),
+            mask_latent,
+        )
 
     def prepare_target_pose(self, target, num_latents: Optional[int] = None):
         target_cfg = getattr(self.model_cfg.autoencoders, "target")
@@ -180,18 +257,28 @@ class T2VWrapper(DiffusionWrapper):
 
     @torch.no_grad()
     def generate_batch_with_scene(self, batch, sampler: Sampler, repeat_factor: int = 1):
-        context_latents = get_latents(
-            autoencoder=self.autoencoder,
-            inputs=batch["context"],
-            view_type="context",
-            precomputed_latents=self.dataset_cfg.precomputed_latents,
-            autoencoder_name=self.get_autoencoder_name("context"),
-            scaling_factor=self.get_autoencoder_scaling_factor("context"),
-        )
+        if self.model_cfg.compressor is not None:
+            context_latents = get_latents(
+                autoencoder=self.autoencoder,
+                inputs=batch["context"],
+                view_type="context",
+                precomputed_latents=self.dataset_cfg.precomputed_latents,
+                autoencoder_name=self.get_autoencoder_name("context"),
+                scaling_factor=self.get_autoencoder_scaling_factor("context"),
+            )
+            device = context_latents.device
+            dtype = context_latents.dtype
+        else:
+            context_latents = None
+            target_latent = batch["target"].get("latent")
+            if target_latent is not None:
+                device = target_latent.device
+                dtype = target_latent.dtype
+            else:
+                device = batch["target"]["extrinsics"].device
+                dtype = next(self.denoiser.parameters()).dtype
 
         target = repeat_batch(batch["target"], repeat_factor)
-        device = context_latents.device
-        dtype = context_latents.dtype
         text_state = self.get_text_condition(batch, device=device)
         if text_state is not None:
             text_state = einops.repeat(text_state, "b n d -> (b r) n d", r=repeat_factor)
@@ -226,15 +313,21 @@ class T2VWrapper(DiffusionWrapper):
         x_t = torch.randn((b, num, c, h, w), device=device, dtype=dtype, generator=noise_generator)
         x_t *= self.scheduler.init_noise_sigma
         first_frame_latents = None
+        first_frame_mask_latent = None
         if self.should_replace_first_frame_latent():
-            first_frame_latents = self.get_first_frame_latents(
+            first_frame_latents, first_frame_mask_latent = self.get_first_frame_latents(
                 batch,
                 device=device,
                 dtype=dtype,
                 repeat_factor=repeat_factor,
             )
             if first_frame_latents is not None:
-                x_t[:, 0:1] = first_frame_latents
+                if first_frame_mask_latent is None:
+                    # Hard replace — no blend, just assign.
+                    x_t[:, 0:1] = first_frame_latents
+                else:
+                    m = first_frame_mask_latent  # (B, 1, 1, h, w) broadcastable
+                    x_t[:, 0:1] = m * first_frame_latents + (1.0 - m) * x_t[:, 0:1]
 
         context_camera = CameraInputs(
             intrinsics=batch["context"]["intrinsics"],
@@ -288,6 +381,7 @@ class T2VWrapper(DiffusionWrapper):
             offset=self.dataset_cfg.view_sampler.offset,
             chunk_targets=getattr(self.dataset_cfg.view_sampler, "chunk_targets", True),
             first_frame_latents=first_frame_latents,
+            first_frame_mask_latent=first_frame_mask_latent,
         ), scene_tokens
 
     def test_step(self, batch, batch_idx):
@@ -495,14 +589,20 @@ class T2VWrapper(DiffusionWrapper):
         noise = torch.randn_like(target_latents, device=device)
         noisy_latents = self.scheduler.add_noise(target_latents, noise, timestep)
         first_frame_latents = None
+        first_frame_mask_latent = None
         if self.should_replace_first_frame_latent(training=True):
-            first_frame_latents = self.get_first_frame_latents(
+            first_frame_latents, first_frame_mask_latent = self.get_first_frame_latents(
                 batch,
                 device=device,
                 dtype=dtype,
             )
         if first_frame_latents is not None:
-            noisy_latents[:, 0:1] = first_frame_latents
+            if first_frame_mask_latent is None:
+                # Hard replace — no blend, just assign.
+                noisy_latents[:, 0:1] = first_frame_latents
+            else:
+                m = first_frame_mask_latent  # (B, 1, 1, h, w) broadcastable
+                noisy_latents[:, 0:1] = m * first_frame_latents + (1.0 - m) * noisy_latents[:, 0:1]
         condition_latents = self.get_condition_latents(
             batch,
             device=device,

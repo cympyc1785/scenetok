@@ -4,6 +4,14 @@
 
 
 import os
+# Limit OpenMP/MKL/OpenBLAS intra-op parallelism. PyTorch grabs all cores by
+# default which causes 4000%+ CPU spikes per process and core contention when
+# multiple training jobs run concurrently. Must be set BEFORE numpy/torch import.
+# `setdefault` so an explicit shell-side override still wins.
+os.environ.setdefault("OMP_NUM_THREADS", "8")
+os.environ.setdefault("MKL_NUM_THREADS", "8")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "8")
+
 import hydra
 import wandb
 import warnings
@@ -78,6 +86,7 @@ def preprocess_dataset_cache(cfg, step_tracker):
 )
 def train(cfg_dict: DictConfig):
     # print(cfg_dict.dataset)
+    print("loading config")
     cfg = load_typed_root_config(cfg_dict)
     set_cfg(cfg_dict)
     if cfg_dict.seed is not None:

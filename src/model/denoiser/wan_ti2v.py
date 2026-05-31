@@ -61,11 +61,12 @@ class WanTI2V5BCfg:
     seq_len: int = 512
     clean: str = "whitespace"
     gradient_checkpointing: bool = True
-    condition_latents_input_type: Literal["none", "width", "channel", "temporal", "first_frame", "first_frame_random"] = "none"
-    camera_input_type: Literal["none", "recam_attention", "cross_attention", "new_cross_attention", "adaln", "wan_control"] | None = None
+    condition_latents_input_type: Literal["none", "width", "channel", "temporal", "first_frame", "first_frame_random", "first_frame_depth", "first_frame_depth_soft"] = "none"
+    camera_input_type: Literal["none", "recam_attention", "cross_attention", "new_cross_attention", "adaln", "wan_control", "channel_concat"] | None = None
     enable_recam_attention: bool | None = None
     camera_context_spatial_pool: int = 1
     scene_input_type: Literal["none", "cross_attention", "new_cross_attention", "latent_concat"] = "cross_attention"
+    scene_projection: Literal["linear", "mlp"] = "linear"
     num_target_split: int = 1
     input_shape: int | list[int] = 16
     noise_seed: int | None = None
@@ -246,14 +247,27 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
         self.num_scene_tokens = num_scene_tokens
         self.cond_dim = 1 if cond_dim is None else cond_dim
         self.text_embed_dim = 4096
-        self.cnd_proj = nn.Linear(self.cond_dim, self.model.dim)
+        scene_proj_mode = getattr(cfg, "scene_projection", "linear")
+        if scene_proj_mode == "mlp":
+            self.cnd_proj = nn.Sequential(
+                nn.Linear(self.cond_dim, self.model.dim),
+                nn.GELU(approximate="tanh"),
+                nn.Linear(self.model.dim, self.model.dim),
+            )
+        else:
+            self.cnd_proj = nn.Linear(self.cond_dim, self.model.dim)
         self.null_tokens = nn.Parameter(torch.zeros(1, 1, self.model.dim))
         self.text_proj = None
         self.pose_embed = None
         self.negative_prompt = None
         if cfg.camera is not None:
             camera_cfg = deepcopy(cfg.camera)
-            if self.camera_input_type in ("cross_attention", "new_cross_attention"):
+            if self.camera_input_type in ("cross_attention", "new_cross_attention", "adaln"):
+                # adaln collapses the camera embedding to a single (B, dim)
+                # summary; running `time_embed` at the full target spatial
+                # resolution (e.g. 240×416) blows up the Fourier+MLP
+                # intermediates to >100 GB. Mirror the cross_attention path
+                # and downsize the camera grid to a tiny pool ahead of time.
                 pool_size = cfg.camera_context_spatial_pool
                 if pool_size < 1:
                     raise ValueError(f"camera_context_spatial_pool must be >= 1, got {pool_size}.")
@@ -294,6 +308,19 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
                 device=ref_param.device,
                 dtype=ref_param.dtype,
             )
+        if self.camera_input_type == "adaln" and getattr(self.model, "adaln_camera_proj", None) is None:
+            # Zero-initialized gating projector applied to the pooled camera
+            # summary before it is added to the timestep embedding. At
+            # initialization the projector outputs all zeros, so
+            # `t + adaln_camera_embedding == t` — the Wan TI2V prior is
+            # preserved exactly. As training progresses the projector learns
+            # to inject camera information into the per-batch adaLN
+            # modulation. (Same idea as ControlNet zero-conv.)
+            self.model.adaln_camera_proj = nn.Linear(
+                self.model.dim, self.model.dim, bias=True
+            ).to(device=ref_param.device, dtype=ref_param.dtype)
+            nn.init.zeros_(self.model.adaln_camera_proj.weight)
+            nn.init.zeros_(self.model.adaln_camera_proj.bias)
         if self.camera_input_type == "wan_control" and getattr(self.model, "control_adapter", None) is None:
             patch_size = tuple(getattr(self.model, "patch_size", (1, 2, 2)))
             spatial_patch = patch_size[1:] if len(patch_size) == 3 else patch_size
@@ -304,6 +331,34 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
                 stride=tuple(spatial_patch),
                 num_residual_blocks=1,
             ).to(device=ref_param.device, dtype=ref_param.dtype)
+        if self.camera_input_type == "channel_concat":
+            # Channel-concat ray map with latent BEFORE the patch_embedding conv.
+            # `pose_embed(skip_embedding=True)` returns (B, V_lat, 6*T, H, W) when
+            # `embedding.in_channels` was inflated by `temporal_downsample` in
+            # `__init__` (matches wan_control's SimpleAdapter). So extra channels
+            # at patch_embedding input = 6 * temporal_downsample.
+            # Original 48 channels copied from pretrained; extra channels
+            # zero-init so the model starts identical to the Wan TI2V prior,
+            # then learns to use camera info.
+            orig_pe = self.model.patch_embedding
+            extra_in = 6 * max(temporal_downsample, 1)
+            new_in = orig_pe.in_channels + extra_in
+            new_pe = nn.Conv3d(
+                new_in,
+                orig_pe.out_channels,
+                kernel_size=orig_pe.kernel_size,
+                stride=orig_pe.stride,
+                padding=orig_pe.padding,
+                bias=orig_pe.bias is not None,
+            )
+            with torch.no_grad():
+                new_pe.weight.zero_()
+                new_pe.weight[:, : orig_pe.in_channels].copy_(orig_pe.weight)
+                if orig_pe.bias is not None:
+                    new_pe.bias.copy_(orig_pe.bias)
+            self.model.patch_embedding = new_pe.to(
+                device=orig_pe.weight.device, dtype=orig_pe.weight.dtype
+            )
         self.text_encoder = self._load_model(
             "wan_video_text_encoder",
             self._resolve_text_encoder_path(),
@@ -404,6 +459,14 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
             trainable = trainable or (
                 self.camera_input_type == "wan_control"
                 and name.startswith("control_adapter.")
+            )
+            trainable = trainable or (
+                self.camera_input_type == "channel_concat"
+                and name.startswith("patch_embedding.")
+            )
+            trainable = trainable or (
+                self.camera_input_type == "adaln"
+                and name.startswith("adaln_camera_proj.")
             )
             if not self.cfg.lora.enabled:
                 trainable = trainable or name.startswith("text_embedding.")
@@ -541,12 +604,18 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
                 extrinsics = extrinsics[:, indices]
             return extrinsics.flatten(-2)
 
-        if self.camera_input_type == "wan_control":
-            return self.pose_embed(
+        if self.camera_input_type in ("wan_control", "channel_concat"):
+            # Both modes consume raw Plücker rays (6 ch) without `time_embed`
+            # blow-up. SimpleAdapter / channel-concat handle dim alignment themselves.
+            # SimpleAdapter unpacks `(B, C, F, H, W)` (NCFHW), but
+            # `RayCamera` returns NFCHW — permute frames and channels.
+            rays = self.pose_embed(
                 inputs.pose,
                 temporal_downsample=temporal_downsample,
                 chunk_targets=chunk_targets,
+                skip_embedding=True,
             )
+            return rays.permute(0, 2, 1, 3, 4).contiguous()  # (B, V, C, H, W) -> (B, C, V, H, W)
 
         pose_tokens = self.pose_embed(
             inputs.pose,
@@ -571,8 +640,23 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
         if self.camera_input_type == "none" or camera_embedding is None:
             return None
         if self.camera_input_type == "adaln":
-            return rearrange(camera_embedding, "b v c h w -> b v (h w) c")
-        if self.camera_input_type == "wan_control":
+            # `pose_embed` output is (B, V, dim, H, W). LightningDiT mixes the
+            # full per-token pose grid into a per-token time embedding inside
+            # `t_embedder(t, pemb=p)`; Wan TI2V's adaLN is per-batch scalar
+            # (t_mod shape is (B, 6, dim)), so we collapse the (V, H, W) axes
+            # to a (B, dim) summary that `simple_wan_video_fn` will add to
+            # the timestep embedding before computing `t_mod`. The pooled
+            # vector is gated through a zero-initialized linear so the
+            # initial contribution is exactly 0 — Wan TI2V's pretrained
+            # behaviour is preserved at the start of training, then camera
+            # info ramps in as `adaln_camera_proj` learns.
+            ref_param = next(self.model.parameters())
+            camera_embedding = camera_embedding.to(
+                device=ref_param.device, dtype=ref_param.dtype
+            )
+            pooled = camera_embedding.mean(dim=(1, 3, 4))  # (b v c h w) -> (b c)
+            return self.model.adaln_camera_proj(pooled)
+        if self.camera_input_type in ("wan_control", "channel_concat"):
             return camera_embedding
         ref_param = next(self.model.parameters())
         camera_embedding = camera_embedding.to(device=ref_param.device, dtype=ref_param.dtype)
@@ -596,7 +680,7 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
         latents: torch.Tensor,
         condition_latents: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, int | None]:
-        if condition_latents is None or self.condition_latents_input_type in ("none", "first_frame", "first_frame_random"):
+        if condition_latents is None or self.condition_latents_input_type in ("none", "first_frame", "first_frame_random", "first_frame_depth", "first_frame_depth_soft"):
             return latents, None, None
 
         condition_latents = rearrange(condition_latents, "b v c h w -> b c v h w")
@@ -713,7 +797,7 @@ def simple_wan_video_fn(
     scene_context: torch.Tensor = None,
     scene_input_type: Literal["none", "cross_attention", "new_cross_attention", "latent_concat"] = "cross_attention",
     camera_context: torch.Tensor = None,
-    camera_input_type: Literal["none", "recam_attention", "cross_attention", "new_cross_attention", "adaln", "wan_control"] | None = None,
+    camera_input_type: Literal["none", "recam_attention", "cross_attention", "new_cross_attention", "adaln", "wan_control", "channel_concat"] | None = None,
     fuse_vae_embedding_in_latents: bool = False,
     use_gradient_checkpointing: bool = False,
     use_gradient_checkpointing_offload: bool = False,
@@ -725,16 +809,17 @@ def simple_wan_video_fn(
         )
     if camera_input_type is None:
         camera_input_type = "none"
-    if camera_input_type not in ("none", "recam_attention", "cross_attention", "new_cross_attention", "adaln", "wan_control"):
+    if camera_input_type not in ("none", "recam_attention", "cross_attention", "new_cross_attention", "adaln", "wan_control", "channel_concat"):
         raise ValueError(
             f"Unsupported camera_input_type={camera_input_type!r}. "
-            "Expected 'none', 'recam_attention', 'cross_attention', 'new_cross_attention', 'adaln', or 'wan_control'."
+            "Expected 'none', 'recam_attention', 'cross_attention', 'new_cross_attention', 'adaln', 'wan_control', or 'channel_concat'."
         )
 
     adaln_camera_embedding = camera_context if camera_input_type == "adaln" else None
     recam_camera_embedding = camera_context if camera_input_type == "recam_attention" else None
     cross_attention_camera_context = camera_context if camera_input_type == "cross_attention" else None
     wan_control_camera_input = camera_context if camera_input_type == "wan_control" else None
+    channel_concat_camera_input = camera_context if camera_input_type == "channel_concat" else None
     cross_attention_scene_context = None
 
     # Timestep
@@ -801,6 +886,27 @@ def simple_wan_video_fn(
             if context is None:
                 context = scene_context
             else:
+                # Broadcast/repeat batch dims so concat works when CFG uncond
+                # encodes a single "" prompt (batch=1) while scene_context has
+                # the full val/train batch.
+                if context.shape[0] != scene_context.shape[0]:
+                    if context.shape[0] == 1:
+                        context = context.expand(scene_context.shape[0], -1, -1)
+                    elif scene_context.shape[0] == 1:
+                        scene_context = scene_context.expand(context.shape[0], -1, -1)
+                    elif scene_context.shape[0] % context.shape[0] == 0:
+                        context = context.repeat_interleave(
+                            scene_context.shape[0] // context.shape[0], dim=0
+                        )
+                    elif context.shape[0] % scene_context.shape[0] == 0:
+                        scene_context = scene_context.repeat_interleave(
+                            context.shape[0] // scene_context.shape[0], dim=0
+                        )
+                    else:
+                        raise ValueError(
+                            "text context and scene_context batch sizes must match or be broadcastable: "
+                            f"text={context.shape[0]}, scene={scene_context.shape[0]}"
+                        )
                 context = torch.cat([context, scene_context], dim=1)
         else:
             scene_latent_tokens = scene_context
@@ -859,6 +965,38 @@ def simple_wan_video_fn(
         x = dit.patch_embedding(x)
         y_camera = dit.control_adapter(wan_control_camera_input)
         x = x + y_camera
+    elif channel_concat_camera_input is not None:
+        # Channel-concat ray map (6 ch) with latent before patch_embedding.
+        # patch_embedding was extended to `in_channels + 6` in __init__, with
+        # the extra 6 channels zero-init so initial behaviour matches Wan prior.
+        channel_concat_camera_input = channel_concat_camera_input.to(
+            dtype=latents.dtype, device=latents.device
+        )
+        if channel_concat_camera_input.shape[0] != x.shape[0]:
+            if channel_concat_camera_input.shape[0] == 1:
+                channel_concat_camera_input = channel_concat_camera_input.expand(
+                    x.shape[0], -1, -1, -1, -1
+                )
+            elif x.shape[0] % channel_concat_camera_input.shape[0] == 0:
+                repeat = x.shape[0] // channel_concat_camera_input.shape[0]
+                channel_concat_camera_input = channel_concat_camera_input.repeat_interleave(
+                    repeat, dim=0
+                )
+            else:
+                raise ValueError(
+                    "channel_concat camera input batch must match or divide latent batch: "
+                    f"camera={channel_concat_camera_input.shape[0]}, latent={x.shape[0]}"
+                )
+        # Both `x` (latent) and ray map are NCFHW; spatial (H, W) and temporal
+        # (F) dims must match. If they don't, raise — config has wrong shapes.
+        if channel_concat_camera_input.shape[-3:] != x.shape[-3:]:
+            raise ValueError(
+                "channel_concat ray map shape must match latent (F, H, W). Got "
+                f"ray={tuple(channel_concat_camera_input.shape)}, latent={tuple(x.shape)}. "
+                "Set `model.denoiser.camera.input_shape=[H_latent, W_latent]` to match."
+            )
+        x = torch.cat([x, channel_concat_camera_input], dim=1)
+        x = dit.patch_embedding(x)
     else:
         x = dit.patchify(x)
     f, h, w = x.shape[2:]
