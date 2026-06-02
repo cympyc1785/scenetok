@@ -377,7 +377,7 @@ class T2VWrapper(DiffusionWrapper):
             cfg_scale=self.model_cfg.cfg_scale,
             autoencoder_name=target_cfg.name,
             scaling_factor=target_cfg.kwargs.scaling_factor,
-            chunk_index_gap=self.dataset_cfg.view_sampler.chunk_index_gap,
+            chunk_index_gap=getattr(self.dataset_cfg.view_sampler, "chunk_index_gap", 1),
             offset=self.dataset_cfg.view_sampler.offset,
             chunk_targets=getattr(self.dataset_cfg.view_sampler, "chunk_targets", True),
             first_frame_latents=first_frame_latents,
