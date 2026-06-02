@@ -2,16 +2,18 @@ config=custom/scenetok_va-wan-ti2v_dl3dv
 num_workers=4
 gpus=1
 num_nodes=1
-exp_name="va-wan-ti2v_recon_aggressive_train_256-480_finetuned_scene_new_ca_recam_large"
+exp_name="va-wan-ti2v_recon_aggressive_train_256-480_finetuned_scene_new_ca_recam_text_small"
 # exp_name="test_lora_no_ffn"
 resume_lora_ckpt=null
 
 export WANDB_API_KEY=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
 export DEBUG=1
-CUDA_VISIBLE_DEVICES=0 exec -a dynamic_scenetok_lets_go python -m src.main +experiment=${config} \
+CUDA_VISIBLE_DEVICES=3 exec -a dynamic_scenetok_lets_go python -m src.main +experiment=${config} \
   data_loader.train.num_workers=${num_workers} \
   mode=train \
-  dataset.smallset=false \
+  dataset/view_sampler=caption_window \
+  +dataset.load_prompts=true \
+  dataset.smallset=true \
   dataset.context_shape=[256,448] \
   dataset.target_shape=[480,832] \
   model.compressor.ckpt_path=checkpoints/va-wan_dl3dv_256x448.ckpt \

@@ -1,0 +1,24 @@
+name: caption_window
+
+# Overridden per-experiment (e.g. 16 / 10 in scenetok_va-wan-ti2v_dl3dv).
+num_context_views: 0
+num_target_views: 0
+
+# How context views are picked inside the caption window.
+context_sampling: "farthest_point"
+
+# Caption window source + target-length geometry (kept in sync with the dataset's
+# own prompts lookup; V_pixel = 1 + (num_target_views - 1) * temporal_downsample
+# when offset != 0).
+prompts_filename: prompts_37.json
+temporal_downsample: 4
+offset: 1
+chunk_targets: false
+
+# Extra frames on either side of the window when sampling context (0 → context
+# strictly inside the target window).
+context_window_margin: 0
+
+# Accept a shorter-than-V_pixel window (the last bucket in prompts_37.json is
+# often short) instead of raising.
+allow_short_last_window: true
