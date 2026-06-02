@@ -193,3 +193,9 @@ cython_debug/
 DATA
 results
 exp
+WorldTraj
+
+# Vendored upstream repos (nested .git, read-only references — see CLAUDE.md)
+src/model/DiffSynth-Studio
+src/model/ac3d
+src/model/GEN3C

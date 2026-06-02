@@ -27,6 +27,7 @@ Dynamic video generation with scene tokens. Built on top of SceneTok (CVPR '26):
 - Full TI2V/T2V (non-overfit): `bash train_t2vgen.sh` (DAVIS, `scenetok_va-wan-ti2v_davis`), `bash train_t2vgen_recon.sh` (DL3DV, `scenetok_va-wan-ti2v_dl3dv`)
 - 14B variant: `bash train_t2vgen_14B_recon_overfit.sh`
 - Inference: `bash infer_t2vgen_recon.sh` (recon-style), `bash infer_t2vgen_text.sh` (text-conditioned)
+- Fast standalone inference: `bash fast_infer_t2v.sh` (`scripts/fast_infer_t2v.py`) — Hydra/Lightning을 우회해 `exp/<exp_name>/.hydra/config.yaml` + `last.ckpt`를 직접 로드, 한 scene에 `{cfg, 1.0}×{prompt, ""}` 4 combo를 mp4로 sampling
 - Smoke / load test: `bash load_ti2v_test.sh`
 
 **기타**
@@ -40,6 +41,7 @@ Required env vars in the shells:
 - `WANDB_API_KEY` — already inlined in each script
 - `DEBUG=1` — disables `torch.compile` for all modules (set in every current shell). Drop it only when actually benchmarking compiled training.
 - `CUDA_VISIBLE_DEVICES` — pinned per-shell (often `1`, `2`, or `3` depending on which run a script is for). Override at the shell level before invoking, do not delete from the script.
+- `OMP_NUM_THREADS` (+ MKL/OpenBLAS) — `src/main.py`가 import 이전에 `setdefault("8")`. 72-core 머신에서 train job 여러 개 동시 실행 시 intra-op pool이 코어를 독점하는 것 방지. shell에서 export하면 override 가능. `src.main_scene`엔 미적용.
 
 ### Modes
 The `mode=` Hydra arg routes the trainer:
@@ -66,6 +68,7 @@ The `mode=` Hydra arg routes the trainer:
 - `denoiser/` — diffusion backbones. `wan_ti2v.py` and `wan_t2v_14B.py` wrap DiffSynth-Studio's Wan DiT and add LoRA + scene/camera/condition-latent injection points. `lightningdit.py` is the legacy SceneTok denoiser.
 - `camera/` — Plücker / ray / Wan-Plücker camera encoders. Selected via `model.denoiser.camera`.
 - `scene_generator/`, `scheduler/`, `sampler/` — used by SceneGen and inference paths.
+- `DiffSynth-Studio/`, `ac3d/`, `GEN3C/` — vendored upstream repos (Wan DiT/VAE, AC3D camera-control reference, GEN3C). Treat as read-only references; our code imports from them, don't refactor them.
 
 ### Configs (Hydra, config/)
 - `config/main.yaml` — defaults composition (dataset, autoencoders, scheduler, denoiser, …)
@@ -76,8 +79,9 @@ The `mode=` Hydra arg routes the trainer:
 
 Key knobs exposed on the denoiser side (driven from the shell scripts):
 - `model.denoiser.scene_input_type` ∈ `{none, cross_attention, new_cross_attention, latent_concat}` — how scene tokens enter the DiT
-- `model.denoiser.camera_input_type` ∈ `{none, recam_attention, cross_attention, new_cross_attention, adaln, wan_control}` — camera conditioning path
-- `model.denoiser.condition_latents_input_type` ∈ `{none, width, channel, temporal, first_frame, first_frame_random}` — how condition latents/frames are fused
+- `model.denoiser.scene_projection` ∈ `{linear, mlp}` — scene-token projector (`cnd_proj`); `mlp` = `Linear→GELU(tanh)→Linear`
+- `model.denoiser.camera_input_type` ∈ `{none, recam_attention, cross_attention, new_cross_attention, adaln, wan_control, channel_concat, ac3d}` — camera conditioning path. `channel_concat` concats raw Plücker rays into `patch_embedding` (zero-init extra channels); `ac3d` is the AC3D / CogVideoX-ControlNet pattern (separate `ac3d_patch_embedding` + first `ac3d_num_layers` block copies + zero-init projectors residual-injected into the main DiT)
+- `model.denoiser.condition_latents_input_type` ∈ `{none, width, channel, temporal, first_frame, first_frame_random, first_frame_depth, first_frame_depth_soft}` — how condition latents/frames are fused
 - `model.denoiser.lora.{enabled,rank,alpha,target_modules,checkpoint}` — PEFT LoRA over Wan DiT projection / FFN layers
 - `freeze.{denoiser,compressor,autoencoder}` — what gets gradients
 
@@ -95,6 +99,7 @@ Pretrained weights live under `checkpoints/` (downloaded SceneTok/VAE/SceneGen w
 - View samplers (`src/dataset/view_sampler/`): training은 `bounded` (dl3dv) 또는 `unbounded` (re10k 등). `unbounded`는 `offset != 0`이면 Wan 4N+1 chunk 레이아웃을 따른다 (chunk당 raw `4N-3` 프레임). `chunk_targets`는 sampler 자체 동작은 그대로지만 downstream wrapper가 raw→latent 변환 경로를 선택하는 플래그.
 - Eval은 `assets/evaluation_index/{ds}_c{NC}_{NT}_{standard,unseen}.json` 사전 샘플 파일을 사용. `(chunk_targets, val_seen)` 조합으로 자동 선택되며 (`load_evaluation_index`), `chunk_targets=true`면 `_34`, false면 `_37` (raw frame count). `standard`는 train pool, `unseen`은 test pool. config에서 `evaluation_index_path`를 명시하면 그 값이 우선.
 - `dataset.smallset=true` is the overfit/dev subset; 일부 SceneTok 학습은 `smallset=false`로 full split 사용.
+- **Scene blacklist** (dl3dv & re10k): `{cfg.root}/{train|test}/blacklist.csv` (`scene, reason, step, loss, detail`)에 적힌 scene은 meta.csv 재빌드 없이 `__init__` 필터에서 즉시 제외됨. helper는 `dataset_dl3dv.py`의 `load_blacklist`/`append_blacklist`/`_resolve_blacklist_path` (re10k가 재사용). DL3DV는 학습 중 NaN loss 발생 시 `diffusion_wrapper._diagnose_batch_for_blacklist`가 데이터 anomaly를 잡아 자동 append (auto-mode 친화적); re10k는 자동 append 분기가 없어 수동 편집 워크플로우. `scripts/blacklist_non_consecutive_frames.py`로 비연속 프레임 scene을 일괄 등록.
 
 ### Known gotchas
 - **Wan 2.2 VAE + 1024 scene_tokens (wan-wan scratch):** published va-vdc는 512 tokens + `kl_weights=1e-10`로 안정했지만, 1024 tokens 환경에선 동일 anchor가 부족해 step ~2k–20k 사이에 cascading gradient NaN으로 발산한다. 대응: compressor `init_large=false, init_small=true` (scene_tokens 초기 std 5.0 → 0.02) + `kl_weights` 단계적 상향 (1e-10 → 1e-7 → 1e-6 → 1e-5). 새 wan-wan 학습 시작 전에 `scenetok_wan-wan_lognorm_re10k_scratch.yaml`의 현재 값을 그대로 따라가는 게 안전. 진단 스크립트: `python scripts/check_wan_vae_outliers.py`.
@@ -127,3 +132,20 @@ Pretrained weights live under `checkpoints/` (downloaded SceneTok/VAE/SceneGen w
 2. 사용자에게 어느 카테고리에 추가했는지 알려줄 것
 
 이 단계를 건너뛰지 말 것. 사소한 변경이라도 사용자에게 영향이 있으면 기록한다.
+
+## Git 커밋 워크플로우
+
+역할 분담: **Claude = 현재 브랜치에 커밋까지, 사용자 = push.** Claude는 브랜치를 새로 만들지 않고 push도 하지 않는다. (이 프로젝트는 "요청받을 때만 커밋" 기본 동작과 "default 브랜치면 먼저 분기" 동작을 의도적으로 override 한다 — 코드 변경 작업이면 분기 없이 현재 브랜치에 자동 커밋.)
+
+### Claude가 자동으로 하는 것
+1. 코드 변경 작업이 끝나면 **현재 브랜치에 그대로 커밋**한다 (브랜치 분기 금지).
+2. 코드 변경 + `CHANGELOG.md [Unreleased]` 갱신을 **하나의 커밋**으로 묶는다. 커밋 메시지는 `<type>: <한 줄 요약>` (`feat` 새 기능 / `fix` 버그 / `exp` 실험·ablation / `chore` 리팩터·문서·잡일; 예: `feat: ac3d camera_input_type 추가`) + 필요 시 본문에 why, 끝에 Co-Authored-By trailer.
+3. **스테이징은 변경한 파일만 명시적으로 `git add <경로>`.** `git add -A` / `git add .` **금지** — vendored 디렉토리(`src/model/{DiffSynth-Studio,ac3d,GEN3C}`, `WorldTraj`; DiffSynth-Studio는 ~417GB)가 인덱스에 끌려들어가는 사고를 gitignore 상태와 무관하게 차단.
+4. 커밋 후 **커밋 요약을 사용자에게 보고하고 멈춘다.**
+
+### Claude가 하지 않는 것 (전부 사용자가 수동)
+- `git push`, `git merge`, `git pull`, 브랜치 생성/삭제.
+
+### 커밋하지 않는 경우
+- 읽기 전용 / 분석 / 질문 답변 등 코드 변경이 없는 작업.
+- 사용자가 명시적으로 "커밋하지 마"라고 지시한 경우.
