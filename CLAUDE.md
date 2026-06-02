@@ -139,7 +139,7 @@ Pretrained weights live under `checkpoints/` (downloaded SceneTok/VAE/SceneGen w
 
 ### Claude가 자동으로 하는 것
 1. 코드 변경 작업이 끝나면 **현재 브랜치에 그대로 커밋**한다 (브랜치 분기 금지).
-2. 코드 변경 + `CHANGELOG.md [Unreleased]` 갱신을 **하나의 커밋**으로 묶는다. 커밋 메시지는 `<type>: <한 줄 요약>` (`feat` 새 기능 / `fix` 버그 / `exp` 실험·ablation / `chore` 리팩터·문서·잡일; 예: `feat: ac3d camera_input_type 추가`) + 필요 시 본문에 why, 끝에 Co-Authored-By trailer.
+2. 코드 변경 + `CHANGELOG.md [Unreleased]` 갱신을 **하나의 커밋**으로 묶는다. 커밋 메시지는 `<type>: <한 줄 요약>` (`feat` 새 기능 / `fix` 버그 / `exp` 실험·ablation / `chore` 리팩터·문서·잡일; 예: `feat: ac3d camera_input_type 추가`) + 필요 시 본문에 why.
 3. **스테이징은 변경한 파일만 명시적으로 `git add <경로>`.** `git add -A` / `git add .` **금지** — vendored 디렉토리(`src/model/{DiffSynth-Studio,ac3d,GEN3C}`, `WorldTraj`; DiffSynth-Studio는 ~417GB)가 인덱스에 끌려들어가는 사고를 gitignore 상태와 무관하게 차단.
 4. 커밋 후 **커밋 요약을 사용자에게 보고하고 멈춘다.**
 
