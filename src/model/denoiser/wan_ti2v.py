@@ -62,11 +62,12 @@ class WanTI2V5BCfg:
     clean: str = "whitespace"
     gradient_checkpointing: bool = True
     condition_latents_input_type: Literal["none", "width", "channel", "temporal", "first_frame", "first_frame_random", "first_frame_depth", "first_frame_depth_soft"] = "none"
-    camera_input_type: Literal["none", "recam_attention", "cross_attention", "new_cross_attention", "adaln", "wan_control", "channel_concat"] | None = None
+    camera_input_type: Literal["none", "recam_attention", "cross_attention", "new_cross_attention", "adaln", "wan_control", "channel_concat", "ac3d"] | None = None
     enable_recam_attention: bool | None = None
     camera_context_spatial_pool: int = 1
     scene_input_type: Literal["none", "cross_attention", "new_cross_attention", "latent_concat"] = "cross_attention"
     scene_projection: Literal["linear", "mlp"] = "linear"
+    ac3d_num_layers: int = 2
     num_target_split: int = 1
     input_shape: int | list[int] = 16
     noise_seed: int | None = None
@@ -331,6 +332,55 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
                 stride=tuple(spatial_patch),
                 num_residual_blocks=1,
             ).to(device=ref_param.device, dtype=ref_param.dtype)
+        if self.camera_input_type == "ac3d":
+            # AC3D-style camera controlnet: small parallel branch that runs first
+            # `ac3d_num_layers` Wan blocks on (latent + ray channel-concat) input,
+            # then injects layer-wise zero-init residuals into the corresponding
+            # first N main DiT blocks. Mirrors AC3D / CogVideoX-ControlNet.
+            extra_in_ac = 6 * max(temporal_downsample, 1)
+            orig_pe_ac = self.model.patch_embedding
+            self.model.ac3d_patch_embedding = nn.Conv3d(
+                orig_pe_ac.in_channels + extra_in_ac,
+                orig_pe_ac.out_channels,
+                kernel_size=orig_pe_ac.kernel_size,
+                stride=orig_pe_ac.stride,
+                padding=orig_pe_ac.padding,
+                bias=orig_pe_ac.bias is not None,
+            )
+            with torch.no_grad():
+                self.model.ac3d_patch_embedding.weight.zero_()
+                self.model.ac3d_patch_embedding.weight[:, : orig_pe_ac.in_channels].copy_(orig_pe_ac.weight)
+                if orig_pe_ac.bias is not None:
+                    self.model.ac3d_patch_embedding.bias.copy_(orig_pe_ac.bias)
+            self.model.ac3d_patch_embedding = self.model.ac3d_patch_embedding.to(
+                device=orig_pe_ac.weight.device, dtype=orig_pe_ac.weight.dtype
+            )
+            # Clone first N main blocks with scene/camera inside-block paths disabled
+            # so the controlnet itself doesn't try to consume scene_context/recam.
+            ac3d_n = max(int(cfg.ac3d_num_layers), 1)
+            ac3d_n = min(ac3d_n, len(self.model.blocks))
+            ac3d_has_image_input = bool(getattr(self.model, "has_image_input", False))
+            self.model.ac3d_blocks = nn.ModuleList([
+                NewDiTBlock.from_dit_block(
+                    self.model.blocks[i],
+                    has_image_input=ac3d_has_image_input,
+                    camera_input_type="none",
+                    scene_input_type="none",
+                )
+                for i in range(ac3d_n)
+            ])
+            # Per-layer zero-init projectors (ControlNet's signature pattern —
+            # initial contribution = 0 → Wan prior preserved at t=0)
+            self.model.ac3d_projectors = nn.ModuleList([
+                nn.Linear(self.model.dim, self.model.dim)
+                for _ in range(ac3d_n)
+            ])
+            for proj in self.model.ac3d_projectors:
+                nn.init.zeros_(proj.weight)
+                nn.init.zeros_(proj.bias)
+            self.model.ac3d_projectors = self.model.ac3d_projectors.to(
+                device=ref_param.device, dtype=ref_param.dtype
+            )
         if self.camera_input_type == "channel_concat":
             # Channel-concat ray map with latent BEFORE the patch_embedding conv.
             # `pose_embed(skip_embedding=True)` returns (B, V_lat, 6*T, H, W) when
@@ -463,6 +513,14 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
             trainable = trainable or (
                 self.camera_input_type == "channel_concat"
                 and name.startswith("patch_embedding.")
+            )
+            trainable = trainable or (
+                self.camera_input_type == "ac3d"
+                and (
+                    name.startswith("ac3d_patch_embedding.")
+                    or name.startswith("ac3d_blocks.")
+                    or name.startswith("ac3d_projectors.")
+                )
             )
             trainable = trainable or (
                 self.camera_input_type == "adaln"
@@ -604,7 +662,7 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
                 extrinsics = extrinsics[:, indices]
             return extrinsics.flatten(-2)
 
-        if self.camera_input_type in ("wan_control", "channel_concat"):
+        if self.camera_input_type in ("wan_control", "channel_concat", "ac3d"):
             # Both modes consume raw Plücker rays (6 ch) without `time_embed`
             # blow-up. SimpleAdapter / channel-concat handle dim alignment themselves.
             # SimpleAdapter unpacks `(B, C, F, H, W)` (NCFHW), but
@@ -656,7 +714,7 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
             )
             pooled = camera_embedding.mean(dim=(1, 3, 4))  # (b v c h w) -> (b c)
             return self.model.adaln_camera_proj(pooled)
-        if self.camera_input_type in ("wan_control", "channel_concat"):
+        if self.camera_input_type in ("wan_control", "channel_concat", "ac3d"):
             return camera_embedding
         ref_param = next(self.model.parameters())
         camera_embedding = camera_embedding.to(device=ref_param.device, dtype=ref_param.dtype)
@@ -797,7 +855,7 @@ def simple_wan_video_fn(
     scene_context: torch.Tensor = None,
     scene_input_type: Literal["none", "cross_attention", "new_cross_attention", "latent_concat"] = "cross_attention",
     camera_context: torch.Tensor = None,
-    camera_input_type: Literal["none", "recam_attention", "cross_attention", "new_cross_attention", "adaln", "wan_control", "channel_concat"] | None = None,
+    camera_input_type: Literal["none", "recam_attention", "cross_attention", "new_cross_attention", "adaln", "wan_control", "channel_concat", "ac3d"] | None = None,
     fuse_vae_embedding_in_latents: bool = False,
     use_gradient_checkpointing: bool = False,
     use_gradient_checkpointing_offload: bool = False,
@@ -809,10 +867,10 @@ def simple_wan_video_fn(
         )
     if camera_input_type is None:
         camera_input_type = "none"
-    if camera_input_type not in ("none", "recam_attention", "cross_attention", "new_cross_attention", "adaln", "wan_control", "channel_concat"):
+    if camera_input_type not in ("none", "recam_attention", "cross_attention", "new_cross_attention", "adaln", "wan_control", "channel_concat", "ac3d"):
         raise ValueError(
             f"Unsupported camera_input_type={camera_input_type!r}. "
-            "Expected 'none', 'recam_attention', 'cross_attention', 'new_cross_attention', 'adaln', 'wan_control', or 'channel_concat'."
+            "Expected 'none', 'recam_attention', 'cross_attention', 'new_cross_attention', 'adaln', 'wan_control', 'channel_concat', or 'ac3d'."
         )
 
     adaln_camera_embedding = camera_context if camera_input_type == "adaln" else None
@@ -820,6 +878,7 @@ def simple_wan_video_fn(
     cross_attention_camera_context = camera_context if camera_input_type == "cross_attention" else None
     wan_control_camera_input = camera_context if camera_input_type == "wan_control" else None
     channel_concat_camera_input = camera_context if camera_input_type == "channel_concat" else None
+    ac3d_camera_input = camera_context if camera_input_type == "ac3d" else None
     cross_attention_scene_context = None
 
     # Timestep
@@ -1023,6 +1082,9 @@ def simple_wan_video_fn(
         ],
         dim=-1,
     ).reshape(f * h * w, 1, -1).to(x.device)
+    # Preserve a copy of freqs without scene_latent_tokens for any side branch
+    # (e.g. AC3D controlnet) that runs on the same (f, h, w) sequence.
+    ac3d_freqs = freqs
     if scene_latent_token_count:
         scene_freqs = torch.ones(
             scene_latent_token_count,
@@ -1032,6 +1094,47 @@ def simple_wan_video_fn(
         )
         freqs = torch.cat([freqs, scene_freqs], dim=0)
 
+    # AC3D ControlNet branch: encode (latent + ray) via `ac3d_patch_embedding`,
+    # run through `ac3d_blocks`, project each to dim via zero-init linear, and
+    # collect per-layer residuals. These are added to the main DiT's hidden
+    # states after each of the first N main blocks. The main DiT itself runs
+    # with vanilla latent (no channel concat) — ControlNet output is the only
+    # path for camera info to reach the main flow.
+    ac3d_residuals = None
+    if ac3d_camera_input is not None and getattr(dit, "ac3d_blocks", None) is not None:
+        ac3d_camera_input = ac3d_camera_input.to(dtype=latents.dtype, device=latents.device)
+        if ac3d_camera_input.shape[0] != latents.shape[0]:
+            if ac3d_camera_input.shape[0] == 1:
+                ac3d_camera_input = ac3d_camera_input.expand(latents.shape[0], -1, -1, -1, -1)
+            elif latents.shape[0] % ac3d_camera_input.shape[0] == 0:
+                ac3d_camera_input = ac3d_camera_input.repeat_interleave(
+                    latents.shape[0] // ac3d_camera_input.shape[0], dim=0
+                )
+            else:
+                raise ValueError(
+                    "ac3d camera input batch must match or divide latent batch: "
+                    f"camera={ac3d_camera_input.shape[0]}, latent={latents.shape[0]}"
+                )
+        if ac3d_camera_input.shape[-3:] != latents.shape[-3:]:
+            raise ValueError(
+                "ac3d ray map shape must match latent (F, H, W). "
+                f"Got ray={tuple(ac3d_camera_input.shape)}, latent={tuple(latents.shape)}. "
+                "Set `model.denoiser.camera.input_shape=[H_latent, W_latent]`."
+            )
+        ac3d_input = torch.cat([latents, ac3d_camera_input], dim=1)
+        ac3d_x = dit.ac3d_patch_embedding(ac3d_input)
+        # Replicate batch broadcast that vanilla path does to x (line ~913).
+        if ac3d_x.shape[0] != x.shape[0]:
+            if x.shape[0] % ac3d_x.shape[0] == 0:
+                ac3d_x = torch.cat([ac3d_x] * (x.shape[0] // ac3d_x.shape[0]), dim=0)
+        ac3d_x = rearrange(ac3d_x, "b c f h w -> b (f h w) c").contiguous()
+        ac3d_residuals = []
+        for ac3d_block, ac3d_proj in zip(dit.ac3d_blocks, dit.ac3d_projectors):
+            ac3d_x = ac3d_block(
+                ac3d_x, context, None, t_mod, None, ac3d_freqs, None
+            )
+            ac3d_residuals.append(ac3d_proj(ac3d_x))
+
     for block_id, block in enumerate(dit.blocks):
         x = gradient_checkpoint_forward(
             block,
@@ -1039,6 +1142,15 @@ def simple_wan_video_fn(
             use_gradient_checkpointing_offload,
             x, context, cross_attention_scene_context, t_mod, scene_t_mod, freqs, recam_camera_embedding
         )
+        if ac3d_residuals is not None and block_id < len(ac3d_residuals):
+            res = ac3d_residuals[block_id]
+            # Main x may have scene_latent_tokens appended → only add residual
+            # to the patch-token portion (first `n_patches` tokens).
+            n_patches = res.shape[1]
+            if x.shape[1] == n_patches:
+                x = x + res
+            else:
+                x = torch.cat([x[:, :n_patches] + res, x[:, n_patches:]], dim=1)
 
     x = BatchHead.forward(dit.head, x, t)
     if scene_latent_token_count:
