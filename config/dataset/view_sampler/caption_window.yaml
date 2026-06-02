@@ -16,8 +16,13 @@ offset: 1
 chunk_targets: false
 
 # Extra frames on either side of the window when sampling context (0 → context
-# strictly inside the target window).
+# strictly inside the target window). This is the FINAL margin.
 context_window_margin: 0
+# bounded-style warm-up: ramp the margin from `initial_context_window_margin` up
+# to `context_window_margin` over `context_window_margin_warm_up_steps` steps.
+# Leave warm_up_steps=0 to disable (margin stays at context_window_margin).
+initial_context_window_margin: 0
+context_window_margin_warm_up_steps: 0
 
 # Accept a shorter-than-V_pixel window (the last bucket in prompts_37.json is
 # often short) instead of raising.

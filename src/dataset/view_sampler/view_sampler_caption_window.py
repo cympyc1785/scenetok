@@ -30,7 +30,15 @@ class ViewSamplerCaptionWindowCfg(ViewSamplerCfg):
     chunk_targets: bool = False
     # Frames added on either side of the chosen caption window when picking
     # context views (0 → context only from within the target window itself).
+    # This is the *final* margin; see warm-up fields below for ramping it up.
     context_window_margin: int = 0
+    # bounded-style warm-up for the margin: over the first
+    # `context_window_margin_warm_up_steps` global steps the effective margin
+    # ramps linearly from `initial_context_window_margin` → `context_window_margin`.
+    # 0 steps → no schedule (always use `context_window_margin`). At test stage the
+    # full (final) margin is always used.
+    initial_context_window_margin: int = 0
+    context_window_margin_warm_up_steps: int = 0
     # If the picked window is shorter than V_pixel required by the V_lat/temporal
     # config, fall back to using all `window_len` frames (last chunk in
     # `prompts_37.json` is usually short).
@@ -38,6 +46,18 @@ class ViewSamplerCaptionWindowCfg(ViewSamplerCfg):
 
 
 class ViewSamplerCaptionWindow(ViewSampler[ViewSamplerCaptionWindowCfg]):
+    def _schedule(self, initial: int, final: int, steps: int) -> int:
+        # Linear ramp initial → final over `steps` global steps (bounded-style).
+        fraction = self.global_step / steps
+        return min(initial + int((final - initial) * fraction), final)
+
+    def _effective_margin(self) -> int:
+        final = self.cfg.context_window_margin
+        steps = self.cfg.context_window_margin_warm_up_steps
+        if self.stage == "test" or steps <= 0:
+            return final
+        return self._schedule(self.cfg.initial_context_window_margin, final, steps)
+
     def _target_pixel_count(self) -> int:
         n_lat = self.cfg.num_target_views
         td = max(self.cfg.temporal_downsample, 1)
@@ -121,8 +141,9 @@ class ViewSamplerCaptionWindow(ViewSampler[ViewSamplerCaptionWindowCfg]):
         target_end = target_start + V_pixel  # half-open
         target_indices = torch.arange(target_start, target_end, dtype=torch.long)
 
-        c_lo = max(0, lo - self.cfg.context_window_margin)
-        c_hi = min(num_views, hi + self.cfg.context_window_margin)
+        margin = self._effective_margin()
+        c_lo = max(0, lo - margin)
+        c_hi = min(num_views, hi + margin)
         context_indices = self._sample_context(c_lo, c_hi, extrinsics)
         context_indices = context_indices.sort().values
 
