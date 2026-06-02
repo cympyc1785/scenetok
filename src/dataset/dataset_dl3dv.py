@@ -320,7 +320,10 @@ class DatasetDL3DV(Dataset):
                 return None
             size = "34" if chunk_targets else "37"
             split = "standard" if self.cfg.val_seen else "unseen"
-            path = Path(f"assets/evaluation_index/dl3dv_c16_{size}_{split}.json")
+            # caption_window는 caption-정렬 전용 index를 쓴다
+            # (`scripts/build_caption_window_eval_index.py`로 생성).
+            variant = "_caption" if getattr(self.view_sampler.cfg, "name", None) == "caption_window" else ""
+            path = Path(f"assets/evaluation_index/dl3dv_c16_{size}{variant}_{split}.json")
         with Path(path).open("r") as f:
             return json.load(f)
 
