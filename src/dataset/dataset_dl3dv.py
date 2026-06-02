@@ -65,6 +65,7 @@ def check_teleport_camera(extrinsics):
 
 BLACKLIST_FILENAME = "blacklist.csv"
 _BLACKLIST_FIELDNAMES = ["scene", "reason", "step", "loss", "detail"]
+_PROMPTS_NOT_LOADED = object()  # sentinel for `_prompts_cache.get(..., _PROMPTS_NOT_LOADED)`
 
 
 def _resolve_blacklist_path(cfg: "DatasetDL3DVCfg", root: Path) -> Path:
@@ -238,6 +239,11 @@ class DatasetDL3DVCfg(DatasetCfgCommon):
     # and `target["da3_w2c_first"], target["da3_intrinsics_first"]` to the
     # sample. Used by `condition_latents_input_type=first_frame_depth`.
     load_da3_depth: bool = False
+    # If true, read `<scene>/prompts_37.json` (or `prompts_filename`) at
+    # __getitem__ time and inject the entry matching the target frame window
+    # as `sample["text"]` (the `prompt_scene_simple.concise` field).
+    load_prompts: bool = False
+    prompts_filename: str = "prompts_37.json"
 
 class DatasetDL3DV(Dataset):
     cfg: DatasetDL3DVCfg
@@ -265,6 +271,9 @@ class DatasetDL3DV(Dataset):
         self.chunks = []
         self.preprocess = rescale_and_pad if cfg.do_scale_and_pad else rescale_and_crop
         self.evaluation_index = self.load_evaluation_index()
+        # Per-scene cache for prompts_*.json (only used when cfg.load_prompts).
+        # Worker-local; safe under torch DataLoader's per-worker dataset copy.
+        self._prompts_cache: dict[str, dict | None] = {}
 
         if self.cfg.scene_id is not None:
             scene_id = Path(self.cfg.scene_id)
@@ -326,6 +335,55 @@ class DatasetDL3DV(Dataset):
             torch.tensor(entry["target"], dtype=torch.long),
         )
 
+    def _lookup_prompt_for_target(self, scene_root: Path, target_indices: torch.Tensor) -> str:
+        """Look up the `prompts_<N>.json` entry whose `frame_idx` window covers
+        the target frame range, and return `prompt_scene_simple.concise`.
+        Returns empty string if the file is missing or no entry matches.
+
+        Matching rule: `frame_idx[0] <= min(target) <= max(target) < frame_idx[1]`.
+        If multiple windows contain the range (shouldn't happen for typical
+        non-overlapping windows), the narrowest one wins.
+        """
+        scene_key = str(scene_root)
+        cached = self._prompts_cache.get(scene_key, _PROMPTS_NOT_LOADED)
+        if cached is _PROMPTS_NOT_LOADED:
+            prompts_path = scene_root / self.cfg.prompts_filename
+            if not prompts_path.exists():
+                self._prompts_cache[scene_key] = None
+                return ""
+            try:
+                with prompts_path.open() as f:
+                    cached = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                cached = None
+            self._prompts_cache[scene_key] = cached
+        if not cached:
+            return ""
+
+        if target_indices.numel() == 0:
+            return ""
+        t_min = int(target_indices.min().item())
+        t_max = int(target_indices.max().item())
+
+        best = None
+        best_span = None
+        for entry in cached.values():
+            fi = entry.get("frame_idx") if isinstance(entry, dict) else None
+            if not (isinstance(fi, (list, tuple)) and len(fi) == 2):
+                continue
+            lo, hi = int(fi[0]), int(fi[1])  # half-open [lo, hi)
+            if lo <= t_min and t_max < hi:
+                span = hi - lo
+                if best_span is None or span < best_span:
+                    best, best_span = entry, span
+
+        if best is None:
+            return ""
+        scene_simple = best.get("prompt_scene_simple")
+        if not isinstance(scene_simple, dict):
+            return ""
+        return scene_simple.get("concise", "") or ""
+
     def validate_view_shape(
         self,
         images: torch.Tensor,
@@ -383,6 +441,7 @@ class DatasetDL3DV(Dataset):
                 stage=self.stage,
                 extrinsics=extrinsics,
                 scene=scene,
+                scene_dir=chunk_path,
             )
 
         view_index_items = []
@@ -532,6 +591,12 @@ class DatasetDL3DV(Dataset):
                 sample["context"]["da3_w2c_at_target_shape"] = W_ctx_t.contiguous()
                 sample["target"]["da3_w2c_first"] = W_tgt[0].contiguous()           # (4, 4)
                 sample["target"]["da3_intrinsics_first"] = K_tgt[0].contiguous()    # (3, 3)
+
+        if self.cfg.load_prompts:
+            sample["text"] = self._lookup_prompt_for_target(
+                self.root / chunk_name,
+                sample["target"]["index"],
+            )
 
         return sample
     

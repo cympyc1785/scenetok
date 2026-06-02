@@ -11,6 +11,7 @@ from .view_sampler_evaluation import ViewSamplerEvaluation, ViewSamplerEvaluatio
 from .view_sampler_evaluation_scene import ViewSamplerEvaluationScene, ViewSamplerEvaluationSceneCfg 
 from .view_sampler_evaluation_video import ViewSamplerEvaluationVideo, ViewSamplerEvaluationVideoCfg
 from .view_sampler_evaluation_video_wan import ViewSamplerEvaluationVideoWan, ViewSamplerEvaluationVideoWanCfg
+from .view_sampler_caption_window import ViewSamplerCaptionWindow, ViewSamplerCaptionWindowCfg
 
 from ..dtypes import Stage
 from ...misc.step_tracker import StepTracker
@@ -24,6 +25,7 @@ VIEW_SAMPLERS: dict[str, ViewSampler[Any]] = {
     "evaluation_video": ViewSamplerEvaluationVideo,
     "evaluation_video_wan": ViewSamplerEvaluationVideoWan,
     "evaluation_scene": ViewSamplerEvaluationScene,
+    "caption_window": ViewSamplerCaptionWindow,
 
 }
 
@@ -35,6 +37,7 @@ ViewSamplerCfg = (
     | ViewSamplerEvaluationVideoWanCfg
     | ViewSamplerEvaluationSceneCfg
     | ViewSamplerUnboundedCfg
+    | ViewSamplerCaptionWindowCfg
 )
 
 
