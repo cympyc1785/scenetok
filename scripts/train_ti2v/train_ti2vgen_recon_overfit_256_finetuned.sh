@@ -2,7 +2,7 @@ config=custom/scenetok_va-wan-ti2v_dl3dv
 num_workers=4
 gpus=1
 num_nodes=1
-exp_name="va-wan-ti2v_recon_aggressive_train_256-480_finetuned_scene_new_ca_recam_text_small"
+exp_name="va-wan-ti2v_recon_aggressive_train_256-480_finetuned_scene_new_ca_recam_text_small_no_cfg_2"
 # exp_name="test_lora_no_ffn"
 resume_lora_ckpt=null
 
