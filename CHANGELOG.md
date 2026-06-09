@@ -6,6 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- `src/dataset/dataset_dynamicverse.py` + `config/dataset/dynamicverse.yaml`: `WorldTraj/dynamicverse` 데이터셋 (DAVIS / dynamic_replica / MOSE / MVS-Synth / SAV / spring / uvo / VOST / youtube_vis, `dynpose-100k`+`logs` 제외). 한 scene 디렉터리당 `inpaint_result.mp4`+`cameras.json`+`prompts.json`. 주요 cfg 필드:
+  - `excluded_subdatasets` (기본 `["dynpose-100k","logs"]`), `unseen_subdatasets` (기본 `["DAVIS"]`), `val_seen: bool` — train + val.standard는 unseen 제외 pool, val.unseen은 unseen pool만.
+  - `evaluation_index_path: Path | None` — JSON `{scene_name: {context, target}}`. stage∈{val,test}이면 view_sampler 대신 이 인덱스의 fixed indices 사용 (DL3DV 패턴 미러).
+  - `context_shape` / `target_shape` (둘 다 None이면 `shape` fallback). `apply_crop_shim_to_views`를 view-type별로 따로 호출.
+  - `target_video_name: str | None` — 설정 시 target views가 다른 mp4에서 로드 (예: context=`inpaint_result.mp4` 배경, target=`video_input.mp4` 원본).
+  - `prompt_style: "window_dict" | "category_first"` — 전자는 `prompts.json` 의 `prompt_key`(기본 `prompt_scene`); 후자는 `category/category.json`의 `reasoning[dynamic[0]]` 사용 (foreground 동적 객체 설명을 text로).
+  - `require_prompt: bool` — true면 prompt 없는 scene drop (`default_collate`가 batch 내 키 불일치 시 text 키 떨어뜨리는 문제 회피).
+  registry/`__init__.py` + `DatasetCfg` union 갱신. `view_sampler.sample(...)` 호출에 `scene_dir` kwarg 추가 (caption_window 지원).
+- `src/dataset/data_module.py`: dynamicverse val 라우팅 추가 — val loader key가 `unseen`이면 `val_seen=False`+`evaluation_index_path=assets/evaluation_index/dynamicverse_unseen.json`, 그 외는 `val_seen=True`+`_standard.json`. DL3DV/RE10K의 기존 `val_seen` 분기 패턴과 통일.
+- `scripts/build_dynamicverse_eval_index.py` + `assets/evaluation_index/dynamicverse_{standard,unseen}.json`: dynamicverse용 fixed eval index 빌더. seen pool(1329 scenes, DAVIS 제외)에서 random 32 → standard, unseen pool(DAVIS 76)에서 random 32 → unseen. Context=`[0,4,9,13,18,22,27,31,36,40,45,48]` (12 indices, 50-frame clip 가정), target=`range(37)` (Wan 4N+1, td=4).
+- `config/experiment/custom/scenetok_va-wan-ti2v_dynamicverse.yaml`: dynamicverse용 Wan TI2V 5B 학습 실험. `scenetok_va-wan-ti2v_dl3dv.yaml` 미러링 + dynamicverse 측 조정 — view_sampler=caption_window(`prompts_filename=prompts.json`), context_shape=[256,448], target_shape=[480,832], compressor=256x448-finetune ckpt+frozen, scheduler/optimizer는 dl3dv와 동일. 셸 측 override를 위해 `model.denoiser.{scene,camera,condition_latents}_input_type`, `model.denoiser.lora.*`, `wandb.*` 는 yaml에서 빼고 학습 셸로 옮김.
+- `scripts/train_ti2v/train_ti2vgen_dynamicverse_controlnet.sh`: dynamicverse + scene/camera 모두 parallel ControlNet (`scene_input_type=controlnet`, `camera_input_type=controlnet`) + LoRA on (rank=32) 학습 셸. context=target=`inpaint_result.mp4`, text=`prompt_scene`. GPU 1.
+- `scripts/train_ti2v/train_ti2vgen_dynamicverse_controlnet_dynamic.sh`: 위 셸의 변종 — target views가 `video_input.mp4`(원본, 동적 객체 포함)에서 옴, text는 `category/category.json`의 `reasoning[dynamic[0]]`(foreground 동작 설명). scene-token=배경, text=foreground 분리 가설 검증용. GPU 0.
+- `scripts/stage1_lightningdit_coarse.py`: 다수 신규 arg —
+  - `--repeat_factor N` (N>1이면 N MC samples의 픽셀별 std → `variance.mp4` (viridis) + `variance_gray.mp4` (grayscale) + `variance.pt` (raw tensor) 저장; 논문 variance map 재현용).
+  - `--dataset {dl3dv,re10k}` + `--dataset_root` (Hydra-compose 경로에서 dataset group/root override; published latent_dl3dv 등에서 raw 데이터셋으로 swap).
+  - `--view_sampler_td N` (unbounded sampler의 `td * raw_index` OOB 버그 회피 — raw mode RE10K에서 `td=1` override).
+  - `--val_seen {true,false}` (RE10K test pool 접근용).
+  - `--view_sampler_group {evaluation_video,...}` + `--view_sampler_index_path` (eval-style 고정 index 사용 swap).
+- `infer_scenetok_variance.sh` + `assets/evaluation_index/re10k_c12_128_93b36a.json`: paper-faithful Stage-1-only SceneTok variance map 추론 셸 (3 case: va-wan_dl3dv / va-videodc_dl3dv / va-videodc_re10k, 모두 256×256, N=8 MC sampling). RE10K 93b36a scene용 custom 1-scene index.
+- `src/dataset/dataset_re10k.py`: `DatasetRE10kCfg.scene_id: str | None = None` 추가 — DL3DV의 `scene_id` 미러링. 단일 scene 추론 시 view_sampler 호출 전에 `self.scenes = [cfg.scene_id]`로 short-circuit.
+- `scripts/train_scenetok/train_scenetok_dl3dv_256-480_finetune_fixed_intrin.sh` + `_no_kl.sh`: `scenetok_va-wan_dl3dv_256-480_finetune_small`의 두 변종 셸 — `_fixed_intrin`은 `derive_shape_dependent_fields` 도입 후 baseline 재학습, `_no_kl`는 `kl_weights=[0,0]`으로 scene token reparameterize의 σ를 완전 자유롭게.
+
 ### Changed
 - `src/model/diffusion_wrapper.py`: 기존 `set_denoiser_input_shape_from_target` (target_shape → denoiser.input_shape 자동 derive)을 일반화한 **`derive_shape_dependent_fields`** 도입. `dataset.context_shape`/`target_shape`이 바뀔 때 6개 의존 필드가 모두 자동 갱신됨:
   - `denoiser.input_shape` = `target_shape // ae_spatial_compression(target_ae)`

@@ -66,6 +66,57 @@ def parse_args():
     p.add_argument("--out_dir", required=True, help="where to save coarse mp4 + scene_name")
     p.add_argument("--fps", type=int, default=15)
     p.add_argument("--device", default="cuda")
+    p.add_argument(
+        "--repeat_factor",
+        type=int,
+        default=1,
+        help="MC samples per scene (paper's variance-map). >1 enables variance.mp4 + variance.pt "
+             "saving. Each sample has independent diffusion init noise; with `scene_token_projection=kl` "
+             "compressor ε is shared across the N (sampled once before repeat).",
+    )
+    p.add_argument(
+        "--dataset",
+        default=None,
+        help="Hydra dataset group override (e.g. `dl3dv`, `re10k`). Only honored on the "
+             "`--scenetok_experiment` (Hydra-compose) path. Use when the published config "
+             "defaults to `latent_{dl3dv,re10k}` (precomputed latents) but you want raw-image dataset.",
+    )
+    p.add_argument(
+        "--dataset_root",
+        default=None,
+        help="Override `dataset.root` (Hydra-compose path only). If None, auto-derive from "
+             "`--dataset`: dl3dv → ./DATA/DL3DV/DL3DV-960, re10k → ./DATA/re10k/re10k.",
+    )
+    p.add_argument(
+        "--view_sampler_td",
+        type=int,
+        default=None,
+        help="Override `dataset.view_sampler.temporal_downsample`. Set to 1 for raw-mode "
+             "RE10K inference: the unbounded sampler multiplies target indices by `td` to "
+             "map latent→raw, but when num_latents==num_views (no pre-downsample) this "
+             "produces OOB raw indices. Setting td=1 makes target indices pass through.",
+    )
+    p.add_argument(
+        "--val_seen",
+        type=lambda x: str(x).lower() in {"1", "true", "yes"},
+        default=True,
+        help="`dataset.val_seen` flag. True (default) loads the seen/train pool; False "
+             "loads the held-out test pool. RE10K paper eval uses `val_seen=False` "
+             "(test pool — the 3 scenes in `re10k_c12_128_extra.json` are all there).",
+    )
+    p.add_argument(
+        "--view_sampler_group",
+        default=None,
+        help="Hydra view_sampler group override (e.g. `evaluation_video`). Only honored on "
+             "the `--scenetok_experiment` Hydra-compose path. When set to `evaluation_video`, "
+             "also pass `--view_sampler_index_path` so the sampler reads the right index.",
+    )
+    p.add_argument(
+        "--view_sampler_index_path",
+        default=None,
+        help="When using `--view_sampler_group=evaluation_video`, this sets "
+             "`dataset.view_sampler.index_path` (the per-scene context/target index json).",
+    )
     return p.parse_args()
 
 
@@ -100,24 +151,38 @@ def main():
             raise FileNotFoundError(f"SceneTok ckpt not found: {ckpt_path}")
         print(f"[stage1] hydra-compose experiment={args.scenetok_experiment}")
         print(f"[stage1] ckpt: {ckpt_path}")
+        overrides = [
+            f"+experiment={args.scenetok_experiment}",
+            "mode=test",
+            "wandb.activated=false",
+        ]
+        if args.dataset is not None:
+            # Force the dataset group (e.g. `dl3dv`) before applying field
+            # tweaks — needed when the published config uses `latent_dl3dv`
+            # (precomputed latents) but we don't have those locally.
+            overrides.insert(1, f"dataset={args.dataset}")
+        if args.view_sampler_group is not None:
+            # Group override goes BEFORE field tweaks so the new sampler's
+            # default fields land first, then our overrides apply on top.
+            overrides.insert(2, f"dataset/view_sampler={args.view_sampler_group}")
+        # Auto-derive dataset.root from --dataset name if not explicit.
+        _root_defaults = {
+            "dl3dv": "./DATA/DL3DV/DL3DV-960",
+            "re10k": "./DATA/re10k/re10k",
+        }
+        ds_root = args.dataset_root or _root_defaults.get(args.dataset, "./DATA/DL3DV/DL3DV-960")
+        overrides.extend([
+            # Some published experiments set precomputed-latent paths that
+            # only apply to the `latent` dataset (not `dl3dv` / `re10k`).
+            # Strip them so dacite doesn't choke on unknown fields.
+            "~dataset.context_root",
+            "~dataset.target_root",
+            "~dataset.map_dict",
+            # raw-image dataset.root override (defaults None in dl3dv/re10k yamls).
+            f"dataset.root={ds_root}",
+        ])
         with initialize_config_dir(config_dir=str(REPO_ROOT / "config"), version_base=None):
-            cfg_dict = compose(
-                config_name="main",
-                overrides=[
-                    f"+experiment={args.scenetok_experiment}",
-                    "mode=test",
-                    "wandb.activated=false",
-                    # Some published experiments set precomputed-latent paths that
-                    # only apply to the `latent` dataset (not `dl3dv`). Strip them
-                    # so dacite doesn't choke on unknown fields.
-                    "~dataset.context_root",
-                    "~dataset.target_root",
-                    "~dataset.map_dict",
-                    # `dl3dv.yaml` defaults `root: null`; point it at the actual
-                    # raw dataset so dataset init can find frames.
-                    "dataset.root=./DATA/DL3DV/DL3DV-960",
-                ],
-            )
+            cfg_dict = compose(config_name="main", overrides=overrides)
     else:
         config_path = (
             Path(args.scenetok_config)
@@ -148,12 +213,16 @@ def main():
     cfg_dict.freeze.autoencoder = True
     cfg_dict.dataset.smallset = True
     cfg_dict.dataset.stage_override = args.stage_override
-    cfg_dict.dataset.val_seen = True
+    cfg_dict.dataset.val_seen = args.val_seen
     cfg_dict.dataset.scene_id = args.scene_id
+    if args.view_sampler_index_path is not None:
+        cfg_dict.dataset.view_sampler.index_path = args.view_sampler_index_path
     cfg_dict.dataset.context_shape = parse_shape(args.context_shape)
     cfg_dict.dataset.target_shape = parse_shape(args.target_shape)
     cfg_dict.dataset.view_sampler.num_context_views = args.num_context_views
     cfg_dict.dataset.view_sampler.num_target_views = args.num_target_views
+    if args.view_sampler_td is not None:
+        cfg_dict.dataset.view_sampler.temporal_downsample = args.view_sampler_td
     if args.evaluation_index_path:
         cfg_dict.dataset.evaluation_index_path = args.evaluation_index_path
     cfg_dict.model.cfg_scale = args.scenetok_cfg_scale
@@ -205,8 +274,11 @@ def main():
     with torch.no_grad(), torch.amp.autocast(
         device_type="cuda", dtype=precision, enabled=(precision != torch.float32)
     ):
-        sampled, _, _ = wrapper.generate_batch_with_scene(batch, wrapper.sampler, repeat_factor=1)
-    # `sampled`: (1, F, 3, H, W) in [0, 1] (post Wan 2.2 VAE decode).
+        sampled, _, _ = wrapper.generate_batch_with_scene(
+            batch, wrapper.sampler, repeat_factor=args.repeat_factor
+        )
+    # `sampled`: (B*N, F, 3, H, W) in [0, 1] (post target VAE decode). B=1
+    # (single-scene loader), N=repeat_factor.
     print(f"[stage1] coarse video shape: {tuple(sampled.shape)}, "
           f"range [{sampled.min():.3f}, {sampled.max():.3f}]")
 
@@ -214,9 +286,66 @@ def main():
     out_dir = Path(args.out_dir) / scene_name / "stage1"
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    if args.repeat_factor > 1:
+        # Reshape to (N, B=1, F, 3, H, W) and compute the paper's MC variance
+        # map: per-pixel std across N samples, channel-averaged, min-max
+        # normalized, colorized with `viridis`.
+        import numpy as np
+        from matplotlib import cm
+
+        N = args.repeat_factor
+        F_v = sampled.shape[1]
+        sampled_nbf = sampled.view(N, 1, F_v, *sampled.shape[2:]).float().clamp(0, 1)
+        mean_video = sampled_nbf.mean(dim=0)[0]                 # (F, 3, H, W)
+        var_map = sampled_nbf.std(dim=0).mean(dim=2)[0]          # (F, H, W)  per-pixel std
+        # Save raw std tensor (un-normalized) for any downstream re-rendering.
+        torch.save(var_map.detach().cpu(), out_dir / "variance.pt")
+
+        vm_min = var_map.amin()
+        vm_max = var_map.amax()
+        var_norm = (var_map - vm_min) / (vm_max - vm_min + 1e-8)   # (F, H, W) in [0,1]
+
+        # Colorized (viridis) variance map — primary visualization.
+        cmap = cm.get_cmap("viridis")
+        var_rgba = cmap(var_norm.detach().cpu().numpy())             # (F, H, W, 4)
+        var_rgb = torch.from_numpy(var_rgba[..., :3]).permute(0, 3, 1, 2).float()
+        save_image_video(
+            images=var_rgb,
+            indices=torch.arange(0, F_v),
+            output_dir=out_dir,
+            name="variance",
+            save_img=False,
+            save_video=True,
+            fps=args.fps,
+        )
+
+        # Grayscale variance map — useful when downstream tooling wants the
+        # raw scalar field without a colormap baked in. Same min-max
+        # normalization as the colored version so both share the [0,1] range.
+        var_gray = var_norm.detach().cpu().unsqueeze(1).expand(-1, 3, -1, -1).float()
+        save_image_video(
+            images=var_gray,
+            indices=torch.arange(0, F_v),
+            output_dir=out_dir,
+            name="variance_gray",
+            save_img=False,
+            save_video=True,
+            fps=args.fps,
+        )
+
+        print(f"[stage1] saved variance videos → {out_dir / 'variance.mp4'}, "
+              f"{out_dir / 'variance_gray.mp4'} (std range [{vm_min.item():.4g}, {vm_max.item():.4g}])")
+        print(f"[stage1] saved raw variance tensor → {out_dir / 'variance.pt'}")
+
+        # The `coarse.mp4` saved below uses the per-pixel mean across the N
+        # samples, mirroring the paper's "mean image" panel next to variance.
+        save_video_source = mean_video
+    else:
+        save_video_source = sampled[0]
+
     save_image_video(
-        images=sampled[0].float().clamp(0, 1),
-        indices=torch.arange(0, sampled.shape[1]),
+        images=save_video_source.float().clamp(0, 1),
+        indices=torch.arange(0, save_video_source.shape[0]),
         output_dir=out_dir,
         name="coarse",
         save_img=False,

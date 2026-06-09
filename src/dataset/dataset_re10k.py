@@ -125,6 +125,12 @@ class DatasetRE10kCfg(DatasetCfgCommon):
     random_transform_extrinsics = False
     blacklist_path: Path | None = None
     val_seen: bool = False
+    # If set, restrict the dataset to a single scene key (mirrors the DL3DV
+    # `scene_id` field). Used by stage1 / variance-map inference scripts to
+    # render one specific scene without rebuilding meta.csv or providing an
+    # evaluation_video view sampler. Must be a valid key in `index.json` for
+    # the resolved (train/test) split.
+    scene_id: str | None = None
 
 
 class DatasetRE10k(Dataset):
@@ -184,6 +190,17 @@ class DatasetRE10k(Dataset):
             self.scenes = [s for s in view_sampler.index.keys() if s in self.map_dict and s in valid_keys]
         else:
             self.scenes = [s for s in self.map_dict.keys() if s in valid_keys]
+        # Single-scene restriction (DL3DV-style `scene_id` mirror). Done after
+        # blacklist + valid_keys filtering so a typo in scene_id surfaces
+        # immediately rather than silently picking an unrelated scene.
+        if cfg.scene_id is not None:
+            if cfg.scene_id not in self.scenes:
+                raise ValueError(
+                    f"scene_id={cfg.scene_id!r} not found in RE10K split "
+                    f"(stage_subdir={stage_subdir}). Check index.json + blacklist.csv."
+                )
+            print(f"\n\nUsing single RE10K scene: {cfg.scene_id}\n\n")
+            self.scenes = [cfg.scene_id]
         self.chunks = [root / self.map_dict[s] for s in self.scenes]
         self.root = root
 

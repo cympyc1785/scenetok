@@ -12,6 +12,7 @@ from .dataset_dl3dv import DatasetDL3DV, DatasetDL3DVCfg
 from .dataset_re10k import DatasetRE10k, DatasetRE10kCfg
 from .dataset_latent import DatasetLatent, DatasetLatentCfg
 from .dataset_davis import DatasetDAVIS, DatasetDAVISCfg
+from .dataset_dynamicverse import DatasetDynamicverse, DatasetDynamicverseCfg
 
 
 
@@ -20,15 +21,16 @@ DATASETS: dict[str, Dataset] = {
     "dl3dv": DatasetDL3DV,
     "latent": DatasetLatent,
     "davis": DatasetDAVIS,
+    "dynamicverse": DatasetDynamicverse,
 }
 
 
 DatasetCfg = (
-    DatasetDL3DVCfg 
+    DatasetDL3DVCfg
     | DatasetLatentCfg
     | DatasetRE10kCfg
     | DatasetDAVISCfg
-
+    | DatasetDynamicverseCfg
 )
 
 

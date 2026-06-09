@@ -1,0 +1,151 @@
+# @package _global_
+#
+# Wan TI2V 5B + scene tokens + camera, both routed through the AC3D-style
+# parallel ControlNet branch, trained on WorldTraj/dynamicverse (excluding
+# dynpose-100k). Mirrors `scenetok_va-wan-ti2v_dl3dv.yaml` but swaps:
+#   - dataset: dynamicverse (single inpaint_result.mp4 used for both context
+#     and target; context cropped to 256×448 to match the pretrained scene
+#     compressor, target at 480×832 for the denoiser)
+#   - compressor.ckpt_path: 256×448-finetuned scene perceiver, frozen
+#   - denoiser.scene_input_type / camera_input_type: both `controlnet`
+#   - view_sampler: chunk_targets=false, chunk_index_gap=1, offset=0 — Wan-VAE
+#     temporal_downsample=4 but no 4N+1 chunk packing (short clips ~50f)
+#   - no `scale_context_focal_by_256` (dynamicverse cameras already in pixel
+#     units for the rendered resolution; no legacy DL3DV bug-compat needed)
+
+defaults:
+  - override /dataset: dynamicverse
+  - override /dataset/view_sampler: caption_window
+  - override /model/scheduler: rf
+  - override /model/denoiser: wan_ti2v_5b
+  - override /model/autoencoders/context: va
+  - override /model/autoencoders/target: wan
+  - override /model/compressor: mv_B1
+  - override /model/compressor/camera: ray
+  - override /model/compressor/camera/embedding: lvsm
+
+dataset:
+  root: ./WorldTraj/dynamicverse
+  context_shape: [256, 448]
+  target_shape: [480, 832]
+
+  view_sampler:
+    num_context_views: 12
+    num_target_views: 10
+    # dynamicverse prompts file is named `prompts.json` (single-window per
+    # scene with `frame_idx: [0, N]`). Override the caption_window default
+    # of `prompts_37.json` (DL3DV convention).
+    prompts_filename: prompts.json
+    # caption_window defaults: temporal_downsample=4, offset=1, chunk_targets=false.
+    # V_pixel per scene = 1 + (num_target_views-1)*td = 1 + 9*4 = 37 raw frames.
+
+data_loader:
+  train:
+    batch_size: 4
+  val:
+    standard:
+      shuffle: false
+      batch_size: 4
+      max_batches: 4
+      num_workers: 4
+      seed: 0
+      interval: 5000
+      persistent_workers: false
+
+val:
+  video_length: 37
+  window_shift: 5
+
+sampler:
+  clean_targets: 5
+
+freeze:
+  denoiser: false
+  compressor: true
+  autoencoder: true
+
+model:
+  text_encoder: null
+
+  scheduler:
+    sampling_type: random_uniform
+    num_inference_steps: 50
+    kwargs:
+      weighting: shifted
+      timestep_shift: 8
+
+  denoiser:
+    name: wan_ti2v_5b
+    model_root: src/model/DiffSynth-Studio/Wan2.2/Wan2.2-TI2V-5B
+    dit_pattern: diffusion_pytorch_model*.safetensors
+    text_encoder_path: null
+    tokenizer_path: null
+    seq_len: 512
+    clean: whitespace
+    gradient_checkpointing: true
+    # `scene_input_type` / `camera_input_type` / `condition_latents_input_type`
+    # are frequently swapped across experiments → leave them to the shell.
+    ac3d_num_layers: 2
+    camera_context_spatial_pool: 16
+    input_shape: [30, 52]
+    num_target_split: 2
+    ckpt_path: null
+    load_strict: true
+    camera:
+      name: ray
+      input_shape: [30, 52]  # latent-domain controlnet — rays at latent grid
+      normalize: false
+      origin_first: false
+      scale: [1.0, 1.0]
+      embedding:
+        name: time_embed
+        in_channels: 6
+        dropout_prob: 0.0
+        fourier: true
+        freq_origin: 15
+        freq_direction: 15
+    # `lora.*` (enabled/checkpoint/rank/...) is also shell-side — easy to flip
+    # between LoRA-on / off-and-full-finetune / resume-from-ckpt.
+
+  compressor:
+    ckpt_path: checkpoints/va-wan_dl3dv_256x448.ckpt
+    load_strict: false
+    kl_weights: [0.0, 0.0]
+    input_shape: [16, 28]
+    num_scene_tokens: 1024
+    causal_self_atten: false
+    gradient_checkpointing: false
+    token_dim: 64
+    init_large: true
+    camera_conditioning: adaLN
+    scene_token_projection: kl
+    mask_context: false
+    camera:
+      input_shape: [128, 224]
+      embedding:
+        patch_size: 16
+    kwargs:
+      use_rope_2d: true
+      use_rope_3d: false
+      patch_size: 2
+
+trainer:
+  max_steps: 5_000_001
+  val_check_interval: 5000
+  task_steps: null
+  accumulate_grad_batches: 1
+  gradient_clip_val: 0.1
+  precision: bf16-mixed
+
+optimizer:
+  name: AdamW
+  lr: 1.0e-4
+  scale_lr: false
+  milestones: [2000]
+  scheduler:
+    - name: LinearLR
+      frequency: 1
+      interval: step
+      kwargs:
+        start_factor: 5.e-4
+        total_iters: 2000

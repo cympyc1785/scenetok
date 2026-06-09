@@ -1,6 +1,7 @@
 import random
 from copy import copy
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Literal
 
 import numpy as np
@@ -152,6 +153,15 @@ class DataModule(LightningDataModule):
             dataset_cfg = copy(self.dataset_cfg)
             if dataset_cfg.name in {"dl3dv", "re10k"}:
                 dataset_cfg.val_seen = key != "unseen"
+            elif dataset_cfg.name == "dynamicverse":
+                # Route train + val.standard to the "seen" pool (all subdatasets
+                # except `unseen_subdatasets`); val.unseen pulls from the held-out
+                # `unseen_subdatasets` only. Each loader gets a fixed eval index
+                # for reproducible context/target indices.
+                dataset_cfg.val_seen = key != "unseen"
+                dataset_cfg.evaluation_index_path = Path(
+                    f"assets/evaluation_index/dynamicverse_{key}.json"
+                )
             dataset = get_dataset(dataset_cfg, "val", self.step_tracker, generator, force_shuffle=False)
             dataset = self.dataset_shim(dataset, "val")
             validation_length = cfg.batch_size * cfg.max_batches if cfg.max_batches > 0 else len(dataset)

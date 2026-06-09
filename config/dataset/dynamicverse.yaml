@@ -1,0 +1,60 @@
+defaults:
+  - view_sampler: bounded
+
+name: dynamicverse
+root: null  # set to e.g. ./WorldTraj/dynamicverse
+
+# Match Wan VAE temporal downsample (4) but don't enforce Wan-chunked 4N+1
+# target layout — dynamicverse clips are short and arbitrary length so we
+# want the sampler to pick contiguous latent indices without chunk packing.
+view_sampler:
+  temporal_downsample: 4
+  chunk_targets: false
+
+shape: [256, 256]
+# Optional per-view shape overrides. Use these when context (for the scene
+# compressor) and target (for the denoiser) need different spatial layouts.
+# When null, both fall back to `shape`.
+context_shape: null
+target_shape: null
+precomputed_latents:
+  context: false
+  target: false
+
+augment: false
+cameras_are_circular: false
+fps: 10
+
+# Sub-datasets under `root/` to skip when collecting scenes. `dynpose-100k` and
+# `logs` are excluded by default per the dataset's user spec.
+excluded_subdatasets:
+  - dynpose-100k
+  - logs
+
+# Per-scene files
+camera_file: cameras.json
+video_name: inpaint_result.mp4
+# When set, target views come from this video instead of `video_name`.
+# Example: video_name=inpaint_result.mp4 (background), target_video_name=
+# video_input.mp4 (original with dynamic objects).
+target_video_name: null
+prompt_file: prompts.json
+prompt_key: prompt_scene
+# Prompt loading mode: "window_dict" (prompts.json, default) or
+# "category_first" (category/category.json → reasoning[dynamic[0]]).
+prompt_style: window_dict
+category_file: category/category.json
+# Drop scenes whose prompt file lacks a usable value. Needed for
+# text-conditioned training: default_collate raises (or silently loses the
+# key) when some samples in a batch have `sample["text"]` and others don't.
+require_prompt: true
+# Train / val split — DAVIS held out for unseen.
+unseen_subdatasets:
+  - DAVIS
+val_seen: true
+evaluation_index_path: null
+
+# `cameras.json` stores rotation + position as a camera-to-world transform.
+camera_rotation_is_world_to_camera: false
+baseline_epsilon: 1e-3
+make_baseline: false
