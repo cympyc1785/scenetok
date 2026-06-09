@@ -10,30 +10,43 @@ Dynamic video generation with scene tokens. Built on top of SceneTok (CVPR '26):
 
 ## Commands
 
-이 레포는 두 개의 평행한 학습 라인이 동시에 존재한다. 작업 대상이 어느 쪽인지 먼저 확인할 것.
+이 레포는 두 개의 평행한 학습 라인이 동시에 존재한다. 작업 대상이 어느 쪽인지 먼저 확인할 것. **`f65f87d "Organize scripts" (2026-06-04)` 이후 학습/추론 셸들은 `scripts/train_scenetok/`와 `scripts/train_ti2v/` 하위로 이동됨.** root에 남아 있는 것은 `train_scenetok.sh` (RE10K va-vdc scratch baseline), `train_scenegen.sh`, `train_dynvidgen{,_exp_1}.sh`, plus eval/infer/convert/preprocess 셸들 + `fast_infer_t2v.sh`, `infer_pure_ti2v.sh`, `infer_lightningdit_reco.sh`.
 
-**A. SceneTok (scene autoencoder) 학습 — 현재 active focus**
-- `bash train_scenetok.sh` — RE10K va-vdc scratch (`scenetok_va-vdc_re10k_scratch`)
-- `bash train_scenetok_re10k_256.sh` — RE10K wan-wan 256 scratch
-- `bash train_scenetok_re10k_vavdc.sh` — RE10K va-vdc 256 scratch
-- `bash train_scenetok_dl3dv_256.sh` — DL3DV va-wan 256 scratch (large)
-- `bash train_scenetok_dl3dv_wan_256.sh` — DL3DV wan-wan 256 scratch (large)
-- `bash train_scenetok_dl3dv_wan_480.sh` — DL3DV wan-wan 480 scratch (large)
-- `bash train_scenetok_chunked.sh` — DL3DV wan-wan 480 chunked-target ablation
-- `bash train_dynvidgen.sh` / `train_dynvidgen_exp_1.sh` — DAVIS dynvid finetune (`scenetok_va-wan_shift8_davis_finetuned_dynvid`); data root `./WorldTraj/dynamicverse/DAVIS`
+**A. SceneTok (scene autoencoder) 학습** — `scripts/train_scenetok/`
+- `train_scenetok_re10k_256.sh` → `scenetok_va-wan_re10k_256_scratch` (RE10K va-wan 256 scratch)
+- `train_scenetok_re10k_vavdc.sh` → `scenetok_va-vdc_re10k_256_scratch` (RE10K va-vdc 256 scratch)
+- `train_scenetok_dl3dv_256.sh` → `scenetok_va-wan_dl3dv_256_scratch_aligned` (DL3DV va-wan 256x448 scratch, large)
+- `train_scenetok_dl3dv_256_finetune.sh` → `scenetok_va-wan_dl3dv_256_finetune_large` (DL3DV va-wan 256x448 finetune from `va-wan_dl3dv.ckpt`)
+- `train_scenetok_dl3dv_480_finetune.sh` → `scenetok_va-wan_dl3dv_480_finetune_large` (DL3DV va-wan 480x832 finetune from `va-wan_dl3dv.ckpt`)
+- `train_scenetok_dl3dv_256-480_finetune.sh` / `_aggressive.sh` → ctx 256x448 / tgt 480x832 비대칭 finetune (small)
+- `train_scenetok_dl3dv_wan_256.sh` / `train_scenetok_dl3dv_wan_480.sh` — DL3DV wan-wan scratch (large)
+- `train_scenetok_chunked.sh` — DL3DV wan-wan 480 chunked-target ablation
+- `bash train_scenetok.sh` (root) — RE10K va-vdc scratch baseline (`scenetok_va-vdc_re10k_scratch`)
+- `bash train_dynvidgen.sh` / `train_dynvidgen_exp_1.sh` (root) — DAVIS dynvid finetune; data root `./WorldTraj/dynamicverse/DAVIS`
 
-**B. TI2V/T2V denoiser (scene-token-conditioned video gen)**
-- Single-view recon overfit: `bash train_ti2vgen_recon_overfit.sh` / `_interp.sh`; validate with `val_ti2vgen_recon_overfit.sh`
-- Full TI2V/T2V (non-overfit): `bash train_t2vgen.sh` (DAVIS, `scenetok_va-wan-ti2v_davis`), `bash train_t2vgen_recon.sh` (DL3DV, `scenetok_va-wan-ti2v_dl3dv`)
-- 14B variant: `bash train_t2vgen_14B_recon_overfit.sh`
-- Inference: `bash infer_t2vgen_recon.sh` (recon-style), `bash infer_t2vgen_text.sh` (text-conditioned)
-- Fast standalone inference: `bash fast_infer_t2v.sh` (`scripts/fast_infer_t2v.py`) — Hydra/Lightning을 우회해 `exp/<exp_name>/.hydra/config.yaml` + `last.ckpt`를 직접 로드, 한 scene에 `{cfg, 1.0}×{prompt, ""}` 4 combo를 mp4로 sampling
-- Smoke / load test: `bash load_ti2v_test.sh`
+**B. TI2V/T2V denoiser (scene-token-conditioned video gen)** — `scripts/train_ti2v/`
+- Recon-overfit base: `train_ti2vgen_recon_overfit.sh` (256-480) / `_256_finetuned.sh` / `_480.sh` / `_480_finetuned.sh` / `_interp.sh`
+- Recon-overfit ablations: `_256_finetuned_ac3d.sh` (scene_new_ca + ac3d camera), `_256_finetuned_ac3d_full_controlnet.sh` (scene controlnet + camera controlnet_feedback), `_256_finetuned_adaln_cam.sh`, `_256_finetuned_cam_concat_scene_ca_lora.sh`, `_256_finetuned_depth.sh` (first_frame_depth), `_256_finetuned_new_cam.sh` (wan_control camera), `_256_finetune_all.sh` / `_not_aggressive.sh` (encoder도 trainable)
+- Full TI2V/T2V (non-overfit): `train_t2vgen.sh` (DAVIS, `scenetok_va-wan-ti2v_davis`), `train_t2vgen_recon.sh` (DL3DV, `scenetok_va-wan-ti2v_dl3dv`)
+- 14B variant: `train_t2vgen_14B_recon_overfit.sh`
+- Inference: `infer_t2vgen_recon.sh` / `infer_t2vgen_text.sh` (recon-style / text-cond), `infer_ti2vgen.sh` / `_recon_480.sh`
+- Eval: `eval_ti2vgen_recon_480.sh` (학습 train 후 같은 split val)
+- Smoke / load test: `load_ti2v_test.sh`
+- Validation: `val_ti2vgen_recon_overfit.sh`
 
-**기타**
+**B-2. Fast standalone TI2V inference (root)**
+- `bash fast_infer_t2v.sh` (`scripts/fast_infer_t2v.py`) — Hydra/Lightning을 우회해 `exp/<exp_name>/.hydra/config.yaml` + `last.ckpt`를 직접 로드, 한 scene에 `{cfg, 1.0}×{prompt, ""}` 4 combo를 mp4로 sampling
+- `bash infer_pure_ti2v.sh` — pure TI2V (scene token 없음) baseline 비교용
+
+**C. lightningDiT → ReCo 2-stage 파이프라인 (root, 추론 전용)**
+- `bash infer_lightningdit_reco.sh` — Stage 1 SceneTok lightningDiT coarse render → Stage 2 ReCo (Wan2.1-VACE-1.3B + LoRA) edit. 두 stage가 서로 다른 `diffsynth` 패키지(메인 repo vs ReCo 벤더링)를 써서 같은 Python 프로세스에 임포트하면 충돌 → sequential subprocess 분리.
+- 셸 안에 4 케이스 (256+upscale480 / 256 native / 480 native / published va-vdc 256x256) `run_pipeline` 함수로 묶임.
+
+**기타 (root)**
 - Eval: `bash eval_scenetok_{re10k,dl3dv}.sh`, inference: `bash infer_scenetok_{re10k,dl3dv,davis}.sh`
 - Latent precompute: `bash convert_{dl3dv,re10k}_{vavae,videodc}.sh`
 - Dataset cache precompute (`mode=preprocess_data`): `bash preprocess_{dl3dv,re10k}.sh`
+- Custom eval: `python scripts/eval_compare_256upscale_vs_480.py` — DL3DV standard/unseen 140 scene 두 ckpt 비교 (per-scene CSV + summary.json)
 
 All shells call `python -m src.main +experiment=<config> ...` (Hydra). `src.main` is the standard entry; `src.main_scene` is used only for SceneGen.
 
@@ -111,6 +124,7 @@ Pretrained weights live under `checkpoints/` (downloaded SceneTok/VAE/SceneGen w
 - 기존 (published) config 수정 금지. 새 실험은 새 config 파일 — drop it under `config/experiment/custom/`.
 - `src/main_scene.py` 경로(SceneGen)는 이 브랜치의 TI2V 작업과 무관하니 함께 건드리지 말 것.
 - `checkpoints/` 폴더에 학습 산출물 저장 금지. 우리 결과물은 `my_checkpoints/`.
+- GPU 4~7 사용 금지. `CUDA_VISIBLE_DEVICES`는 항상 0~3 범위에서만 지정할 것.
 
 ## Coding conventions
 
@@ -124,6 +138,8 @@ Pretrained weights live under `checkpoints/` (downloaded SceneTok/VAE/SceneGen w
 이 프로젝트는 [Keep a Changelog](https://keepachangelog.com/) 규약을 따른다.
 
 코드를 변경할 때마다 `CHANGELOG.md`의 `[Unreleased]` 섹션에 항목을 추가할 것.
+
+실험할 때마다 실험한 내용 단위로 notion api인 `/home/korea_kh63/.config/notion/notion-token`를 이용해서 정리해줘.
 
 ## 작업 흐름
 

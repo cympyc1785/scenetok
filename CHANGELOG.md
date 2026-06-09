@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+- `src/model/diffusion_wrapper.py`: 기존 `set_denoiser_input_shape_from_target` (target_shape → denoiser.input_shape 자동 derive)을 일반화한 **`derive_shape_dependent_fields`** 도입. `dataset.context_shape`/`target_shape`이 바뀔 때 6개 의존 필드가 모두 자동 갱신됨:
+  - `denoiser.input_shape` = `target_shape // ae_spatial_compression(target_ae)`
+  - `denoiser.camera.input_shape` = mode 분기:
+    - **latent-domain** (`channel_concat`/`controlnet`/`controlnet_feedback`/`ac3d`): `latent_shape` (rays가 latent grid에서 channel-concat돼서)
+    - **pixel/2-domain** (`recam_attention`/`cross_attention`/`new_cross_attention`/`adaln`/`wan_control`/`none`): `target_shape // 2` (LVSM patch embed 또는 SimpleAdapter의 내부 16x downsample 가정)
+  - `denoiser.camera.embedding.patch_size` = `cam_input // latent_shape` (pixel-domain 한정, latent-domain은 yaml에 위임)
+  - `compressor.input_shape` = `context_shape // ae_spatial_compression(context_ae)`
+  - `compressor.camera.input_shape` = `context_shape // 2`
+  - `compressor.camera.embedding.patch_size` = compressor camera token grid이 `compressor.input_shape // compressor.kwargs.patch_size`와 일치하도록.
+  변경된 값만 cyan 로그로 표시 + 일치하면 silent. 기존 22개 SceneTok exp config은 전부 일치(0 override), TI2V/T2V 46개 중 3개는 실제 yaml staleness 발견되어 자동 수정(`_256_scene_ca_recam_*`, 14B exp — target=256x256인데 yaml에 480 base 값이 stale로 남아있던 케이스). `set_denoiser_input_shape_from_target`는 back-compat 알리아스로 유지. 호출은 `DiffusionWrapper.__init__`에서 자동 (기존 위치 그대로). KNOWN_BUGS의 `scale_*_focal_by_256` legacy bug-compat 플래그는 의도적으로 건드리지 않음 (학습된 ckpt 호환 깨질 위험).
+
 ### Added
 - `scripts/eval_compare_256upscale_vs_480.py`: SceneTok lightningDiT 두 ckpt(`scenetok_va-wan_dl3dv_480_finetune_large`와 `scenetok_va-wan_dl3dv_256_finetune_large`)를 DL3DV `standard`/`unseen` evaluation index(`assets/evaluation_index/dl3dv_c16_37_<split>.json`) 140 scene씩 양쪽에서 비교 평가하는 스크립트. 256 ckpt 출력은 `F.interpolate(mode="bilinear")`로 480×832까지 upscale 후 480 GT와 비교. `DiffusionWrapper`를 `.hydra/config.yaml`+`last.ckpt`에서 직접 instantiate(stage1과 동일 패턴), 각 case마다 model의 native target_shape로 sampling → GT용으로는 `target_shape=[480,832]`로 override한 별도 데이터셋 인스턴스를 평행 iterate(같은 eval_index + val_seen이면 chunk 순서 deterministic). 메트릭은 `DiffusionWrapper.metric`(공유 `Metric()`) 재사용해서 학습-time validation과 동일 dtype/구현 — per-scene + dataset-level PSNR/SSIM/LPIPS와 dataset-level FID/FVD. 출력: `results/eval_compare_256upscale_vs_480/per_scene_<case>_<split>.csv` + `summary.json` (각 case 완료 직후 stream 저장).
 

@@ -72,23 +72,196 @@ def get_target_latent_shape(dataset_cfg: DatasetCfg, model_cfg: ModelCfg) -> lis
         )
     return [h // spatial_compression_ratio, w // spatial_compression_ratio]
 
-def set_denoiser_input_shape_from_target(dataset_cfg: DatasetCfg, model_cfg: ModelCfg) -> None:
-    target_latent_shape = get_target_latent_shape(dataset_cfg, model_cfg)
-    if target_latent_shape is None:
-        return
+def _get_ae_spatial_compression(ae_cfg) -> int | None:
+    """Spatial downsample factor for a configured autoencoder. None = unknown."""
+    if ae_cfg is None:
+        return None
+    name = ae_cfg.name
+    if name in {"wan", "wan_single"}:
+        return 8 if ae_cfg.kwargs.latent_channels == 16 else 16
+    if name == "va":
+        return 16
+    if name == "video_dc":
+        return ae_cfg.kwargs.spatial_compression_ratio
+    return None
 
-    old_shape = model_cfg.denoiser.input_shape
-    old_shape_list = list(old_shape) if isinstance(old_shape, (list, tuple)) else [old_shape, old_shape]
-    if old_shape_list == target_latent_shape:
-        return
 
-    print(
-        cyan(
-            "Setting denoiser input_shape from dataset target_shape: "
-            f"{old_shape} -> {target_latent_shape}"
+def get_context_latent_shape(dataset_cfg: DatasetCfg, model_cfg: ModelCfg) -> list[int] | None:
+    """Mirror of get_target_latent_shape for the context autoencoder."""
+    context_shape = getattr(dataset_cfg, "context_shape", None)
+    if context_shape is None:
+        return None
+    ratio = _get_ae_spatial_compression(getattr(model_cfg.autoencoders, "context", None))
+    if ratio is None:
+        return None
+    h, w = context_shape
+    if h % ratio != 0 or w % ratio != 0:
+        raise ValueError(
+            f"context_shape must be divisible by the context autoencoder spatial "
+            f"compression ratio: context_shape={context_shape}, ratio={ratio}"
         )
+    return [h // ratio, w // ratio]
+
+
+def _override_if_diff(parent, attr: str, new_value, label: str) -> None:
+    """Set parent.<attr> = new_value and print a cyan diff log if it differed."""
+    old_value = getattr(parent, attr)
+    old_list = list(old_value) if isinstance(old_value, (list, tuple)) else old_value
+    new_list = list(new_value) if isinstance(new_value, (list, tuple)) else new_value
+    if old_list == new_list:
+        return
+    print(cyan(f"Setting {label}: {old_value} -> {new_value}"))
+    setattr(parent, attr, new_value)
+
+
+# Camera input modes that consume raw rays at the *latent* grid (i.e. rays are
+# channel-concatted into the main `patch_embedding` or its ac3d-branch clone).
+# For these, `camera.input_shape == latent_shape` (= target_shape // vae_down).
+#
+# Other modes — `wan_control` (SimpleAdapter does its own 16× downsample),
+# `recam_attention` (uses extrinsics only, ignores rays), `cross_attention` /
+# `new_cross_attention` / `adaln` (overridden to `[pool_size, pool_size]` at
+# model init in wan_ti2v.py) — follow the pixel/2 convention by default.
+_LATENT_DOMAIN_CAMERA_MODES = {
+    "channel_concat",
+    "controlnet",
+    "controlnet_feedback",
+    "ac3d",
+}
+
+
+def _derive_camera_shapes(
+    denoiser_cfg,
+    *,
+    pixel_shape: list[int],
+    latent_shape: list[int],
+    label_prefix: str,
+) -> None:
+    """Derive `camera.input_shape` and `camera.embedding.patch_size` so that the
+    camera tokens line up with the latent grid.
+
+    Two conventions, picked by `camera_input_type`:
+
+    - **pixel-domain** (default for `recam_attention` / `cross_attention` /
+      `new_cross_attention`): ray map at half pixel resolution, LVSM patch
+      embed so `input_shape // patch_size == latent_shape`. With `vae_down=16`
+      this gives `patch_size = 8`.
+
+    - **latent-domain** (`channel_concat`, `controlnet`, `controlnet_feedback`,
+      `ac3d`, `adaln`, `wan_control`): raw rays already at latent grid, so
+      `camera.input_shape == latent_shape`. `patch_size` (if any) is left to
+      the yaml — these modes use ad-hoc adapters rather than LVSM.
+
+    Note: `recam_attention` is later re-overridden at runtime inside
+    `T2VWrapper`/`wan_ti2v.py` (`camera_cfg.input_shape = [pool_size, pool_size]`),
+    so the value we set here for that mode is just a placeholder.
+    """
+    camera_cfg = getattr(denoiser_cfg, "camera", None)
+    if camera_cfg is None:
+        return
+
+    cam_mode = getattr(denoiser_cfg, "camera_input_type", None)
+    if cam_mode in _LATENT_DOMAIN_CAMERA_MODES:
+        if latent_shape[0] == 0:
+            return
+        _override_if_diff(
+            camera_cfg,
+            "input_shape",
+            list(latent_shape),
+            f"{label_prefix}.camera.input_shape (latent-domain, mode={cam_mode})",
+        )
+        return  # patch_size is mode-specific; leave to yaml.
+
+    # Pixel-domain (or unknown/none — treat as pixel-domain).
+    cam_input = [pixel_shape[0] // 2, pixel_shape[1] // 2]
+    if cam_input[0] == 0 or cam_input[1] == 0:
+        return
+    _override_if_diff(camera_cfg, "input_shape", cam_input, f"{label_prefix}.camera.input_shape")
+
+    emb_cfg = getattr(camera_cfg, "embedding", None)
+    if emb_cfg is None or not hasattr(emb_cfg, "patch_size"):
+        return
+    if latent_shape[0] == 0:
+        return
+    if cam_input[0] % latent_shape[0] != 0 or cam_input[1] % latent_shape[1] != 0:
+        raise ValueError(
+            f"{label_prefix}.camera: derived input_shape {cam_input} not divisible by "
+            f"latent grid {latent_shape}; can't derive patch_size."
+        )
+    derived_patch = cam_input[0] // latent_shape[0]
+    _override_if_diff(
+        emb_cfg, "patch_size", derived_patch, f"{label_prefix}.camera.embedding.patch_size"
     )
-    model_cfg.denoiser.input_shape = target_latent_shape
+
+
+def derive_shape_dependent_fields(dataset_cfg: DatasetCfg, model_cfg: ModelCfg) -> None:
+    """Auto-derive every `*.input_shape` (and the corresponding camera
+    `embedding.patch_size`) from `dataset.context_shape` / `dataset.target_shape`
+    and each autoencoder's spatial-compression ratio.
+
+    Backward compatible: a field is overridden only when it differs from the
+    derived value, and the change is logged in cyan. This catches yaml staleness
+    when shape settings get edited but downstream fields don't.
+
+    Target side (denoiser):
+      - `denoiser.input_shape`           = target_shape // target_ae_ratio
+      - `denoiser.camera.input_shape`    = target_shape // 2
+      - `denoiser.camera.embedding.patch_size` such that camera token grid ==
+        latent grid (typically 8 for vae_ratio=16).
+
+    Context side (compressor):
+      - `compressor.input_shape`         = context_shape // context_ae_ratio
+      - `compressor.camera.input_shape`  = context_shape // 2
+      - `compressor.camera.embedding.patch_size` such that camera token grid
+        equals `compressor.input_shape // compressor.kwargs.patch_size`
+        (so compressor camera tokens align with compressor video tokens).
+    """
+    # ── Target / denoiser side ──────────────────────────────────────────
+    target_latent = get_target_latent_shape(dataset_cfg, model_cfg)
+    if target_latent is not None:
+        _override_if_diff(model_cfg.denoiser, "input_shape", target_latent, "denoiser.input_shape")
+        _derive_camera_shapes(
+            model_cfg.denoiser,
+            pixel_shape=list(dataset_cfg.target_shape),
+            latent_shape=target_latent,
+            label_prefix="denoiser",
+        )
+
+    # ── Context / compressor side ───────────────────────────────────────
+    compressor_cfg = getattr(model_cfg, "compressor", None)
+    if compressor_cfg is None:
+        return
+    context_latent = get_context_latent_shape(dataset_cfg, model_cfg)
+    if context_latent is None:
+        return
+    _override_if_diff(compressor_cfg, "input_shape", context_latent, "compressor.input_shape")
+
+    # compressor.kwargs.patch_size patches the latent further; the camera token
+    # grid must equal latent_grid // compressor_patch_size.
+    cmp_patch = getattr(getattr(compressor_cfg, "kwargs", None), "patch_size", 1)
+    cmp_token_grid = [context_latent[0] // cmp_patch, context_latent[1] // cmp_patch]
+    cam_cfg = getattr(compressor_cfg, "camera", None)
+    if cam_cfg is not None:
+        cam_input = [dataset_cfg.context_shape[0] // 2, dataset_cfg.context_shape[1] // 2]
+        if cam_input[0] > 0 and cam_input[1] > 0:
+            _override_if_diff(cam_cfg, "input_shape", cam_input, "compressor.camera.input_shape")
+            emb_cfg = getattr(cam_cfg, "embedding", None)
+            if emb_cfg is not None and hasattr(emb_cfg, "patch_size") and cmp_token_grid[0] > 0:
+                if cam_input[0] % cmp_token_grid[0] != 0 or cam_input[1] % cmp_token_grid[1] != 0:
+                    raise ValueError(
+                        f"compressor.camera: input_shape {cam_input} not divisible by "
+                        f"compressor camera token grid {cmp_token_grid}."
+                    )
+                derived_patch = cam_input[0] // cmp_token_grid[0]
+                _override_if_diff(
+                    emb_cfg, "patch_size", derived_patch, "compressor.camera.embedding.patch_size"
+                )
+
+
+def set_denoiser_input_shape_from_target(dataset_cfg: DatasetCfg, model_cfg: ModelCfg) -> None:
+    """Back-compat alias. The actual derivation now also covers camera and
+    compressor shapes — see `derive_shape_dependent_fields`."""
+    derive_shape_dependent_fields(dataset_cfg, model_cfg)
 
 class DiffusionWrapper(LightningModule):
     logger: Optional[WandbLogger]
