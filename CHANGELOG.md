@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 - `config/experiment/custom/scenetok_va-wan-ti2v_dynamicverse.yaml`: val OOM (step 5000 validation 진입 직후 Wan VAE decode가 +18 GiB alloc 실패) 해결 — `data_loader.val.unseen` 블록 신규 추가 (기존엔 standard만 있어서 unseen이 default `batch_size=16` 상속 → 16 DAVIS scene을 한 번에 37 × 480×832 decode). 양쪽 모두 `batch_size=1`로 내리고 `max_batches: 4 → 8`로 늘려 FVD가 N≥2 sample 확보하도록.
+
+### Added
+- `scripts/eval_context_view_count_va-wan_dl3dv.py`: published `checkpoints/va-wan_dl3dv.ckpt` (`scenetok_va-wan_shift4_dl3dv_finetuned`, 256×256, dl3dv `c16_37_standard` eval index)로 context view 개수 N ∈ {1,2,3,4,8,12,16}에 따른 재구성 성능 sweep. 16-view 풀-batch를 1회 sampling 한 뒤 `slice_context`로 N개 뷰만 잘라 compressor에 넣고 같은 RNG로 denoise → mp4(`recon_N=*.mp4`)+per-scene `metrics.csv`+global `per_scene.csv`/`summary.csv`(PSNR/SSIM/LPIPS) 저장. 첫 8 scene 사용. `--context_sampling {first,uniform}`로 뷰 선택 전략 분기 — `first`는 인접한 처음 N개, `uniform`은 `np.linspace(0, V-1, N).round()`로 16뷰에 균등 분포. uniform이 적은 N에서 first 대비 +1.5~+2.6 PSNR로 우수(N=1, N=16에서는 동일).
 - `src/model/metrics.py:compute_fvd`: pred_list/gt_list가 비거나 N<2면 NaN tensor 대신 **`None` 반환** → `on_validation_end`의 `if value is not None` 가드와 통합돼 wandb에 NaN/inf 안 찍힘. scipy `sqrtm`이 rank-deficient cov에서 무한 스핀하는 CLAUDE.md gotcha 회피. 추가로 `frechet_video_distance` 결과가 non-finite여도 `None` 반환.
 - `src/model/metrics.py:Metric.forward`: 모든 `compute_<key>(...)` 결과를 검사해서 scalar tensor가 non-finite면 `None`으로 변환 (PSNR/SSIM/LPIPS도 동일 가드). 한 줄 `[Metric] skip <key>: non-finite ...` console log.
 - `src/model/diffusion_wrapper.py:on_validation_end`: `full_sequence_metrics` 로깅 루프에 `if value is None: continue` 가드 추가 (기존엔 NaN 그대로 wandb로 보냄, `general_metrics`엔 이미 None 가드 있었음).
