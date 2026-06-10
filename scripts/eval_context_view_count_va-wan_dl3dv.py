@@ -153,13 +153,14 @@ def build_wrapper_and_loader(args):
                 "dataset=dl3dv",
                 "mode=test",
                 "wandb.activated=false",
-                "~dataset.context_root",
-                "~dataset.target_root",
-                "~dataset.map_dict",
-                "dataset.root=./DATA/DL3DV/DL3DV-960",
             ],
         )
     OmegaConf.set_struct(cfg_dict, False)
+    # Swap to raw dataset (works for both latent-style and raw-style configs).
+    for key in ("context_root", "target_root", "map_dict"):
+        if key in cfg_dict.dataset:
+            del cfg_dict.dataset[key]
+    cfg_dict.dataset.root = "./DATA/DL3DV/DL3DV-960"
     cfg_dict.mode = "test"
     cfg_dict.wandb.activated = False
     cfg_dict.data_loader.test.num_workers = 0
