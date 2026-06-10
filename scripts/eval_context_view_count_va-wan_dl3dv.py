@@ -74,6 +74,24 @@ def parse_args():
              "`uniform` = evenly spread across all 16 (N=2 → [0, 15], N=4 → "
              "[0, 5, 10, 15], etc.) for fair coverage of the scene.",
     )
+    p.add_argument(
+        "--dataset",
+        default="dl3dv",
+        help="Dataset name (matches config/dataset/<name>.yaml).",
+    )
+    p.add_argument(
+        "--dataset_root",
+        default="./DATA/DL3DV/DL3DV-960",
+        help="Raw dataset root (replaces context_root/target_root latent paths).",
+    )
+    p.add_argument(
+        "--view_sampler_td",
+        type=int,
+        default=None,
+        help="Override view_sampler.temporal_downsample. Set to 1 on RE10K raw "
+             "mode — the unbounded sampler multiplies target indices by `td` "
+             "and produces OOB indices on short scenes otherwise.",
+    )
     p.add_argument("--num_scenes", type=int, default=8)
     p.add_argument("--context_shape", default="256,256")
     p.add_argument("--target_shape", default="256,256")
@@ -150,7 +168,7 @@ def build_wrapper_and_loader(args):
             config_name="main",
             overrides=[
                 f"+experiment={args.scenetok_experiment}",
-                "dataset=dl3dv",
+                f"dataset={args.dataset}",
                 "mode=test",
                 "wandb.activated=false",
             ],
@@ -160,7 +178,7 @@ def build_wrapper_and_loader(args):
     for key in ("context_root", "target_root", "map_dict"):
         if key in cfg_dict.dataset:
             del cfg_dict.dataset[key]
-    cfg_dict.dataset.root = "./DATA/DL3DV/DL3DV-960"
+    cfg_dict.dataset.root = args.dataset_root
     cfg_dict.mode = "test"
     cfg_dict.wandb.activated = False
     cfg_dict.data_loader.test.num_workers = 0
@@ -175,8 +193,13 @@ def build_wrapper_and_loader(args):
     cfg_dict.dataset.scene_id = None
     cfg_dict.dataset.context_shape = parse_shape(args.context_shape)
     cfg_dict.dataset.target_shape = parse_shape(args.target_shape)
-    # Lock the loader to the eval index's full 16 context views; we slice in-batch.
-    cfg_dict.dataset.view_sampler.num_context_views = 16
+    # Lock the loader to the eval index's full context-view list; we slice in-batch.
+    # When evaluation_index_path is set the view_sampler reads indices from the
+    # JSON so this knob is mostly cosmetic, but we still set it to max(N) so the
+    # internal max-view check (if any) stays consistent.
+    cfg_dict.dataset.view_sampler.num_context_views = max(parse_ints(args.num_context_views_list))
+    if args.view_sampler_td is not None:
+        cfg_dict.dataset.view_sampler.temporal_downsample = args.view_sampler_td
     cfg_dict.dataset.view_sampler.num_target_views = args.num_target_views
     cfg_dict.model.cfg_scale = args.scenetok_cfg_scale
     cfg_dict.model.scheduler.num_inference_steps = args.scenetok_inference_steps
@@ -274,7 +297,11 @@ def main():
 
     # ── Sweep N × scenes ────────────────────────────────────────────────────
     rows = []
+    V_max = cached[0][1]["context"]["extrinsics"].shape[1] if cached else 0
     for n in n_list:
+        if n > V_max:
+            print(f"\n[N={n}] skip — exceeds available context views V={V_max}")
+            continue
         print(f"\n{'='*72}\n[N={n}] sweeping {len(cached)} scenes\n{'='*72}")
         for scene_name, batch_dev, gt in cached:
             batch_n = slice_context(batch_dev, n, mode=args.context_sampling)
