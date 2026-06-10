@@ -62,7 +62,7 @@ class WanTI2V5BCfg:
     clean: str = "whitespace"
     gradient_checkpointing: bool = True
     condition_latents_input_type: Literal["none", "width", "channel", "temporal", "first_frame", "first_frame_random", "first_frame_depth", "first_frame_depth_soft"] = "none"
-    camera_input_type: Literal["none", "recam_attention", "cross_attention", "new_cross_attention", "adaln", "wan_control", "channel_concat", "controlnet", "controlnet_feedback"] | None = None
+    camera_input_type: Literal["none", "recam_attention", "cross_attention", "new_cross_attention", "adaln", "wan_control", "channel_concat", "controlnet", "controlnet_feedback", "controlnet_ac3d"] | None = None
     enable_recam_attention: bool | None = None
     camera_context_spatial_pool: int = 1
     scene_input_type: Literal["none", "cross_attention", "new_cross_attention", "latent_concat", "controlnet"] = "cross_attention"
@@ -109,6 +109,7 @@ class NewDiTBlock(nn.Module):
         eps: float = 1e-6,
         camera_input_type: str | None = None,
         scene_input_type: str = "none",
+        use_text_cross_attn: bool = True,
     ):
         super().__init__()
         self.dim = dim
@@ -116,10 +117,16 @@ class NewDiTBlock(nn.Module):
         self.ffn_dim = ffn_dim
         self.camera_input_type = camera_input_type or "none"
         self.scene_input_type = scene_input_type
+        self.use_text_cross_attn = use_text_cross_attn
 
         self.self_attn = SelfAttention(dim, num_heads, eps)
-        self.cross_attn = CrossAttention(
-            dim, num_heads, eps, has_image_input=has_image_input)
+        if self.use_text_cross_attn:
+            self.cross_attn = CrossAttention(
+                dim, num_heads, eps, has_image_input=has_image_input)
+        else:
+            # controlnet_ac3d 분기: ac3d 블록은 scene cross-attn만 가짐
+            # (text는 main DiT 분기에서만 처리). norm3도 같이 빠짐.
+            self.cross_attn = None
         self.use_scene_cross_attn = self.scene_input_type == "new_cross_attention"
         if self.use_scene_cross_attn:
             self.scene_cross_attn = CrossAttention(dim, num_heads, eps, has_image_input=False)
@@ -139,7 +146,10 @@ class NewDiTBlock(nn.Module):
             self.recam_projector = None
         self.norm1 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
         self.norm2 = nn.LayerNorm(dim, eps=eps, elementwise_affine=False)
-        self.norm3 = nn.LayerNorm(dim, eps=eps)
+        if self.use_text_cross_attn:
+            self.norm3 = nn.LayerNorm(dim, eps=eps)
+        else:
+            self.norm3 = None
         self.ffn = nn.Sequential(nn.Linear(dim, ffn_dim), nn.GELU(
             approximate='tanh'), nn.Linear(ffn_dim, dim))
         self.gate = GateModule()
@@ -151,6 +161,7 @@ class NewDiTBlock(nn.Module):
         has_image_input: bool,
         camera_input_type: str | None,
         scene_input_type: str,
+        use_text_cross_attn: bool = True,
     ) -> "NewDiTBlock":
         new_block = cls(
             has_image_input=has_image_input,
@@ -160,6 +171,7 @@ class NewDiTBlock(nn.Module):
             eps=block.norm1.eps,
             camera_input_type=camera_input_type,
             scene_input_type=scene_input_type,
+            use_text_cross_attn=use_text_cross_attn,
         ).to(device=block.modulation.device, dtype=block.modulation.dtype)
         new_block.load_state_dict(block.state_dict(), strict=False)
         # if new_block.use_scene_cross_attn:
@@ -208,7 +220,8 @@ class NewDiTBlock(nn.Module):
             self_attn = self.recam_projector(self_attn)
 
         x = self.gate(x, gate_msa, self_attn)
-        x = x + self.cross_attn(self.norm3(x), context)
+        if self.use_text_cross_attn:
+            x = x + self.cross_attn(self.norm3(x), context)
 
         if self.use_scene_cross_attn:
             input_x = self.norm4(x)
@@ -246,7 +259,7 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
             self.camera_input_type = "recam_attention" if cfg.enable_recam_attention else "none"
         # scene_input_type="controlnet"은 ControlNet(AC3D-style) 분기에 scene tokens을
         # (camera ray와 함께) 주입하는 모드 → 분기를 만드는 camera_input_type="controlnet"이 전제.
-        if self.scene_input_type == "controlnet" and self.camera_input_type not in ("controlnet", "controlnet_feedback"):
+        if self.scene_input_type == "controlnet" and self.camera_input_type not in ("controlnet", "controlnet_feedback", "controlnet_ac3d"):
             raise ValueError(
                 "scene_input_type='controlnet' requires camera_input_type='controlnet' "
                 "(scene tokens are injected into the AC3D-style controlnet branch). "
@@ -455,6 +468,64 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
             self.model.ac3d_fc_down = self.model.ac3d_fc_down.to(
                 device=ref_param.device, dtype=ref_param.dtype
             )
+        if self.camera_input_type == "controlnet_ac3d":
+            # AC3D paper VDiT-CC architecture (paper-faithful variant).
+            # 차이점 vs `controlnet`/`controlnet_feedback`:
+            #   1. Noise/latent은 main DiT에만 들어감. ac3d 분기는 latent를 직접 안 봄.
+            #   2. ctrl block i input = FC_main2ctrl(main_x_i) + cam_emb + ctrl_x_{i-1}
+            #      → main의 매 layer 출력을 ctrl이 흡수.
+            #   3. ctrl block output → zero-init Linear → main_x_i에 add → main block_{i+1} 입력.
+            #   4. ctrl block 내부: self_attn → scene_cross_attn (zero-init proj) → FFN
+            #      (text cross-attn 없음 — `use_text_cross_attn=False`).
+            # Camera embedding은 ray map을 main patch grid에 맞게 patchify해서 per-token으로
+            # 더해줌. ctrl block마다 같은 cam_emb를 더함 (per-layer 분리 X — 파라미터 절감).
+            ac3d_n = max(int(cfg.ac3d_num_layers), 1)
+            ac3d_n = min(ac3d_n, len(self.model.blocks))
+            ac3d_has_image_input = bool(getattr(self.model, "has_image_input", False))
+            ac3d_scene_input = "new_cross_attention" if self.scene_input_type == "controlnet" else "none"
+            self.model.ac3d_blocks = nn.ModuleList([
+                NewDiTBlock.from_dit_block(
+                    self.model.blocks[i],
+                    has_image_input=ac3d_has_image_input,
+                    camera_input_type="none",
+                    scene_input_type=ac3d_scene_input,
+                    use_text_cross_attn=False,
+                )
+                for i in range(ac3d_n)
+            ])
+            # main → ctrl FC (forward path; NOT zero-init).
+            self.model.ac3d_main2ctrl = nn.ModuleList([
+                nn.Linear(self.model.dim, self.model.dim)
+                for _ in range(ac3d_n)
+            ])
+            self.model.ac3d_main2ctrl = self.model.ac3d_main2ctrl.to(
+                device=ref_param.device, dtype=ref_param.dtype
+            )
+            # ctrl → main residual projector (zero-init, ControlNet signature).
+            self.model.ac3d_projectors = nn.ModuleList([
+                nn.Linear(self.model.dim, self.model.dim)
+                for _ in range(ac3d_n)
+            ])
+            for proj in self.model.ac3d_projectors:
+                nn.init.zeros_(proj.weight)
+                nn.init.zeros_(proj.bias)
+            self.model.ac3d_projectors = self.model.ac3d_projectors.to(
+                device=ref_param.device, dtype=ref_param.dtype
+            )
+            # Camera ray map → per-token embedding. Mirror main `patch_embedding`의 spatial
+            # config (Conv3d, same kernel/stride/padding)이라 출력 grid가 main patch token
+            # 시퀀스와 정확히 1:1 매칭. 6·td 입력 채널 (Plücker ray, origin 3 + dir 3) × Wan
+            # temporal downsample factor.
+            extra_in_ac = 6 * max(temporal_downsample, 1)
+            orig_pe_ac = self.model.patch_embedding
+            self.model.ac3d_camera_patch_embed = nn.Conv3d(
+                extra_in_ac,
+                orig_pe_ac.out_channels,
+                kernel_size=orig_pe_ac.kernel_size,
+                stride=orig_pe_ac.stride,
+                padding=orig_pe_ac.padding,
+                bias=orig_pe_ac.bias is not None,
+            ).to(device=orig_pe_ac.weight.device, dtype=orig_pe_ac.weight.dtype)
         if self.camera_input_type == "channel_concat":
             # Channel-concat ray map with latent BEFORE the patch_embedding conv.
             # `pose_embed(skip_embedding=True)` returns (B, V_lat, 6*T, H, W) when
@@ -603,6 +674,15 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
                     or name.startswith("ac3d_blocks.")
                     or name.startswith("ac3d_projectors.")
                     or name.startswith("ac3d_fc_down.")
+                )
+            )
+            trainable = trainable or (
+                self.camera_input_type == "controlnet_ac3d"
+                and (
+                    name.startswith("ac3d_camera_patch_embed.")
+                    or name.startswith("ac3d_blocks.")
+                    or name.startswith("ac3d_main2ctrl.")
+                    or name.startswith("ac3d_projectors.")
                 )
             )
             trainable = trainable or (
@@ -797,7 +877,7 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
             )
             pooled = camera_embedding.mean(dim=(1, 3, 4))  # (b v c h w) -> (b c)
             return self.model.adaln_camera_proj(pooled)
-        if self.camera_input_type in ("wan_control", "channel_concat", "controlnet", "controlnet_feedback"):
+        if self.camera_input_type in ("wan_control", "channel_concat", "controlnet", "controlnet_feedback", "controlnet_ac3d"):
             return camera_embedding
         ref_param = next(self.model.parameters())
         camera_embedding = camera_embedding.to(device=ref_param.device, dtype=ref_param.dtype)
@@ -938,7 +1018,7 @@ def simple_wan_video_fn(
     scene_context: torch.Tensor = None,
     scene_input_type: Literal["none", "cross_attention", "new_cross_attention", "latent_concat", "controlnet"] = "cross_attention",
     camera_context: torch.Tensor = None,
-    camera_input_type: Literal["none", "recam_attention", "cross_attention", "new_cross_attention", "adaln", "wan_control", "channel_concat", "controlnet", "controlnet_feedback"] | None = None,
+    camera_input_type: Literal["none", "recam_attention", "cross_attention", "new_cross_attention", "adaln", "wan_control", "channel_concat", "controlnet", "controlnet_feedback", "controlnet_ac3d"] | None = None,
     fuse_vae_embedding_in_latents: bool = False,
     use_gradient_checkpointing: bool = False,
     use_gradient_checkpointing_offload: bool = False,
@@ -950,10 +1030,10 @@ def simple_wan_video_fn(
         )
     if camera_input_type is None:
         camera_input_type = "none"
-    if camera_input_type not in ("none", "recam_attention", "cross_attention", "new_cross_attention", "adaln", "wan_control", "channel_concat", "controlnet", "controlnet_feedback"):
+    if camera_input_type not in ("none", "recam_attention", "cross_attention", "new_cross_attention", "adaln", "wan_control", "channel_concat", "controlnet", "controlnet_feedback", "controlnet_ac3d"):
         raise ValueError(
             f"Unsupported camera_input_type={camera_input_type!r}. "
-            "Expected 'none', 'recam_attention', 'cross_attention', 'new_cross_attention', 'adaln', 'wan_control', 'channel_concat', 'controlnet', or 'controlnet_feedback'."
+            "Expected 'none', 'recam_attention', 'cross_attention', 'new_cross_attention', 'adaln', 'wan_control', 'channel_concat', 'controlnet', 'controlnet_feedback', or 'controlnet_ac3d'."
         )
 
     adaln_camera_embedding = camera_context if camera_input_type == "adaln" else None
@@ -961,8 +1041,9 @@ def simple_wan_video_fn(
     cross_attention_camera_context = camera_context if camera_input_type == "cross_attention" else None
     wan_control_camera_input = camera_context if camera_input_type == "wan_control" else None
     channel_concat_camera_input = camera_context if camera_input_type == "channel_concat" else None
-    ac3d_camera_input = camera_context if camera_input_type in ("controlnet", "controlnet_feedback") else None
+    ac3d_camera_input = camera_context if camera_input_type in ("controlnet", "controlnet_feedback", "controlnet_ac3d") else None
     ac3d_feedback_mode = camera_input_type == "controlnet_feedback"
+    ac3d_paper_mode = camera_input_type == "controlnet_ac3d"
     cross_attention_scene_context = None
     ac3d_scene_context = None
 
@@ -1182,15 +1263,19 @@ def simple_wan_video_fn(
         )
         freqs = torch.cat([freqs, scene_freqs], dim=0)
 
-    # AC3D ControlNet branch: encode (latent + ray) via `ac3d_patch_embedding`,
-    # run through `ac3d_blocks`, project each to dim via zero-init linear, and
-    # collect per-layer residuals. These are added to the main DiT's hidden
-    # states after each of the first N main blocks. The main DiT itself runs
-    # with vanilla latent (no channel concat) — ControlNet output is the only
-    # path for camera info to reach the main flow.
+    # AC3D ControlNet branch: 세 가지 모드 지원
+    #   `controlnet`        — parallel: ac3d branch가 (latent⊕ray) end-to-end forward,
+    #                         per-layer 잔차 미리 수집해서 main block 직후 add.
+    #   `controlnet_feedback` — 인터리브: ac3d block_i 입력 = ac3d_x + FC_down(main_x),
+    #                         그 output을 main block_i 직전에 잔차로 add.
+    #   `controlnet_ac3d`   — AC3D 논문 VDiT-CC: noise는 main에만, ctrl block_i 입력 =
+    #                         FC_main2ctrl(main_x_i) + cam_emb + ctrl_x_{i-1},
+    #                         output → zero-init proj → main_x_i에 add → main block_{i+1} 입력.
+    #                         ctrl block 내부엔 self_attn + scene_cross_attn + FFN만 (text 없음).
     ac3d_residuals = None
     ac3d_x = None
     ac3d_scene = None
+    ac3d_cam_emb = None  # controlnet_ac3d 전용 per-token camera embedding
     if ac3d_camera_input is not None and getattr(dit, "ac3d_blocks", None) is not None:
         ac3d_camera_input = ac3d_camera_input.to(dtype=latents.dtype, device=latents.device)
         if ac3d_camera_input.shape[0] != latents.shape[0]:
@@ -1211,31 +1296,45 @@ def simple_wan_video_fn(
                 f"Got ray={tuple(ac3d_camera_input.shape)}, latent={tuple(latents.shape)}. "
                 "Set `model.denoiser.camera.input_shape=[H_latent, W_latent]`."
             )
-        ac3d_input = torch.cat([latents, ac3d_camera_input], dim=1)
-        ac3d_x = dit.ac3d_patch_embedding(ac3d_input)
-        # Replicate batch broadcast that vanilla path does to x (line ~913).
-        if ac3d_x.shape[0] != x.shape[0]:
-            if x.shape[0] % ac3d_x.shape[0] == 0:
-                ac3d_x = torch.cat([ac3d_x] * (x.shape[0] // ac3d_x.shape[0]), dim=0)
-        ac3d_x = rearrange(ac3d_x, "b c f h w -> b (f h w) c").contiguous()
-        # scene_input_type="controlnet": scene tokens을 ac3d 블록의 scene cross-attn에
-        # 전달. batch가 ac3d_x와 안 맞으면 broadcast/repeat (CFG uncond 등).
+
+        if ac3d_paper_mode:
+            # AC3D paper 모드: ray만 patchify해서 per-token camera embedding 생성.
+            # latent은 ctrl 분기에 들어가지 않음 (main DiT 단독 처리).
+            cam_emb_3d = dit.ac3d_camera_patch_embed(ac3d_camera_input)
+            if cam_emb_3d.shape[0] != x.shape[0]:
+                if x.shape[0] % cam_emb_3d.shape[0] == 0:
+                    cam_emb_3d = torch.cat([cam_emb_3d] * (x.shape[0] // cam_emb_3d.shape[0]), dim=0)
+            ac3d_cam_emb = rearrange(cam_emb_3d, "b c f h w -> b (f h w) c").contiguous()
+            ref_branch = ac3d_cam_emb
+        else:
+            # parallel / feedback 모드: (latent ⊕ ray) → ac3d_patch_embedding → ac3d_x
+            ac3d_input = torch.cat([latents, ac3d_camera_input], dim=1)
+            ac3d_x = dit.ac3d_patch_embedding(ac3d_input)
+            # Replicate batch broadcast that vanilla path does to x (line ~913).
+            if ac3d_x.shape[0] != x.shape[0]:
+                if x.shape[0] % ac3d_x.shape[0] == 0:
+                    ac3d_x = torch.cat([ac3d_x] * (x.shape[0] // ac3d_x.shape[0]), dim=0)
+            ac3d_x = rearrange(ac3d_x, "b c f h w -> b (f h w) c").contiguous()
+            ref_branch = ac3d_x
+
+        # scene_input_type="controlnet": scene tokens → ac3d 블록의 scene cross-attn.
+        # batch가 ref_branch와 안 맞으면 broadcast/repeat (CFG uncond 등).
         ac3d_scene = ac3d_scene_context
         if ac3d_scene is not None:
-            ac3d_scene = ac3d_scene.to(dtype=ac3d_x.dtype, device=ac3d_x.device)
-            if ac3d_scene.shape[0] != ac3d_x.shape[0]:
+            ac3d_scene = ac3d_scene.to(dtype=ref_branch.dtype, device=ref_branch.device)
+            if ac3d_scene.shape[0] != ref_branch.shape[0]:
                 if ac3d_scene.shape[0] == 1:
-                    ac3d_scene = ac3d_scene.expand(ac3d_x.shape[0], -1, -1)
-                elif ac3d_x.shape[0] % ac3d_scene.shape[0] == 0:
+                    ac3d_scene = ac3d_scene.expand(ref_branch.shape[0], -1, -1)
+                elif ref_branch.shape[0] % ac3d_scene.shape[0] == 0:
                     ac3d_scene = ac3d_scene.repeat_interleave(
-                        ac3d_x.shape[0] // ac3d_scene.shape[0], dim=0
+                        ref_branch.shape[0] // ac3d_scene.shape[0], dim=0
                     )
                 else:
                     raise ValueError(
                         "ac3d scene_context batch must match or divide ac3d branch batch: "
-                        f"scene={ac3d_scene.shape[0]}, ac3d_x={ac3d_x.shape[0]}"
+                        f"scene={ac3d_scene.shape[0]}, ref_branch={ref_branch.shape[0]}"
                     )
-        if not ac3d_feedback_mode:
+        if not ac3d_feedback_mode and not ac3d_paper_mode:
             # Parallel mode (AC3D公개 코드 / CogVideoX-ControlNet style):
             # ac3d branch runs end-to-end first, residuals collected, then
             # added to main blocks per-layer.
@@ -1245,13 +1344,12 @@ def simple_wan_video_fn(
                     ac3d_x, context, ac3d_scene, t_mod, None, ac3d_freqs, None
                 )
                 ac3d_residuals.append(ac3d_proj(ac3d_x))
-        # else: feedback mode → ac3d_x carries forward, ac3d_block + residual
-        # injection happens inside the main loop below.
+        # feedback / ac3d_paper mode → ac3d block 실행은 main loop 안에서 처리
 
+    ctrl_x = None  # controlnet_ac3d carry state
     for block_id, block in enumerate(dit.blocks):
         # Feedback mode: ac3d block i takes (ac3d_x + FC_down(main_x)) as input,
         # then its projected output is added to main_x BEFORE main block i.
-        # (AC3D paper VDiT-CC architecture.)
         if (
             ac3d_feedback_mode
             and ac3d_x is not None
@@ -1286,6 +1384,7 @@ def simple_wan_video_fn(
         # Parallel mode: residual added AFTER main block.
         if (
             not ac3d_feedback_mode
+            and not ac3d_paper_mode
             and ac3d_residuals is not None
             and block_id < len(ac3d_residuals)
         ):
@@ -1297,6 +1396,37 @@ def simple_wan_video_fn(
                 x = x + res
             else:
                 x = torch.cat([x[:, :n_patches] + res, x[:, n_patches:]], dim=1)
+
+        # AC3D paper mode: main block forward 직후 → ctrl block_i 실행 → 잔차 add.
+        #   ctrl_input = FC_main2ctrl(main_x_i) + cam_emb + ctrl_x_{i-1}
+        #   ctrl_x_i   = ctrl_block_i(ctrl_input, scene_tokens, t_mod, ac3d_freqs)
+        #               (self_attn → scene_cross_attn → FFN; text cross-attn 없음)
+        #   res        = ac3d_projectors[i](ctrl_x_i)   ← zero-init
+        #   main_x     = main_x + res                    → main block_{i+1} 입력
+        if (
+            ac3d_paper_mode
+            and ac3d_cam_emb is not None
+            and block_id < len(dit.ac3d_blocks)
+        ):
+            n_patches_ac = ac3d_cam_emb.shape[1]
+            main_for_ctrl = dit.ac3d_main2ctrl[block_id](x[:, :n_patches_ac])
+            ctrl_input = main_for_ctrl + ac3d_cam_emb
+            if ctrl_x is not None:
+                ctrl_input = ctrl_input + ctrl_x
+            ctrl_x = dit.ac3d_blocks[block_id](
+                ctrl_input,
+                None,  # text context — use_text_cross_attn=False라 무시됨
+                ac3d_scene,
+                t_mod,
+                None,
+                ac3d_freqs,
+                None,
+            )
+            res = dit.ac3d_projectors[block_id](ctrl_x)
+            if x.shape[1] == n_patches_ac:
+                x = x + res
+            else:
+                x = torch.cat([x[:, :n_patches_ac] + res, x[:, n_patches_ac:]], dim=1)
 
     x = BatchHead.forward(dit.head, x, t)
     if scene_latent_token_count:

@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- `model.denoiser.camera_input_type=controlnet_ac3d` (`src/model/denoiser/wan_ti2v.py`): AC3D 논문 VDiT-CC architecture에 충실한 새 ControlNet 변종. 기존 `controlnet` (parallel) / `controlnet_feedback` (단순 양방향)과 별도 모드로 추가, 기존 모드는 그대로 보존.
+  - 핵심 차이:
+    - **Noise/latent은 main DiT에만** 들어감 (ac3d_patch_embedding 없음). ctrl 분기엔 latent 직접 미입력.
+    - **ctrl block i 입력** = `FC_main2ctrl(main_x_i) + ac3d_cam_emb + ctrl_x_{i-1}` — 즉 매 layer마다 main의 hidden state를 ctrl이 흡수, 직전 ctrl 출력과 carry되며, camera embedding을 layer마다 더함.
+    - **ctrl block 출력** → zero-init `ac3d_projectors[i]` → main_x_i에 add → main block_{i+1} 입력으로 흘러감.
+    - **ctrl block 내부 구조**: self_attn → scene_cross_attn (`scene_input_type=controlnet` 시 zero-init proj) → FFN. **text cross-attn 없음** — `NewDiTBlock`에 `use_text_cross_attn: bool=True` 인자 추가, `False`면 `cross_attn`/`norm3` 둘 다 생성 안 함.
+  - 새 모듈 (모두 `self.model.*`에 attach):
+    - `ac3d_camera_patch_embed: Conv3d(6·td → dim, kernel/stride/padding = main patch_embedding 동일)` — ray map만 patchify해서 per-token 임베딩 생성. 모든 ctrl layer가 같은 cam_emb 공유 (per-layer 분리 X).
+    - `ac3d_blocks[N]`: main 앞 N개 block 복제, `use_text_cross_attn=False`, scene_cross_attn 활성 (scene_input_type=controlnet).
+    - `ac3d_main2ctrl[N]: Linear(dim, dim)` — **NOT zero-init** (forward 신호 경로).
+    - `ac3d_projectors[N]: Linear(dim, dim)` — **zero-init** (ctrl→main residual gate, ControlNet signature).
+  - 학습 t=0: `ac3d_projectors` zero-init → main에 더해지는 잔차 = 0 → main DiT는 vanilla Wan 그대로 작동, Wan prior 보존. `scene_cross_attn_proj`도 ctrl block 내부에서 zero-init이라 scene 영향도 초기 0.
+  - 셸 사용 예: `model.denoiser.camera_input_type=controlnet_ac3d model.denoiser.scene_input_type=controlnet`. `ac3d_num_layers` (yaml `model.denoiser.ac3d_num_layers`, 기본 2) 그대로 작동.
+
 ### Fixed
 - `config/experiment/custom/scenetok_va-wan-ti2v_dynamicverse.yaml`: val OOM (step 5000 validation 진입 직후 Wan VAE decode가 +18 GiB alloc 실패) 해결 — `data_loader.val.unseen` 블록 신규 추가 (기존엔 standard만 있어서 unseen이 default `batch_size=16` 상속 → 16 DAVIS scene을 한 번에 37 × 480×832 decode). 양쪽 모두 `batch_size=1`로 내리고 `max_batches: 4 → 8`로 늘려 FVD가 N≥2 sample 확보하도록.
 
