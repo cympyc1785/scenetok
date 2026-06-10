@@ -298,11 +298,14 @@ def main():
     # ── Sweep N × scenes ────────────────────────────────────────────────────
     rows = []
     V_max = cached[0][1]["context"]["extrinsics"].shape[1] if cached else 0
+    set_level_metrics = {}  # N -> dict(fid, fvd)
     for n in n_list:
         if n > V_max:
             print(f"\n[N={n}] skip — exceeds available context views V={V_max}")
             continue
         print(f"\n{'='*72}\n[N={n}] sweeping {len(cached)} scenes\n{'='*72}")
+        metric.reset_fid()
+        metric.reset_fvd()
         for scene_name, batch_dev, gt in cached:
             batch_n = slice_context(batch_dev, n, mode=args.context_sampling)
             with torch.no_grad(), torch.amp.autocast(
@@ -340,6 +343,9 @@ def main():
                 psnr = metric.compute_psnr(pred_flat, gt_flat).item()
                 ssim = metric.compute_ssim(pred_flat, gt_flat).item()
                 lpips = metric.compute_lpips(pred_flat, gt_flat).item()
+                # Set-level FID/FVD accumulation (one entry per scene at this N).
+                metric.update_fid(pred_flat, gt_flat, num_views=sampled_use.shape[1])
+                metric.update_fvd(pred_flat, gt_flat, num_views=sampled_use.shape[1])
 
             scene_dir = out_dir / scene_name
             save_image_video(
@@ -368,6 +374,21 @@ def main():
             print(f"  [{scene_name[:16]}... N={n}] psnr={psnr:.3f} ssim={ssim:.4f} lpips={lpips:.4f}")
             torch.cuda.empty_cache()
             gc.collect()
+        # End of scene loop for this N — compute set-level FID/FVD.
+        try:
+            fid_val = metric.compute_fid(update=False)
+            fid_val = float(fid_val.item()) if torch.is_tensor(fid_val) else (float(fid_val) if fid_val is not None else None)
+        except Exception as e:
+            print(f"  [N={n}] FID compute failed: {e}")
+            fid_val = None
+        try:
+            fvd_val = metric.compute_fvd(update=False)
+            fvd_val = float(fvd_val.item()) if torch.is_tensor(fvd_val) else (float(fvd_val) if fvd_val is not None else None)
+        except Exception as e:
+            print(f"  [N={n}] FVD compute failed: {e}")
+            fvd_val = None
+        set_level_metrics[n] = dict(fid=fid_val, fvd=fvd_val)
+        print(f"  [N={n}] set-level FID={fid_val} FVD={fvd_val}")
 
     # ── Summary CSV (mean/std per N) ────────────────────────────────────────
     import statistics
@@ -380,6 +401,7 @@ def main():
         psnrs = [r["psnr"] for r in sub]
         ssims = [r["ssim"] for r in sub]
         lpipses = [r["lpips"] for r in sub]
+        sl = set_level_metrics.get(n, {})
         summary_rows.append(dict(
             N=n,
             n_scenes=len(sub),
@@ -389,6 +411,8 @@ def main():
             ssim_std=statistics.stdev(ssims) if len(ssims) > 1 else 0.0,
             lpips_mean=statistics.mean(lpipses),
             lpips_std=statistics.stdev(lpipses) if len(lpipses) > 1 else 0.0,
+            fid=sl.get("fid"),
+            fvd=sl.get("fvd"),
         ))
     with summary_path.open("w", newline="") as fp:
         writer = csv.DictWriter(fp, fieldnames=list(summary_rows[0].keys()) if summary_rows else [])
@@ -400,10 +424,13 @@ def main():
     print(" SUMMARY")
     print("=" * 72)
     for r in summary_rows:
+        fid_s = f"{r['fid']:.2f}" if r['fid'] is not None else "—"
+        fvd_s = f"{r['fvd']:.1f}" if r['fvd'] is not None else "—"
         print(f"  N={r['N']:2d}  n={r['n_scenes']:2d}  "
               f"PSNR {r['psnr_mean']:.3f}±{r['psnr_std']:.3f}  "
               f"SSIM {r['ssim_mean']:.4f}±{r['ssim_std']:.4f}  "
-              f"LPIPS {r['lpips_mean']:.4f}±{r['lpips_std']:.4f}")
+              f"LPIPS {r['lpips_mean']:.4f}±{r['lpips_std']:.4f}  "
+              f"FID {fid_s}  FVD {fvd_s}")
     print(f"\n[eval] per_scene → {per_scene_path}")
     print(f"[eval] summary   → {summary_path}")
 
