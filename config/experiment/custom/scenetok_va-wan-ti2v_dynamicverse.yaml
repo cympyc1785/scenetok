@@ -45,9 +45,21 @@ data_loader:
   val:
     standard:
       shuffle: false
-      batch_size: 4
-      max_batches: 4
-      num_workers: 4
+      batch_size: 1
+      # ≥ 2 needed for meaningful FVD (np.cov(rowvar=False) is rank-deficient
+      # otherwise → scipy.sqrtm hang). 8 keeps wall-time reasonable.
+      max_batches: 8
+      num_workers: 2
+      seed: 0
+      interval: 5000
+      persistent_workers: false
+    unseen:
+      # batch_size=1 to avoid OOM (default 16 batched all 16 DAVIS scenes
+      # through Wan VAE decode (37 × 480×832) in one call → +18 GiB alloc fails).
+      shuffle: false
+      batch_size: 1
+      max_batches: 8
+      num_workers: 2
       seed: 0
       interval: 5000
       persistent_workers: false

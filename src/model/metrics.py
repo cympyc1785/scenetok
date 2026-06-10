@@ -162,12 +162,33 @@ class Metric(nn.Module):
 
         if update:
             self.update_fvd(pred, gt, num_views=num_views)
-        
+
+        # Return None (not NaN) so on_validation_end's `if value is not None`
+        # check skips logging entirely — wandb sees no metric instead of NaN.
+        if not self.pred_list or not self.gt_list:
+            return None
+
         pred_tensor = torch.cat(self.pred_list, dim=0)
         gt_tensor = torch.cat(self.gt_list, dim=0)
 
+        # FVD needs ≥ 2 video clips per set or `np.cov(rowvar=False)` produces a
+        # rank-deficient covariance (degrees of freedom <= 0) which makes
+        # `scipy.linalg.sqrtm` either return NaN or spin forever on Schur
+        # decomposition. CLAUDE.md gotcha — skip rather than hang.
+        if pred_tensor.shape[0] < 2 or gt_tensor.shape[0] < 2:
+            print(
+                f"[FVD] skip: insufficient samples "
+                f"pred={pred_tensor.shape[0]}, gt={gt_tensor.shape[0]} (need ≥ 2)"
+            )
+            return None
+
         fvd_device = "cuda" if torch.cuda.is_available() else "cpu"
         fvd = frechet_video_distance(pred_tensor, gt_tensor, "submodules/fvd/pytorch_i3d_model/models/rgb_imagenet.pt", device=fvd_device)
+        if not np.isfinite(fvd):
+            # Final sanity guard: degenerate cov can still produce NaN/Inf
+            # through scipy.sqrtm even with ≥ 2 samples. Skip logging.
+            print(f"[FVD] skip: non-finite result ({fvd})")
+            return None
 
         return torch.tensor(fvd)
 
@@ -177,7 +198,15 @@ class Metric(nn.Module):
 
         for key in list(kwargs.keys()):
             if kwargs.get(key, False):
-                _dict[key] = getattr(self, f"compute_{key}")(pred, gt, num_views=num_views)
+                value = getattr(self, f"compute_{key}")(pred, gt, num_views=num_views)
+                # Convert non-finite scalar metrics to None so on_validation_end's
+                # `if value is not None: log_metrics(...)` skips them — keeps
+                # wandb clean of NaN entries when pred/gt is degenerate
+                # (e.g. all-NaN model output in early training).
+                if torch.is_tensor(value) and value.numel() == 1 and not torch.isfinite(value).item():
+                    print(f"[Metric] skip {key}: non-finite value ({value.item()})")
+                    value = None
+                _dict[key] = value
                 gc.collect()
                 torch.cuda.empty_cache()
 

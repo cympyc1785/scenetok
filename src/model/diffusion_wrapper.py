@@ -1281,6 +1281,8 @@ class DiffusionWrapper(LightningModule):
                 )
 
                 for key, value in full_sequence_metrics.items():
+                    if value is None:
+                        continue
                     self.logger.log_metrics({f"{loader_name}/full_sequence/{key}": value}, val_step)
                     if loader_name == "standard":
                         self.logger.log_metrics({f"full_sequence/{key}": value}, val_step)

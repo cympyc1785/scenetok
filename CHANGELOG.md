@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- `config/experiment/custom/scenetok_va-wan-ti2v_dynamicverse.yaml`: val OOM (step 5000 validation 진입 직후 Wan VAE decode가 +18 GiB alloc 실패) 해결 — `data_loader.val.unseen` 블록 신규 추가 (기존엔 standard만 있어서 unseen이 default `batch_size=16` 상속 → 16 DAVIS scene을 한 번에 37 × 480×832 decode). 양쪽 모두 `batch_size=1`로 내리고 `max_batches: 4 → 8`로 늘려 FVD가 N≥2 sample 확보하도록.
+- `src/model/metrics.py:compute_fvd`: pred_list/gt_list가 비거나 N<2면 NaN tensor 대신 **`None` 반환** → `on_validation_end`의 `if value is not None` 가드와 통합돼 wandb에 NaN/inf 안 찍힘. scipy `sqrtm`이 rank-deficient cov에서 무한 스핀하는 CLAUDE.md gotcha 회피. 추가로 `frechet_video_distance` 결과가 non-finite여도 `None` 반환.
+- `src/model/metrics.py:Metric.forward`: 모든 `compute_<key>(...)` 결과를 검사해서 scalar tensor가 non-finite면 `None`으로 변환 (PSNR/SSIM/LPIPS도 동일 가드). 한 줄 `[Metric] skip <key>: non-finite ...` console log.
+- `src/model/diffusion_wrapper.py:on_validation_end`: `full_sequence_metrics` 로깅 루프에 `if value is None: continue` 가드 추가 (기존엔 NaN 그대로 wandb로 보냄, `general_metrics`엔 이미 None 가드 있었음).
+
 ### Added
 - `src/dataset/dataset_dynamicverse.py` + `config/dataset/dynamicverse.yaml`: `WorldTraj/dynamicverse` 데이터셋 (DAVIS / dynamic_replica / MOSE / MVS-Synth / SAV / spring / uvo / VOST / youtube_vis, `dynpose-100k`+`logs` 제외). 한 scene 디렉터리당 `inpaint_result.mp4`+`cameras.json`+`prompts.json`. 주요 cfg 필드:
   - `excluded_subdatasets` (기본 `["dynpose-100k","logs"]`), `unseen_subdatasets` (기본 `["DAVIS"]`), `val_seen: bool` — train + val.standard는 unseen 제외 pool, val.unseen은 unseen pool만.
