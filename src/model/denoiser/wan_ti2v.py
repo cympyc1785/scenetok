@@ -62,12 +62,18 @@ class WanTI2V5BCfg:
     clean: str = "whitespace"
     gradient_checkpointing: bool = True
     condition_latents_input_type: Literal["none", "width", "channel", "temporal", "first_frame", "first_frame_random", "first_frame_depth", "first_frame_depth_soft"] = "none"
-    camera_input_type: Literal["none", "recam_attention", "cross_attention", "new_cross_attention", "adaln", "wan_control", "channel_concat", "controlnet", "controlnet_feedback", "controlnet_ac3d"] | None = None
+    camera_input_type: Literal["none", "recam_attention", "cross_attention", "new_cross_attention", "adaln", "wan_control", "channel_concat", "controlnet", "controlnet_feedback", "controlnet_ac3d", "controlnet_lightningdit"] | None = None
     enable_recam_attention: bool | None = None
     camera_context_spatial_pool: int = 1
     scene_input_type: Literal["none", "cross_attention", "new_cross_attention", "latent_concat", "controlnet"] = "cross_attention"
     scene_projection: Literal["linear", "mlp"] = "linear"
     ac3d_num_layers: int = 2
+    # controlnet_lightningdit 전용: LightningDiT 분기의 hidden_size / num_heads / SwiGLU
+    # 등 하이퍼파라미터. 기본값은 va-wan_dl3dv_256-480.ckpt의 LightningDiT denoiser와 일치.
+    lightningdit_hidden_size: int = 1024
+    lightningdit_num_heads: int = 16
+    lightningdit_mlp_ratio: float = 4.0
+    lightningdit_ckpt_path: str | Path | None = None  # warm-start ckpt
     num_target_split: int = 1
     input_shape: int | list[int] = 16
     noise_seed: int | None = None
@@ -259,7 +265,7 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
             self.camera_input_type = "recam_attention" if cfg.enable_recam_attention else "none"
         # scene_input_type="controlnet"은 ControlNet(AC3D-style) 분기에 scene tokens을
         # (camera ray와 함께) 주입하는 모드 → 분기를 만드는 camera_input_type="controlnet"이 전제.
-        if self.scene_input_type == "controlnet" and self.camera_input_type not in ("controlnet", "controlnet_feedback", "controlnet_ac3d"):
+        if self.scene_input_type == "controlnet" and self.camera_input_type not in ("controlnet", "controlnet_feedback", "controlnet_ac3d", "controlnet_lightningdit"):
             raise ValueError(
                 "scene_input_type='controlnet' requires camera_input_type='controlnet' "
                 "(scene tokens are injected into the AC3D-style controlnet branch). "
@@ -526,6 +532,126 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
                 padding=orig_pe_ac.padding,
                 bias=orig_pe_ac.bias is not None,
             ).to(device=orig_pe_ac.weight.device, dtype=orig_pe_ac.weight.dtype)
+        if self.camera_input_type == "controlnet_lightningdit":
+            # AC3D paper orchestration과 동일하나 ctrl block을 **LightningDiTBlock**
+            # 구조로 교체한 변종. 사전학습된 SceneTok lightningdit denoiser ckpt
+            # (`cfg.lightningdit_ckpt_path`)에서 첫 N개 block weight를 warm-start하여
+            # finetune.
+            #   - ctrl block hidden dim = `cfg.lightningdit_hidden_size` (기본 1024)
+            #   - Main Wan dim (3072 등) ↔ ctrl dim adapter: `ac3d_main2ctrl`/`ac3d_projectors`
+            #   - Scene tokens: 별도 `ac3d_cnd_proj`로 ctrl dim 투사
+            #   - Timestep cond: 별도 `ac3d_t_embedder` (LightningDiT의 SiLU MLP)
+            #   - RoPE는 ckpt와 정확히 매칭하기 어려워 skip (feat_rope=None) — 사전학습된
+            #     2D/3D RoPE 가정과 다른 patch grid로 들어가므로 attention은
+            #     position-blind으로 작동, qk_norm/스킵 connection이 형태를 유지.
+            from .layers.lightningdit import LightningDiTBlock, TimestepEmbedder
+
+            ac3d_n = max(int(cfg.ac3d_num_layers), 1)
+            ac3d_n = min(ac3d_n, len(self.model.blocks))
+            ld_dim = int(cfg.lightningdit_hidden_size)
+            ld_heads = int(cfg.lightningdit_num_heads)
+            ld_mlp_ratio = float(cfg.lightningdit_mlp_ratio)
+
+            self.model.ac3d_blocks = nn.ModuleList([
+                LightningDiTBlock(
+                    hidden_size=ld_dim,
+                    num_heads=ld_heads,
+                    mlp_ratio=ld_mlp_ratio,
+                    use_qknorm=True,
+                    use_swiglu=True,
+                    use_rmsnorm=True,
+                    wo_shift=False,
+                    is_3d_rope=False,
+                )
+                for _ in range(ac3d_n)
+            ]).to(device=ref_param.device, dtype=ref_param.dtype)
+
+            # main(Wan dim) → ctrl(ld_dim) — random init
+            self.model.ac3d_main2ctrl = nn.ModuleList([
+                nn.Linear(self.model.dim, ld_dim)
+                for _ in range(ac3d_n)
+            ]).to(device=ref_param.device, dtype=ref_param.dtype)
+            # ctrl(ld_dim) → main(Wan dim) — zero-init residual gate
+            self.model.ac3d_projectors = nn.ModuleList([
+                nn.Linear(ld_dim, self.model.dim)
+                for _ in range(ac3d_n)
+            ])
+            for proj in self.model.ac3d_projectors:
+                nn.init.zeros_(proj.weight)
+                nn.init.zeros_(proj.bias)
+            self.model.ac3d_projectors = self.model.ac3d_projectors.to(
+                device=ref_param.device, dtype=ref_param.dtype
+            )
+            # Scene tokens projector: scene_context는 외부 wrapper가 이미 main
+            # `cnd_proj(cond_dim → model.dim)` 통과시킨 (B, T, Wan_dim) 상태로
+            # 들어옴 → ctrl 분기 dim에 맞춰 한 번 더 투사 (model.dim → ld_dim).
+            self.model.ac3d_cnd_proj = nn.Linear(self.model.dim, ld_dim).to(
+                device=ref_param.device, dtype=ref_param.dtype
+            )
+            # Timestep embedder (LightningDiT style)
+            self.model.ac3d_t_embedder = TimestepEmbedder(
+                hidden_size=ld_dim, frequency_embedding_size=256
+            ).to(device=ref_param.device, dtype=ref_param.dtype)
+            # Camera ray map → per-token ld_dim embedding. Main patch grid에 맞춤
+            # (Wan patch_size, e.g. (1, 2, 2)).
+            extra_in_ld = 6 * max(temporal_downsample, 1)
+            orig_pe_ld = self.model.patch_embedding
+            self.model.ac3d_camera_patch_embed = nn.Conv3d(
+                extra_in_ld,
+                ld_dim,
+                kernel_size=orig_pe_ld.kernel_size,
+                stride=orig_pe_ld.stride,
+                padding=orig_pe_ld.padding,
+                bias=orig_pe_ld.bias is not None,
+            ).to(device=orig_pe_ld.weight.device, dtype=orig_pe_ld.weight.dtype)
+
+            # Warm-start from sub-ckpt
+            if cfg.lightningdit_ckpt_path is not None:
+                ckpt_path = Path(cfg.lightningdit_ckpt_path)
+                if not ckpt_path.exists():
+                    raise FileNotFoundError(
+                        f"controlnet_lightningdit: ckpt not found at {ckpt_path}"
+                    )
+                state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+                sd = state.get("state_dict", state)
+                # Extract: denoiser.model.blocks.{i}.*  →  ac3d_blocks[i].*
+                # Extract: denoiser.cnd_proj.*         →  ac3d_cnd_proj.*
+                # Extract: denoiser.model.t_embedder.* →  ac3d_t_embedder.*
+                loaded_blocks = 0
+                missing_total: list[str] = []
+                unexpected_total: list[str] = []
+                for i in range(ac3d_n):
+                    blk_prefix = f"denoiser.model.blocks.{i}."
+                    blk_sd = {
+                        k[len(blk_prefix):]: v
+                        for k, v in sd.items()
+                        if k.startswith(blk_prefix)
+                    }
+                    if blk_sd:
+                        miss, unexp = self.model.ac3d_blocks[i].load_state_dict(
+                            blk_sd, strict=False
+                        )
+                        missing_total.extend(f"blocks.{i}." + m for m in miss)
+                        unexpected_total.extend(f"blocks.{i}." + u for u in unexp)
+                        loaded_blocks += 1
+                # cnd_proj는 dim 불일치로 (ckpt: cond_dim→ld_dim, ours: model.dim→ld_dim)
+                # warm-start 불가 — 랜덤 init 그대로 사용.
+                # t_embedder
+                te_sd = {
+                    k[len("denoiser.model.t_embedder."):]: v
+                    for k, v in sd.items()
+                    if k.startswith("denoiser.model.t_embedder.")
+                }
+                if te_sd:
+                    try:
+                        self.model.ac3d_t_embedder.load_state_dict(te_sd, strict=False)
+                    except Exception as e:
+                        print(f"[controlnet_lightningdit] ac3d_t_embedder load skipped: {e}")
+                print(
+                    f"[controlnet_lightningdit] warm-started from {ckpt_path}: "
+                    f"{loaded_blocks}/{ac3d_n} blocks, "
+                    f"missing={len(missing_total)}, unexpected={len(unexpected_total)}"
+                )
         if self.camera_input_type == "channel_concat":
             # Channel-concat ray map with latent BEFORE the patch_embedding conv.
             # `pose_embed(skip_embedding=True)` returns (B, V_lat, 6*T, H, W) when
@@ -686,6 +812,17 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
                 )
             )
             trainable = trainable or (
+                self.camera_input_type == "controlnet_lightningdit"
+                and (
+                    name.startswith("ac3d_camera_patch_embed.")
+                    or name.startswith("ac3d_blocks.")
+                    or name.startswith("ac3d_main2ctrl.")
+                    or name.startswith("ac3d_projectors.")
+                    or name.startswith("ac3d_cnd_proj.")
+                    or name.startswith("ac3d_t_embedder.")
+                )
+            )
+            trainable = trainable or (
                 self.camera_input_type == "adaln"
                 and name.startswith("adaln_camera_proj.")
             )
@@ -825,7 +962,7 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
                 extrinsics = extrinsics[:, indices]
             return extrinsics.flatten(-2)
 
-        if self.camera_input_type in ("wan_control", "channel_concat", "controlnet", "controlnet_feedback"):
+        if self.camera_input_type in ("wan_control", "channel_concat", "controlnet", "controlnet_feedback", "controlnet_ac3d", "controlnet_lightningdit"):
             # Both modes consume raw Plücker rays (6 ch) without `time_embed`
             # blow-up. SimpleAdapter / channel-concat handle dim alignment themselves.
             # SimpleAdapter unpacks `(B, C, F, H, W)` (NCFHW), but
@@ -877,7 +1014,7 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
             )
             pooled = camera_embedding.mean(dim=(1, 3, 4))  # (b v c h w) -> (b c)
             return self.model.adaln_camera_proj(pooled)
-        if self.camera_input_type in ("wan_control", "channel_concat", "controlnet", "controlnet_feedback", "controlnet_ac3d"):
+        if self.camera_input_type in ("wan_control", "channel_concat", "controlnet", "controlnet_feedback", "controlnet_ac3d", "controlnet_lightningdit"):
             return camera_embedding
         ref_param = next(self.model.parameters())
         camera_embedding = camera_embedding.to(device=ref_param.device, dtype=ref_param.dtype)
@@ -1018,7 +1155,7 @@ def simple_wan_video_fn(
     scene_context: torch.Tensor = None,
     scene_input_type: Literal["none", "cross_attention", "new_cross_attention", "latent_concat", "controlnet"] = "cross_attention",
     camera_context: torch.Tensor = None,
-    camera_input_type: Literal["none", "recam_attention", "cross_attention", "new_cross_attention", "adaln", "wan_control", "channel_concat", "controlnet", "controlnet_feedback", "controlnet_ac3d"] | None = None,
+    camera_input_type: Literal["none", "recam_attention", "cross_attention", "new_cross_attention", "adaln", "wan_control", "channel_concat", "controlnet", "controlnet_feedback", "controlnet_ac3d", "controlnet_lightningdit"] | None = None,
     fuse_vae_embedding_in_latents: bool = False,
     use_gradient_checkpointing: bool = False,
     use_gradient_checkpointing_offload: bool = False,
@@ -1030,10 +1167,10 @@ def simple_wan_video_fn(
         )
     if camera_input_type is None:
         camera_input_type = "none"
-    if camera_input_type not in ("none", "recam_attention", "cross_attention", "new_cross_attention", "adaln", "wan_control", "channel_concat", "controlnet", "controlnet_feedback", "controlnet_ac3d"):
+    if camera_input_type not in ("none", "recam_attention", "cross_attention", "new_cross_attention", "adaln", "wan_control", "channel_concat", "controlnet", "controlnet_feedback", "controlnet_ac3d", "controlnet_lightningdit"):
         raise ValueError(
             f"Unsupported camera_input_type={camera_input_type!r}. "
-            "Expected 'none', 'recam_attention', 'cross_attention', 'new_cross_attention', 'adaln', 'wan_control', 'channel_concat', 'controlnet', 'controlnet_feedback', or 'controlnet_ac3d'."
+            "Expected 'none', 'recam_attention', 'cross_attention', 'new_cross_attention', 'adaln', 'wan_control', 'channel_concat', 'controlnet', 'controlnet_feedback', 'controlnet_ac3d', or 'controlnet_lightningdit'."
         )
 
     adaln_camera_embedding = camera_context if camera_input_type == "adaln" else None
@@ -1041,9 +1178,10 @@ def simple_wan_video_fn(
     cross_attention_camera_context = camera_context if camera_input_type == "cross_attention" else None
     wan_control_camera_input = camera_context if camera_input_type == "wan_control" else None
     channel_concat_camera_input = camera_context if camera_input_type == "channel_concat" else None
-    ac3d_camera_input = camera_context if camera_input_type in ("controlnet", "controlnet_feedback", "controlnet_ac3d") else None
+    ac3d_camera_input = camera_context if camera_input_type in ("controlnet", "controlnet_feedback", "controlnet_ac3d", "controlnet_lightningdit") else None
     ac3d_feedback_mode = camera_input_type == "controlnet_feedback"
     ac3d_paper_mode = camera_input_type == "controlnet_ac3d"
+    ac3d_litdit_mode = camera_input_type == "controlnet_lightningdit"
     cross_attention_scene_context = None
     ac3d_scene_context = None
 
@@ -1297,9 +1435,9 @@ def simple_wan_video_fn(
                 "Set `model.denoiser.camera.input_shape=[H_latent, W_latent]`."
             )
 
-        if ac3d_paper_mode:
-            # AC3D paper 모드: ray만 patchify해서 per-token camera embedding 생성.
-            # latent은 ctrl 분기에 들어가지 않음 (main DiT 단독 처리).
+        if ac3d_paper_mode or ac3d_litdit_mode:
+            # AC3D paper / lightningdit 변종: ray만 patchify해서 per-token camera
+            # embedding 생성. latent은 ctrl 분기에 직접 들어가지 않음.
             cam_emb_3d = dit.ac3d_camera_patch_embed(ac3d_camera_input)
             if cam_emb_3d.shape[0] != x.shape[0]:
                 if x.shape[0] % cam_emb_3d.shape[0] == 0:
@@ -1334,7 +1472,7 @@ def simple_wan_video_fn(
                         "ac3d scene_context batch must match or divide ac3d branch batch: "
                         f"scene={ac3d_scene.shape[0]}, ref_branch={ref_branch.shape[0]}"
                     )
-        if not ac3d_feedback_mode and not ac3d_paper_mode:
+        if not ac3d_feedback_mode and not ac3d_paper_mode and not ac3d_litdit_mode:
             # Parallel mode (AC3D公개 코드 / CogVideoX-ControlNet style):
             # ac3d branch runs end-to-end first, residuals collected, then
             # added to main blocks per-layer.
@@ -1385,6 +1523,7 @@ def simple_wan_video_fn(
         if (
             not ac3d_feedback_mode
             and not ac3d_paper_mode
+            and not ac3d_litdit_mode
             and ac3d_residuals is not None
             and block_id < len(ac3d_residuals)
         ):
@@ -1427,6 +1566,60 @@ def simple_wan_video_fn(
                 x = x + res
             else:
                 x = torch.cat([x[:, :n_patches_ac] + res, x[:, n_patches_ac:]], dim=1)
+
+        # controlnet_lightningdit mode: AC3D paper orchestration이지만 ctrl block이
+        # LightningDiTBlock. 추가 차이:
+        #   - dim adapter (`ac3d_main2ctrl`: wan_dim→ld_dim, `ac3d_projectors`: ld_dim→wan_dim).
+        #   - Scene tokens은 `ac3d_cnd_proj`로 ld_dim에 투사 (한 번 계산 후 layer 간 재사용).
+        #   - Timestep cond: LightningDiT의 `ac3d_t_embedder(timestep) → (B, 1, ld_dim)` 별도 계산.
+        #   - LightningDiTBlock signature: (x, c, y, feat_rope, num_views, num_split).
+        #     feat_rope=None (사전학습된 RoPE patch grid가 우리 Wan grid와 달라 skip).
+        if (
+            ac3d_litdit_mode
+            and ac3d_cam_emb is not None
+            and block_id < len(dit.ac3d_blocks)
+        ):
+            n_patches_ac = ac3d_cam_emb.shape[1]
+            main_for_ctrl = dit.ac3d_main2ctrl[block_id](x[:, :n_patches_ac])
+            ctrl_input = main_for_ctrl + ac3d_cam_emb
+            if ctrl_x is not None:
+                ctrl_input = ctrl_input + ctrl_x
+            # LightningDiT가 요구하는 conditioning 벡터 c — timestep만 (class label 없음)
+            if not hasattr(dit, "_ac3d_litdit_c_cache") or dit._ac3d_litdit_c_cache is None or dit._ac3d_litdit_c_cache.shape[0] != ctrl_input.shape[0]:
+                # ac3d_t_embedder는 (B,) → (B, 1, ld_dim) 반환
+                c_litdit = dit.ac3d_t_embedder(timestep.to(ctrl_input.device))
+                dit._ac3d_litdit_c_cache = c_litdit
+            else:
+                c_litdit = dit._ac3d_litdit_c_cache
+            # Scene tokens을 ctrl dim에 투사 — 한 번 계산해서 layer마다 재사용
+            if not hasattr(dit, "_ac3d_litdit_y_cache") or dit._ac3d_litdit_y_cache is None:
+                if ac3d_scene is not None:
+                    y_litdit = dit.ac3d_cnd_proj(ac3d_scene)
+                else:
+                    y_litdit = None
+                dit._ac3d_litdit_y_cache = y_litdit
+            else:
+                y_litdit = dit._ac3d_litdit_y_cache
+            ctrl_x = dit.ac3d_blocks[block_id](
+                ctrl_input,
+                c_litdit,
+                y_litdit,
+                feat_rope=None,
+                num_views=1,
+                num_split=1,
+            )
+            res = dit.ac3d_projectors[block_id](ctrl_x)
+            if x.shape[1] == n_patches_ac:
+                x = x + res
+            else:
+                x = torch.cat([x[:, :n_patches_ac] + res, x[:, n_patches_ac:]], dim=1)
+
+    # litdit cache 정리 (다음 forward 호출에 carry되지 않도록)
+    if ac3d_litdit_mode:
+        if hasattr(dit, "_ac3d_litdit_c_cache"):
+            dit._ac3d_litdit_c_cache = None
+        if hasattr(dit, "_ac3d_litdit_y_cache"):
+            dit._ac3d_litdit_y_cache = None
 
     x = BatchHead.forward(dit.head, x, t)
     if scene_latent_token_count:

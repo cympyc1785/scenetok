@@ -126,6 +126,8 @@ _LATENT_DOMAIN_CAMERA_MODES = {
     "channel_concat",
     "controlnet",
     "controlnet_feedback",
+    "controlnet_ac3d",
+    "controlnet_lightningdit",
     "ac3d",
 }
 
