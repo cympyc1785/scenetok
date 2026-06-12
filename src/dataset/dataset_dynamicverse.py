@@ -87,9 +87,29 @@ class DatasetDynamicverseCfg(DatasetCfgCommon):
     # also restricts to the scenes listed in the JSON. Built by
     # `scripts/build_dynamicverse_eval_index.py`.
     evaluation_index_path: Path | None = None
-    # Some pipelines store rotation in world-to-camera form. DAVIS / dynamicverse
-    # use camera-to-world (rotation + position = c2w), matching `dataset_davis`.
+    # Some pipelines store rotation in world-to-camera form. `_load_cameras`는
+    # `True`면 `[R | t]`를 w2c로 보고 `c2w = inv(w2c)`로 변환. 검증된 dynamicverse
+    # cameras.json은 **w2c** (DL3DV transforms.json과 동일 scene의 w2c와
+    # translation 자리수까지 일치). → 새 학습은 `True`로 권장.
     camera_rotation_is_world_to_camera: bool = False
+    # Dynamicverse cameras.json의 world frame은 DL3DV/SceneTok OpenCV world와 다른
+    # axes를 가짐 — x↔y swap + z flip, 즉 `P = [[0,1,0],[1,0,0],[0,0,-1]]` 만큼
+    # 회전된 world. `True`로 두면 `_load_cameras` 끝에서 `c2w = P_h @ c2w`로
+    # pre-multiply해서 DL3DV-world 좌표계로 정렬. SceneTok compressor (DL3DV-
+    # pretrained) compatibility를 위해 권장. `camera_rotation_is_world_to_camera=True`
+    # 와 함께 써야 의미 있음.
+    align_world_to_dl3dv: bool = False
+    # cameras.json은 raw pixel 단위 (fx≈300, cx≈252) 로 저장돼 있으나 DL3DV/RE10K는
+    # normalized [0,1] (image dim으로 나눔). `True`면 `__getitem__`에서 video 첫
+    # frame 로드 후 dims로 나눠 정규화 → DL3DV/RE10K와 같은 컨벤션. `crop_shim`은
+    # normalized 가정 (center_crop이 `*= w_in/w_out` 로 fx 업데이트하는데, 이는
+    # normalized 일 때만 유효).
+    normalize_intrinsics: bool = True
+    # Option B (scene-radius normalization): subtract camera centroid, divide by max
+    # camera distance from centroid → 모든 cam origin이 unit sphere 안에. subdataset
+    # 별 scale 편차(spring 0.001 ~ MVS-Synth 5)를 균질화. DL3DV pre-normalized 데이터와
+    # 매그니튜드 범위 비슷해짐. relative camera motion 비율은 보존됨.
+    normalize_scene_scale: bool = False
     baseline_epsilon: float = 1e-3
     make_baseline: bool = False
     # Per-view-type shape overrides. If None, falls back to `shape`. Use these
@@ -273,6 +293,21 @@ class DatasetDynamicverse(Dataset):
         extrinsics = extrinsics[:num_views]
         intrinsics = intrinsics[:num_views]
 
+        # Normalize pixel-unit intrinsics → [0,1] convention (matches DL3DV/RE10K).
+        # cameras.json은 원본 capture 해상도(504×280; cx=252,cy=140 = 이미지 중심)
+        # 기준 pixel intrinsics. video는 그 후 432×240으로 isotropic resize됨.
+        # 영상 픽셀 dim 으로 나누면 정규화된 cx, cy가 0.5에서 어긋남 → 원본 ref dim
+        # 으로 나눠야 함. 모든 scene에서 principal point가 image center에 있다고 가정
+        # → (2*cx, 2*cy) = 원본 dim.
+        if self.cfg.normalize_intrinsics:
+            ref_w = 2.0 * intrinsics[:, 0, 2]   # (N,) per-frame
+            ref_h = 2.0 * intrinsics[:, 1, 2]
+            intrinsics = intrinsics.clone()
+            intrinsics[:, 0, 0] = intrinsics[:, 0, 0] / ref_w   # fx
+            intrinsics[:, 1, 1] = intrinsics[:, 1, 1] / ref_h   # fy
+            intrinsics[:, 0, 2] = intrinsics[:, 0, 2] / ref_w   # cx → 0.5
+            intrinsics[:, 1, 2] = intrinsics[:, 1, 2] / ref_h   # cy → 0.5
+
         ctx_shape = tuple(self.cfg.context_shape or self.cfg.shape)
         tgt_shape = tuple(self.cfg.target_shape or self.cfg.shape)
         # `apply_crop_shim_to_views` assumes input ≥ output; rescale frames up
@@ -393,11 +428,14 @@ class DatasetDynamicverse(Dataset):
             mode="bilinear",
             align_corners=False,
         )
-        intrinsics = intrinsics.clone()
-        intrinsics[:, 0, 0] *= new_w / w
-        intrinsics[:, 1, 1] *= new_h / h
-        intrinsics[:, 0, 2] *= new_w / w
-        intrinsics[:, 1, 2] *= new_h / h
+        # Normalized intrinsics는 scale-invariant이므로 업데이트 불필요.
+        # Pixel-unit (cfg.normalize_intrinsics=False)일 때만 새 해상도에 맞게 scale.
+        if not self.cfg.normalize_intrinsics:
+            intrinsics = intrinsics.clone()
+            intrinsics[:, 0, 0] *= new_w / w
+            intrinsics[:, 1, 1] *= new_h / h
+            intrinsics[:, 0, 2] *= new_w / w
+            intrinsics[:, 1, 2] *= new_h / h
         return latents, intrinsics
 
     def _load_video(self, path: Path, max_frames: int | None = None) -> torch.Tensor:
@@ -480,7 +518,34 @@ class DatasetDynamicverse(Dataset):
             intrinsic[1, 2] = float(camera["cy"])
             intrinsics.append(intrinsic)
 
-        return torch.stack(extrinsics), torch.stack(intrinsics)
+        extrinsics = torch.stack(extrinsics)
+        intrinsics = torch.stack(intrinsics)
+
+        if self.cfg.align_world_to_dl3dv:
+            # cameras.json의 world frame이 DL3DV OpenCV world에서 x↔y swap +
+            # z flip된 상태. DL3DV scene 한 개로 transforms.json과 비교 검증됨
+            # (translation 완전 일치, rotation은 R_dl3dv = R_gt @ P 관계).
+            # P_h @ c2w_dl3dv → c2w_aligned (DL3DV world).
+            P_h = torch.tensor(
+                [
+                    [0.0, 1.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.0, 0.0, -1.0, 0.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                ],
+                dtype=extrinsics.dtype,
+            )
+            extrinsics = P_h @ extrinsics  # (N, 4, 4) batch matmul broadcast
+
+        if self.cfg.normalize_scene_scale:
+            # Option B: centroid 빼고 max radius로 나눔 → cam origins ⊂ unit sphere.
+            cam_origins = extrinsics[:, :3, 3]                         # (N, 3)
+            centroid = cam_origins.mean(dim=0)                         # (3,)
+            radius = (cam_origins - centroid).norm(dim=-1).max().clamp(min=1e-6)
+            extrinsics = extrinsics.clone()
+            extrinsics[:, :3, 3] = (cam_origins - centroid) / radius
+
+        return extrinsics, intrinsics
 
     def _load_prompt(self, scene_dir: Path) -> str | None:
         cache_key = str(scene_dir)

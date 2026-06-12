@@ -54,7 +54,14 @@ unseen_subdatasets:
 val_seen: true
 evaluation_index_path: null
 
-# `cameras.json` stores rotation + position as a camera-to-world transform.
-camera_rotation_is_world_to_camera: false
+# cameras.json은 실제로 w2c. DL3DV scene 1개로 transforms.json과 검증 완료
+# (translation 자리수까지 일치, rotation은 P=[[0,1,0],[1,0,0],[0,0,-1]] 만큼 회전된
+# world frame). 두 플래그 같이 켜야 DL3DV/SceneTok world에 정렬됨.
+camera_rotation_is_world_to_camera: true
+align_world_to_dl3dv: true
+# cameras.json intrinsics는 raw pixel — DL3DV/RE10K처럼 image_dims로 나눠 [0,1] 정규화.
+normalize_intrinsics: true
+# Option B per-scene scale norm — default off. 셸에서 `dataset.normalize_scene_scale=true`로 켜고 비교
+normalize_scene_scale: false
 baseline_epsilon: 1e-3
 make_baseline: false
