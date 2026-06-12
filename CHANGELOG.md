@@ -7,6 +7,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- `scripts/run_standard_inference.sh <exp_name> [GPU]` — TI2V ckpt 표준 추론 셋업. 6 scenes (train: `0004`+`sav_014713_manual`, test: `blackswan`+`bike-packing`, OOD DL3DV: `a4c20f6...`+`aeea987...`) × 4 text × 2 cfg = 48 mp4. ControlNet ablation + uncertainty 자동. 새 eval index 2개 동봉: `assets/evaluation_index/dynamicverse_infer_{train,val}_2scene.json`. ckpt 간 비교 가능한 고정 grid를 제공해 매 추론마다 scene/text/cfg를 수동 구성하지 않도록 함.
+
+### Added
 - `model.denoiser.camera_input_type=controlnet_ac3d` (`src/model/denoiser/wan_ti2v.py`): AC3D 논문 VDiT-CC architecture에 충실한 새 ControlNet 변종. 기존 `controlnet` (parallel) / `controlnet_feedback` (단순 양방향)과 별도 모드로 추가, 기존 모드는 그대로 보존.
   - 핵심 차이:
     - **Noise/latent은 main DiT에만** 들어감 (ac3d_patch_embedding 없음). ctrl 분기엔 latent 직접 미입력.
