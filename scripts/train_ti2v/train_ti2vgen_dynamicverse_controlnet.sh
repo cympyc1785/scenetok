@@ -8,7 +8,7 @@ config=custom/scenetok_va-wan-ti2v_dynamicverse
 num_workers=4
 gpus=1
 num_nodes=1
-exp_name="va-wan-ti2v_dynamicverse_recon_controlnet_scene_camera"
+exp_name="va-wan-ti2v_dynamicverse_recon_controlnet_scene_camera_2_no_lora"
 
 # ── Condition routing ─────────────────────────────────────────────────────
 scene_input_type=controlnet
@@ -16,7 +16,7 @@ camera_input_type=controlnet
 condition_latents_input_type=none
 
 # ── LoRA on the main Wan DiT ──────────────────────────────────────────────
-lora_enabled=true
+lora_enabled=false
 lora_rank=32
 lora_alpha=32
 lora_target_modules='q,k,v,o,ffn.0,ffn.2'

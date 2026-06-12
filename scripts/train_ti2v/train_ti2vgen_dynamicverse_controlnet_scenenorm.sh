@@ -1,25 +1,21 @@
 #!/usr/bin/env bash
-# Variant of train_ti2vgen_dynamicverse_controlnet.sh:
-#   * Target views come from `video_input.mp4` (original, with dynamic objects)
-#     instead of `inpaint_result.mp4` (background only). Scene tokens still
-#     come from `inpaint_result.mp4` context — the model learns to add the
-#     dynamic foreground back via the text prompt.
-#   * Text is the dynamic-object description from
-#     `category/category.json` → `reasoning[dynamic[0]]`.
-# Same controlnet routing (scene + camera). GPU 0.
+# Train Wan TI2V 5B on WorldTraj/dynamicverse. Model architecture, dataset
+# layout, and view_sampler settings live in
+# `config/experiment/custom/scenetok_va-wan-ti2v_dynamicverse.yaml`. The
+# frequently-toggled knobs (condition types, LoRA, wandb) stay here.
 
 config=custom/scenetok_va-wan-ti2v_dynamicverse
 num_workers=4
 gpus=1
 num_nodes=1
-exp_name="va-wan-ti2v_dynamicverse_dynamic_controlnet_scene_camera_2_no_lora"
+exp_name="va-wan-ti2v_dynamicverse_recon_controlnet_scene_camera_2_scenenorm_no_lora"
 
 # ── Condition routing ─────────────────────────────────────────────────────
 scene_input_type=controlnet
 camera_input_type=controlnet
 condition_latents_input_type=none
 
-# ── LoRA on main Wan DiT ──────────────────────────────────────────────────
+# ── LoRA on the main Wan DiT ──────────────────────────────────────────────
 lora_enabled=false
 lora_rank=32
 lora_alpha=32
@@ -28,16 +24,15 @@ resume_lora_ckpt=null
 
 # ── wandb ────────────────────────────────────────────────────────────────
 wandb_activated=true
-wandb_tags='[dynamicverse,wan-ti2v,controlnet,scene+camera,lora,video_input,category]'
+wandb_tags='[dynamicverse,wan-ti2v,controlnet,scene+camera,lora]'
 
 export WANDB_API_KEY=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
 export DEBUG=1
 
-CUDA_VISIBLE_DEVICES=0 exec -a dynamic_scenetok_lets_go python -m src.main +experiment=${config} \
+CUDA_VISIBLE_DEVICES=3 exec -a dynamic_scenetok_lets_go python -m src.main +experiment=${config} \
   data_loader.train.num_workers=${num_workers} \
   mode=train \
-  dataset.target_video_name=video_input.mp4 \
-  dataset.prompt_style=category_first \
+  dataset.normalize_scene_scale=true \
   trainer.devices=${gpus} \
   trainer.num_nodes=${num_nodes} \
   trainer.num_sanity_val_steps=1 \

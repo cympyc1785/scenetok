@@ -12,7 +12,7 @@ config=custom/scenetok_va-wan-ti2v_dynamicverse
 num_workers=4
 gpus=1
 num_nodes=1
-exp_name="va-wan-ti2v_dynamicverse_dynamic_controlnet_scene_camera_2_no_lora"
+exp_name="va-wan-ti2v_dynamicverse_dynamic_controlnet_scene_camera_2_scenenorm_no_lora"
 
 # ── Condition routing ─────────────────────────────────────────────────────
 scene_input_type=controlnet
@@ -33,11 +33,12 @@ wandb_tags='[dynamicverse,wan-ti2v,controlnet,scene+camera,lora,video_input,cate
 export WANDB_API_KEY=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
 export DEBUG=1
 
-CUDA_VISIBLE_DEVICES=0 exec -a dynamic_scenetok_lets_go python -m src.main +experiment=${config} \
+CUDA_VISIBLE_DEVICES=2 exec -a dynamic_scenetok_lets_go python -m src.main +experiment=${config} \
   data_loader.train.num_workers=${num_workers} \
   mode=train \
   dataset.target_video_name=video_input.mp4 \
   dataset.prompt_style=category_first \
+  dataset.normalize_scene_scale=true \
   trainer.devices=${gpus} \
   trainer.num_nodes=${num_nodes} \
   trainer.num_sanity_val_steps=1 \
