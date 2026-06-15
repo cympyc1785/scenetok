@@ -58,6 +58,15 @@ class DatasetDynamicverseCfg(DatasetCfgCommon):
     # `video_input.mp4` (original with dynamic objects); train scene-token=
     # background, text=foreground.
     target_video_name: str | None = None
+    # Auxiliary background target for `controlnet_lightningdit` joint recon
+    # training. When set, the dataset loads a SECOND target video (typically
+    # `inpaint_result.mp4`) along with the main target, sampled at the same
+    # target indices, and exposes it as `target["recon_video"]`. The wrapper
+    # encodes it to a recon-target latent so the LightningDiT ctrl branch's
+    # raw prediction can be supervised toward background reconstruction
+    # while the main DiT learns dynamic (`target_video_name`) generation.
+    # None disables (default).
+    recon_target_video_name: str | None = None
     prompt_file: str = "prompts.json"
     prompt_key: str = "prompt_scene"
     # Prompt loading mode.
@@ -276,6 +285,20 @@ class DatasetDynamicverse(Dataset):
         else:
             tgt_frames = ctx_frames
 
+        # Optional auxiliary recon target (e.g. inpaint_result.mp4 for
+        # LightningDiT ctrl branch background supervision).
+        recon_frames = None
+        if self.cfg.recon_target_video_name is not None:
+            if self.cfg.recon_target_video_name == self.cfg.video_name:
+                recon_frames = ctx_frames
+            elif self.cfg.target_video_name is not None and self.cfg.recon_target_video_name == self.cfg.target_video_name:
+                recon_frames = tgt_frames
+            else:
+                recon_frames = self._load_video(
+                    scene_dir / self.cfg.recon_target_video_name,
+                    max_frames=num_cameras,
+                )
+
         num_views = min(
             ctx_frames.shape[0],
             tgt_frames.shape[0],
@@ -290,6 +313,11 @@ class DatasetDynamicverse(Dataset):
 
         ctx_frames = ctx_frames[:num_views]
         tgt_frames = tgt_frames[:num_views] if tgt_frames is not ctx_frames else ctx_frames
+        if recon_frames is not None:
+            recon_frames = (
+                ctx_frames if recon_frames is ctx_frames
+                else (tgt_frames if recon_frames is tgt_frames else recon_frames[:num_views])
+            )
         extrinsics = extrinsics[:num_views]
         intrinsics = intrinsics[:num_views]
 
@@ -316,6 +344,8 @@ class DatasetDynamicverse(Dataset):
         ctx_frames, intrinsics = self._ensure_min_shape(ctx_frames, intrinsics, min_shape)
         if tgt_frames is not ctx_frames:
             tgt_frames, _ = self._ensure_min_shape(tgt_frames, intrinsics, min_shape)
+        if recon_frames is not None and recon_frames is not ctx_frames and recon_frames is not tgt_frames:
+            recon_frames, _ = self._ensure_min_shape(recon_frames, intrinsics, min_shape)
 
         # Clone per-view tensors so context/target can be modulated
         # independently downstream (e.g. baseline rescaling).
@@ -390,6 +420,8 @@ class DatasetDynamicverse(Dataset):
                 "latent": tgt_frames[view_indices.target].float(),
                 "index": view_indices.target,
             }
+            if recon_frames is not None:
+                sample["target"]["recon_video"] = recon_frames[view_indices.target].float()
 
         if self.stage == "train" and self.cfg.augment:
             sample = apply_augmentation_shim(sample)
@@ -400,7 +432,15 @@ class DatasetDynamicverse(Dataset):
         if "context" in sample:
             sample["context"] = apply_crop_shim_to_views(sample["context"], ctx_shape)
         if "target" in sample:
+            recon_v = sample["target"].pop("recon_video", None)
             sample["target"] = apply_crop_shim_to_views(sample["target"], tgt_shape)
+            if recon_v is not None:
+                from .shims.crop_shim import rescale_and_crop
+                # Apply the same rescale+crop to the recon target frames using a
+                # dummy intrinsic — we only consume the image tensor.
+                dummy_intr = torch.eye(3).unsqueeze(0).expand(recon_v.shape[0], -1, -1)
+                recon_v, _ = rescale_and_crop(recon_v, dummy_intr, tgt_shape)
+                sample["target"]["recon_video"] = recon_v
 
         prompt = self._load_prompt(scene_dir)
         if prompt is not None:

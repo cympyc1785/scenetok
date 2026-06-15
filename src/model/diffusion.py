@@ -217,8 +217,10 @@ def step(
     inputs = x_t_inputs.clone()
 
     # Conditional Forward Pass
+    raw_cond_state = cond_state  # pre-cnd_proj copy for branches that need raw cond_dim
     if cond_state is None:
         cond_state = torch.zeros((b, model.num_scene_tokens, model.cond_dim), device=inputs.device)
+        raw_cond_state = cond_state
         cond_state = model.cnd_proj(cond_state)
         cond_state_uc = cond_state
     else:
@@ -226,11 +228,12 @@ def step(
 
 
     denoiser_input = DenoiserInputs(
-        view=inputs, 
-        pose=target_pose, 
-        timestep=t, 
+        view=inputs,
+        pose=target_pose,
+        timestep=t,
         state=cond_state,
-        text=text_state
+        text=text_state,
+        raw_state=raw_cond_state,
     )
     # print(temporal_downsample, inputs.shape, t.shape, cond_state.shape, target_pose.extrinsics.shape)
     pred_conditional, qk_list = model._forward(
@@ -239,8 +242,13 @@ def step(
         chunk_targets=chunk_targets,
     )
     if cfg_scale > 1.0:
-        cond_state_uc = model.null_tokens.expand(b, model.num_scene_tokens, -1)            
+        cond_state_uc = model.null_tokens.expand(b, model.num_scene_tokens, -1)
         denoiser_input.state = cond_state_uc
+        # Unconditional raw_state: zero in raw cond_dim space.
+        denoiser_input.raw_state = torch.zeros(
+            (b, model.num_scene_tokens, model.cond_dim),
+            device=inputs.device, dtype=cond_state_uc.dtype,
+        )
         negative_prompt = getattr(model, "negative_prompt", None)
         if negative_prompt:
             denoiser_input.text = model.encode_text_condition(negative_prompt, device=inputs.device)

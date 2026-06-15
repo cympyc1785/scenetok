@@ -29,6 +29,11 @@ class DenoiserInputs:
     state: Optional[Float[Tensor, "batch num _"]]=None
     text: Optional[Float[Tensor, "batch num _"]]=None
     condition_latents: Optional[Float[Tensor, "batch cond_view _ height width"]]=None
+    # Raw (pre-cnd_proj) scene tokens (cond_dim, not yet projected to model.dim).
+    # Filled by `step()` only when a branch needs the raw cond_dim tensor
+    # (e.g. `controlnet_lightningdit` to feed the SceneTok LightningDiT
+    # decoder's own cnd_proj). None for all other branches.
+    raw_state: Optional[Float[Tensor, "batch num _"]]=None
 
 
 @dataclass

@@ -1,4 +1,5 @@
 import math
+import os
 
 from .diffusion import first_stage_encode, last_stage_decode
 from .diffusion_wrapper import *
@@ -257,6 +258,15 @@ class T2VWrapper(DiffusionWrapper):
 
     @torch.no_grad()
     def generate_batch_with_scene(self, batch, sampler: Sampler, repeat_factor: int = 1):
+        if os.environ.get("FORCE_FP32"):
+            self.denoiser.model.to(torch.float32)
+            if getattr(self.denoiser, "text_encoder", None) is not None:
+                self.denoiser.text_encoder.to(torch.float32)
+            import diffsynth.models.wan_video_dit as _wvd
+            _wvd.FLASH_ATTN_3_AVAILABLE = False
+            _wvd.FLASH_ATTN_2_AVAILABLE = False
+            _wvd.SAGE_ATTN_AVAILABLE = False
+            print("[T2VWrapper] FORCE_FP32: cast model+text_encoder → fp32, disable FlashAttention")
         if self.model_cfg.compressor is not None:
             context_latents = get_latents(
                 autoencoder=self.autoencoder,
@@ -312,6 +322,12 @@ class T2VWrapper(DiffusionWrapper):
 
         x_t = torch.randn((b, num, c, h, w), device=device, dtype=dtype, generator=noise_generator)
         x_t *= self.scheduler.init_noise_sigma
+        _inject_path = os.environ.get("INJECT_NOISE_PATH")
+        if _inject_path:
+            injected = torch.load(_inject_path, map_location=device).to(dtype=dtype)
+            assert injected.shape == x_t.shape, f"injected noise shape {tuple(injected.shape)} != x_t {tuple(x_t.shape)}"
+            print(f"[T2VWrapper] Overriding x_t with noise from {_inject_path}  sum={injected.float().sum().item():.4f}")
+            x_t = injected
         first_frame_latents = None
         first_frame_mask_latent = None
         if self.should_replace_first_frame_latent():
@@ -610,6 +626,12 @@ class T2VWrapper(DiffusionWrapper):
             target_num_views=batch["target"]["latent"].shape[1],
         )
 
+        # Stash raw (pre-cnd_proj) cond tokens for branches that need cond_dim
+        # input (controlnet_lightningdit uses ckpt-warm-started Linear(64→1024)).
+        raw_scene_tokens = scene_tokens if scene_tokens is not None else torch.zeros(
+            (b, self.denoiser.num_scene_tokens, self.denoiser.cond_dim),
+            device=device, dtype=dtype,
+        )
         scene_tokens = self.preprocess_scene_tokens(
             scene_tokens=scene_tokens,
             shape=(b, self.denoiser.num_scene_tokens, self.denoiser.cond_dim),
@@ -624,7 +646,13 @@ class T2VWrapper(DiffusionWrapper):
             state=scene_tokens,
             text=self.get_text_condition(batch, device=device),
             condition_latents=condition_latents,
+            raw_state=raw_scene_tokens,
         )
+
+        # Clear stashed ctrl pred before forward; populated by wan_ti2v._forward
+        # when camera_input_type=controlnet_lightningdit.
+        if hasattr(self.denoiser, "_last_ctrl_pred_raw"):
+            self.denoiser._last_ctrl_pred_raw = None
 
         pred, _ = self.denoiser(
             inputs=denoiser_input,
@@ -645,6 +673,43 @@ class T2VWrapper(DiffusionWrapper):
             loss = loss.sum(-1) / target_cond_mask.sum(-1)
         else:
             loss = einops.reduce(loss, "b v c h w -> b", "mean")
+
+        # ── Joint recon loss for controlnet_lightningdit ────────────────────
+        # When `model.denoiser.litdit_recon_loss_weight > 0` AND the dataset
+        # provided `target["recon_video"]` (background frames), supervise the
+        # LightningDiT ctrl branch's raw (pre-gate) prediction toward the
+        # rectified-flow velocity for the background video. Uses the SAME
+        # noise + timestep as the main forward — `noisy_latents` already
+        # encodes that noise level — so only the target shifts.
+        litdit_recon_w = float(getattr(self.denoiser.cfg, "litdit_recon_loss_weight", 0.0))
+        recon_pred = getattr(self.denoiser, "_last_ctrl_pred_raw", None)
+        recon_video = batch["target"].get("recon_video") if "target" in batch else None
+        if litdit_recon_w > 0.0 and recon_pred is not None and recon_video is not None:
+            recon_batch = {**batch["target"], "latent": recon_video}
+            recon_target_latents = get_latents(
+                autoencoder=self.autoencoder,
+                inputs=recon_batch,
+                view_type="target",
+                precomputed_latents=self.dataset_cfg.precomputed_latents,
+                autoencoder_name=self.get_autoencoder_name("target"),
+                scaling_factor=self.get_autoencoder_scaling_factor("target"),
+                chunk_targets=getattr(self.dataset_cfg.view_sampler, "chunk_targets", True),
+            )
+            if num_target_latents is not None and num_target_latents != recon_target_latents.shape[1]:
+                recon_target_latents = recon_target_latents[:, :num_target_latents]
+            gt_recon = self.process_gt(recon_target_latents, noise, timestep)
+            recon_pred_aligned = recon_pred
+            if first_frame_latents is not None:
+                recon_pred_aligned = recon_pred_aligned[:, 1:]
+                gt_recon = gt_recon[:, 1:]
+            # ctrl branch operates in (B, C, V, H, W); main pred is (B, V, C, H, W).
+            # `process_gt` returns (B, V, C, H, W); align by rearranging recon_pred.
+            if recon_pred_aligned.shape != gt_recon.shape:
+                recon_pred_aligned = rearrange(recon_pred_aligned, "b c v h w -> b v c h w")
+            recon_loss = F.mse_loss(recon_pred_aligned, gt_recon, reduction="none")
+            recon_loss = einops.reduce(recon_loss, "b v c h w -> b", "mean")
+            loss = loss + litdit_recon_w * recon_loss
+            self.log("loss/litdit_recon", recon_loss.mean())
 
         if self.model_cfg.compressor is not None and self.model_cfg.compressor.scene_token_projection == "kl" and conditional_tokens and not self.frozen_compressor:
             kl_raw = tokens.kl()

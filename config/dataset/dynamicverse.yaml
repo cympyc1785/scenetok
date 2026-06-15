@@ -38,6 +38,11 @@ video_name: inpaint_result.mp4
 # Example: video_name=inpaint_result.mp4 (background), target_video_name=
 # video_input.mp4 (original with dynamic objects).
 target_video_name: null
+# Auxiliary background recon target (controlnet_lightningdit joint training).
+# When set (e.g. `inpaint_result.mp4`), dataset exposes `target["recon_video"]`
+# sampled at the same target indices; wrapper supervises the LightningDiT
+# ctrl branch's pre-gate prediction toward it. Default off (None).
+recon_target_video_name: null
 prompt_file: prompts.json
 prompt_key: prompt_scene
 # Prompt loading mode: "window_dict" (prompts.json, default) or

@@ -7,6 +7,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- `model.denoiser.litdit_recon_loss_weight: float = 0.0` + `dataset.recon_target_video_name: str | None = None` — controlnet_lightningdit joint dynamic+background reconstruction 학습. λ>0일 때 wrapper가 LightningDiT ctrl branch의 pre-gate raw prediction을 `target["recon_video"]` (보통 `inpaint_result.mp4`)의 rectified-flow velocity에 supervise. main DiT는 그대로 `target_video_name` (e.g. `video_input.mp4`) velocity 학습. **같은 noise + 같은 timestep**, target만 다른 두 path 동시 학습 — SceneTok recon 능력 보존하면서 dynamic generation 같이.
+  - 데이터셋: `dataset_dynamicverse.py`가 `recon_target_video_name` 지정 시 inpaint_result.mp4 같은 indices로 sample → `batch["target"]["recon_video"]`. 같은 crop/rescale 적용.
+  - wrapper: `_forward` (controlnet_lightningdit 분기)에서 zero-init gate 적용 전 ctrl_pred를 `self._last_ctrl_pred_raw`에 저장. `training_step`이 raw를 받아 `MSE(recon_pred, process_gt(recon_target_latents, noise, timestep))` 계산 후 `loss += λ * recon_loss`. wandb에 `loss/litdit_recon` 로깅.
+  - 셸: `scripts/train_ti2v/train_ti2vgen_dynamicverse_controlnet_lightningdit_dynamic_no_lora_recon.sh` (`+dataset.recon_target_video_name=inpaint_result.mp4 +model.denoiser.litdit_recon_loss_weight=1.0`, GPU 2). 
+
+### Changed
+- `model.denoiser.camera_input_type=controlnet_lightningdit` (`src/model/denoiser/wan_ti2v.py`): **구조 전면 재작성**. 기존 feedback-style block-wise residual 구조를 폐기하고 SceneTok rectified flow decoder (`LightningDiT`)를 통째로 ctrl 분기로 instantiate한 후 output-level 잔차로 main Wan DiT에 합산.
+  - 폐기된 모듈: `ac3d_main2ctrl` (feedback adapter), `ac3d_camera_patch_embed`, `ac3d_t_embedder`, `ac3d_cnd_proj`, `ac3d_projectors` (block-wise residual gates), block-별 ctrl 입력 합성 로직 — 모두 제거.
+  - 새 모듈:
+    - `self.model.litdit_branch = LightningDiT(...)` — `va-wan_dl3dv_256-480.ckpt`에서 strict=False로 full warm-start. patch_size=1 Conv2d x_embedder, plücker `pose_embed`, pose-aware `t_embedder`, 24 LightningDiTBlock (`use_qknorm=True, use_swiglu=True, use_rmsnorm=True, use_rope_3d=True`), `cnd_proj` (64→1024), `final_layer + unpatchify` 모두 활성.
+    - `self.model.litdit_output_gate = nn.Conv3d(C_lat, C_lat, kernel_size=1)` — zero-init weight+bias. ControlNet residual signature: 학습 초반엔 ctrl 기여=0 → Wan main 단독 작동 → 학습 진행하며 점진적으로 gate가 학습되어 ctrl prediction이 합산.
+  - Forward (wrapper `_forward`):
+    1. Main: `simple_wan_video_fn(... camera_input_type="none")` — Wan DiT만 (camera 정보 main에 안 들어감)
+    2. Ctrl: `self.model.litdit_branch._forward(DenoiserInputs(view=latents_v, pose=context_pose, timestep, state=raw_cond_state))` — LightningDiT 전체 pipeline 그대로
+    3. `return main_pred + litdit_output_gate(ctrl_pred)`
+  - 보조 변경:
+    - `src/model/types.py:DenoiserInputs.raw_state` 필드 신규 추가 — cnd_proj 거치기 전 raw cond_dim=64 scene tokens. controlnet_lightningdit 모드에서 LightningDiT 자체 cnd_proj ckpt warm-start 위해 필요. 다른 모드엔 영향 없음 (default None).
+    - `src/model/diffusion.py:step()`에서 raw cond_state 함께 전달 (uncond CFG path는 zero tensor in raw cond_dim).
+  - 학습 셸은 그대로 사용 가능: `model.denoiser.camera_input_type=controlnet_lightningdit` + `+model.denoiser.lightningdit_ckpt_path=checkpoints/va-wan_dl3dv_256-480.ckpt`.
+
+### Added
 - `scripts/run_standard_inference.sh <exp_name> [GPU]` — TI2V ckpt 표준 추론 셋업. 6 scenes (train: `0004`+`sav_014713_manual`, test: `blackswan`+`bike-packing`, OOD DL3DV: `a4c20f6...`+`aeea987...`) × 4 text × 2 cfg = 48 mp4. ControlNet ablation + uncertainty 자동. 새 eval index 2개 동봉: `assets/evaluation_index/dynamicverse_infer_{train,val}_2scene.json`. ckpt 간 비교 가능한 고정 grid를 제공해 매 추론마다 scene/text/cfg를 수동 구성하지 않도록 함.
 
 ### Added

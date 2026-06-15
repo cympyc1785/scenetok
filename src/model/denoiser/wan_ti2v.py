@@ -74,6 +74,12 @@ class WanTI2V5BCfg:
     lightningdit_num_heads: int = 16
     lightningdit_mlp_ratio: float = 4.0
     lightningdit_ckpt_path: str | Path | None = None  # warm-start ckpt
+    # Joint dynamic + background recon training: when > 0, the wrapper computes
+    # an additional rectified-flow loss between the LightningDiT ctrl branch's
+    # raw prediction (pre-gate) and the velocity for `target["recon_video"]`
+    # (typically `inpaint_result.mp4` — background only). Adds
+    # `λ · MSE(ctrl_pred_raw, v_recon)` to the main loss.
+    litdit_recon_loss_weight: float = 0.0
     num_target_split: int = 1
     input_shape: int | list[int] = 16
     noise_seed: int | None = None
@@ -533,124 +539,95 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
                 bias=orig_pe_ac.bias is not None,
             ).to(device=orig_pe_ac.weight.device, dtype=orig_pe_ac.weight.dtype)
         if self.camera_input_type == "controlnet_lightningdit":
-            # AC3D paper orchestration과 동일하나 ctrl block을 **LightningDiTBlock**
-            # 구조로 교체한 변종. 사전학습된 SceneTok lightningdit denoiser ckpt
-            # (`cfg.lightningdit_ckpt_path`)에서 첫 N개 block weight를 warm-start하여
-            # finetune.
-            #   - ctrl block hidden dim = `cfg.lightningdit_hidden_size` (기본 1024)
-            #   - Main Wan dim (3072 등) ↔ ctrl dim adapter: `ac3d_main2ctrl`/`ac3d_projectors`
-            #   - Scene tokens: 별도 `ac3d_cnd_proj`로 ctrl dim 투사
-            #   - Timestep cond: 별도 `ac3d_t_embedder` (LightningDiT의 SiLU MLP)
-            #   - RoPE는 ckpt와 정확히 매칭하기 어려워 skip (feat_rope=None) — 사전학습된
-            #     2D/3D RoPE 가정과 다른 patch grid로 들어가므로 attention은
-            #     position-blind으로 작동, qk_norm/스킵 connection이 형태를 유지.
-            from .layers.lightningdit import LightningDiTBlock, TimestepEmbedder
-
-            ac3d_n = max(int(cfg.ac3d_num_layers), 1)
-            ac3d_n = min(ac3d_n, len(self.model.blocks))
-            ld_dim = int(cfg.lightningdit_hidden_size)
-            ld_heads = int(cfg.lightningdit_num_heads)
-            ld_mlp_ratio = float(cfg.lightningdit_mlp_ratio)
-
-            self.model.ac3d_blocks = nn.ModuleList([
-                LightningDiTBlock(
-                    hidden_size=ld_dim,
-                    num_heads=ld_heads,
-                    mlp_ratio=ld_mlp_ratio,
-                    use_qknorm=True,
-                    use_swiglu=True,
-                    use_rmsnorm=True,
-                    wo_shift=False,
-                    is_3d_rope=False,
-                )
-                for _ in range(ac3d_n)
-            ]).to(device=ref_param.device, dtype=ref_param.dtype)
-
-            # main(Wan dim) → ctrl(ld_dim) — random init
-            self.model.ac3d_main2ctrl = nn.ModuleList([
-                nn.Linear(self.model.dim, ld_dim)
-                for _ in range(ac3d_n)
-            ]).to(device=ref_param.device, dtype=ref_param.dtype)
-            # ctrl(ld_dim) → main(Wan dim) — zero-init residual gate
-            self.model.ac3d_projectors = nn.ModuleList([
-                nn.Linear(ld_dim, self.model.dim)
-                for _ in range(ac3d_n)
-            ])
-            for proj in self.model.ac3d_projectors:
-                nn.init.zeros_(proj.weight)
-                nn.init.zeros_(proj.bias)
-            self.model.ac3d_projectors = self.model.ac3d_projectors.to(
-                device=ref_param.device, dtype=ref_param.dtype
+            # SceneTok rectified flow decoder (LightningDiT)를 통째로 ctrl 분기로
+            # instantiate. Main Wan DiT와 평행하게 독립 forward (no feedback) 후 final
+            # prediction을 zero-init Conv3d gate 통해 main_pred에 잔차 add.
+            #
+            # Ctrl 분기 == SceneTok 학습된 LightningDiT 그대로:
+            #   - x_embedder        : Conv2d(48 → 1024, k=1)           ← ckpt 그대로
+            #   - pose_embed        : get_camera(cfg) (plücker → pos)  ← ckpt 그대로
+            #   - t_embedder        : TimestepEmbedder(1024, pose-aware) ← ckpt 그대로
+            #   - blocks × 24       : LightningDiTBlock (SwiGLU+RMSNorm+qk_norm, 3D RoPE) ← ckpt 그대로
+            #   - cnd_proj          : Linear(64 → 1024)                ← ckpt 그대로 (raw cond_dim 입력)
+            #   - final_layer + unpatchify → (B, V, C_lat, H, W) velocity prediction
+            # 추가 학습 layer (zero-init):
+            #   - litdit_output_gate: Conv3d(C_lat, C_lat, k=1)        ← ControlNet residual gate
+            from .lightningdit import (
+                LightningDiT,
+                LightningDiTCfg,
+                LightningDiTKwargsCfg,
             )
-            # Scene tokens projector: scene_context는 외부 wrapper가 이미 main
-            # `cnd_proj(cond_dim → model.dim)` 통과시킨 (B, T, Wan_dim) 상태로
-            # 들어옴 → ctrl 분기 dim에 맞춰 한 번 더 투사 (model.dim → ld_dim).
-            self.model.ac3d_cnd_proj = nn.Linear(self.model.dim, ld_dim).to(
-                device=ref_param.device, dtype=ref_param.dtype
+
+            litdit_kwargs = LightningDiTKwargsCfg(
+                patch_size=1,
+                in_channels=int(self.model.patch_embedding.in_channels),
+                hidden_size=int(cfg.lightningdit_hidden_size),
+                depth=24,
+                num_heads=int(cfg.lightningdit_num_heads),
+                mlp_ratio=float(cfg.lightningdit_mlp_ratio),
+                class_dropout_prob=0.0,
+                num_classes=1000,
+                learn_sigma=False,
+                use_qknorm=True,
+                use_swiglu=True,
+                use_rope=False,
+                use_rope_3d=True,
+                use_rmsnorm=True,
+                wo_shift=False,
+                frequency_embedding_size=256,
             )
-            # Timestep embedder (LightningDiT style)
-            self.model.ac3d_t_embedder = TimestepEmbedder(
-                hidden_size=ld_dim, frequency_embedding_size=256
+            # Build a LightningDiT-side camera_cfg with the SAME in_channels
+            # inflation main wrapper does — otherwise pose_embed.linear_1
+            # expects 6 channels while Wan-style ray maps arrive as
+            # 6 * temporal_downsample channels.
+            ld_camera_cfg = deepcopy(cfg.camera)
+            ld_emb_cfg = getattr(ld_camera_cfg, "embedding", None)
+            if (
+                temporal_downsample > 1
+                and ld_emb_cfg is not None
+                and getattr(ld_emb_cfg, "name", None) == "time_embed"
+            ):
+                ld_emb_cfg.in_channels *= temporal_downsample
+            litdit_cfg = LightningDiTCfg(
+                name="lightningdit",
+                camera=ld_camera_cfg,
+                kwargs=litdit_kwargs,
+                single_dim_tokens=False,
+                num_target_split=int(cfg.num_target_split),
+                camera_conditioning="add",
+                input_shape=list(cfg.input_shape) if not isinstance(cfg.input_shape, int) else [cfg.input_shape, cfg.input_shape],
+                gradient_checkpointing=True,
+                pretrained_from=None,
+                ckpt_path=str(cfg.lightningdit_ckpt_path) if cfg.lightningdit_ckpt_path is not None else None,
+                load_strict=False,
+                causal_attention=False,
+                text_cond_dim=None,
+            )
+            # cond_dim mismatch check (ckpt expects raw cond_dim=64 for cnd_proj).
+            # If wrapper's cond_dim differs, LightningDiT.load_weights (strict=False
+            # + shape-mismatch pop) will silently drop cnd_proj; init random.
+            ld_cond_dim = 64
+            num_target_views = int(getattr(cfg, "ac3d_num_layers", 0)) or 10  # placeholder; over-written by data shape at forward
+            self.model.litdit_branch = LightningDiT(
+                cfg=litdit_cfg,
+                cond_dim=ld_cond_dim,
+                num_scene_tokens=int(num_scene_tokens),
+                num_views=int(num_target_views),
+                temporal_downsample=int(temporal_downsample),
+                using_wan=True,
+                cfg_train=False,
             ).to(device=ref_param.device, dtype=ref_param.dtype)
-            # Camera ray map → per-token ld_dim embedding. Main patch grid에 맞춤
-            # (Wan patch_size, e.g. (1, 2, 2)).
-            extra_in_ld = 6 * max(temporal_downsample, 1)
-            orig_pe_ld = self.model.patch_embedding
-            self.model.ac3d_camera_patch_embed = nn.Conv3d(
-                extra_in_ld,
-                ld_dim,
-                kernel_size=orig_pe_ld.kernel_size,
-                stride=orig_pe_ld.stride,
-                padding=orig_pe_ld.padding,
-                bias=orig_pe_ld.bias is not None,
-            ).to(device=orig_pe_ld.weight.device, dtype=orig_pe_ld.weight.dtype)
-
-            # Warm-start from sub-ckpt
+            # Zero-init residual gate: ctrl pred → main pred sum.
+            C_out = int(self.model.patch_embedding.in_channels)
+            self.model.litdit_output_gate = nn.Conv3d(
+                C_out, C_out, kernel_size=1, bias=True
+            ).to(device=ref_param.device, dtype=ref_param.dtype)
+            nn.init.zeros_(self.model.litdit_output_gate.weight)
+            nn.init.zeros_(self.model.litdit_output_gate.bias)
             if cfg.lightningdit_ckpt_path is not None:
-                ckpt_path = Path(cfg.lightningdit_ckpt_path)
-                if not ckpt_path.exists():
-                    raise FileNotFoundError(
-                        f"controlnet_lightningdit: ckpt not found at {ckpt_path}"
-                    )
-                state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-                sd = state.get("state_dict", state)
-                # Extract: denoiser.model.blocks.{i}.*  →  ac3d_blocks[i].*
-                # Extract: denoiser.cnd_proj.*         →  ac3d_cnd_proj.*
-                # Extract: denoiser.model.t_embedder.* →  ac3d_t_embedder.*
-                loaded_blocks = 0
-                missing_total: list[str] = []
-                unexpected_total: list[str] = []
-                for i in range(ac3d_n):
-                    blk_prefix = f"denoiser.model.blocks.{i}."
-                    blk_sd = {
-                        k[len(blk_prefix):]: v
-                        for k, v in sd.items()
-                        if k.startswith(blk_prefix)
-                    }
-                    if blk_sd:
-                        miss, unexp = self.model.ac3d_blocks[i].load_state_dict(
-                            blk_sd, strict=False
-                        )
-                        missing_total.extend(f"blocks.{i}." + m for m in miss)
-                        unexpected_total.extend(f"blocks.{i}." + u for u in unexp)
-                        loaded_blocks += 1
-                # cnd_proj는 dim 불일치로 (ckpt: cond_dim→ld_dim, ours: model.dim→ld_dim)
-                # warm-start 불가 — 랜덤 init 그대로 사용.
-                # t_embedder
-                te_sd = {
-                    k[len("denoiser.model.t_embedder."):]: v
-                    for k, v in sd.items()
-                    if k.startswith("denoiser.model.t_embedder.")
-                }
-                if te_sd:
-                    try:
-                        self.model.ac3d_t_embedder.load_state_dict(te_sd, strict=False)
-                    except Exception as e:
-                        print(f"[controlnet_lightningdit] ac3d_t_embedder load skipped: {e}")
                 print(
-                    f"[controlnet_lightningdit] warm-started from {ckpt_path}: "
-                    f"{loaded_blocks}/{ac3d_n} blocks, "
-                    f"missing={len(missing_total)}, unexpected={len(unexpected_total)}"
+                    f"[controlnet_lightningdit] ctrl branch warm-started from "
+                    f"{cfg.lightningdit_ckpt_path} (strict=False); output_gate zero-init."
                 )
         if self.camera_input_type == "channel_concat":
             # Channel-concat ray map with latent BEFORE the patch_embedding conv.
@@ -814,12 +791,8 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
             trainable = trainable or (
                 self.camera_input_type == "controlnet_lightningdit"
                 and (
-                    name.startswith("ac3d_camera_patch_embed.")
-                    or name.startswith("ac3d_blocks.")
-                    or name.startswith("ac3d_main2ctrl.")
-                    or name.startswith("ac3d_projectors.")
-                    or name.startswith("ac3d_cnd_proj.")
-                    or name.startswith("ac3d_t_embedder.")
+                    name.startswith("litdit_branch.")
+                    or name.startswith("litdit_output_gate.")
                 )
             )
             trainable = trainable or (
@@ -1126,18 +1099,65 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
         camera_embedding = self._get_camera_embedding(inputs, temporal_downsample, chunk_targets)
         camera_context = self._get_camera_context(camera_embedding)
 
-        pred = simple_wan_video_fn(
-            dit=self.model,
-            latents=latents,
-            timestep=timestep,
-            context=context,
-            scene_context=scene_context,
-            scene_input_type=self.cfg.scene_input_type,
-            camera_context=camera_context,
-            camera_input_type=self.camera_input_type,
-            fuse_vae_embedding_in_latents=False,
-            use_gradient_checkpointing=self.cfg.gradient_checkpointing and self.training,
-        )
+        if self.camera_input_type == "controlnet_lightningdit":
+            # Main Wan DiT forward — camera off (camera 정보는 ctrl 분기에서만 사용)
+            main_pred = simple_wan_video_fn(
+                dit=self.model,
+                latents=latents,
+                timestep=timestep,
+                context=context,
+                scene_context=scene_context,
+                scene_input_type=self.cfg.scene_input_type,
+                camera_context=None,
+                camera_input_type="none",
+                fuse_vae_embedding_in_latents=False,
+                use_gradient_checkpointing=self.cfg.gradient_checkpointing and self.training,
+            )
+            # Ctrl branch (SceneTok LightningDiT 그대로) — independent forward.
+            # latents currently `(B, C, V, H, W)`; LightningDiT expects `(B, V, C, H, W)`.
+            latents_v = rearrange(latents, "b c v h w -> b v c h w")
+            raw_scene = getattr(inputs, "raw_state", None)
+            # SceneTok convention: outer wrapper applies `cnd_proj` BEFORE passing
+            # `state` into the denoiser. LightningDiT._forward itself never invokes
+            # self.cnd_proj — its blocks' `attn2.to_k` expects `y` already in
+            # hidden_size (1024) space. So project here using the branch's own
+            # ckpt-warm-started `cnd_proj` (64 → 1024).
+            if raw_scene is not None:
+                projected_scene_ld = self.model.litdit_branch.cnd_proj(raw_scene)
+            else:
+                projected_scene_ld = None
+            ctrl_inputs = DenoiserInputs(
+                view=latents_v,
+                pose=inputs.pose,
+                timestep=inputs.timestep if inputs.timestep.ndim >= 1 else inputs.timestep.unsqueeze(0),
+                state=projected_scene_ld,
+                text=None,
+                condition_latents=None,
+            )
+            ctrl_pred, _ = self.model.litdit_branch._forward(
+                inputs=ctrl_inputs,
+                temporal_downsample=temporal_downsample,
+                chunk_targets=chunk_targets,
+            )
+            # ctrl_pred shape `(B, V, C, H, W)` → `(B, C, V, H, W)` to match main.
+            ctrl_pred = rearrange(ctrl_pred, "b v c h w -> b c v h w")
+            # Stash pre-gate raw ctrl prediction for joint recon loss.
+            self._last_ctrl_pred_raw = ctrl_pred
+            ctrl_pred = self.model.litdit_output_gate(ctrl_pred)
+            pred = main_pred + ctrl_pred
+        else:
+            pred = simple_wan_video_fn(
+                dit=self.model,
+                latents=latents,
+                timestep=timestep,
+                context=context,
+                scene_context=scene_context,
+                scene_input_type=self.cfg.scene_input_type,
+                camera_context=camera_context,
+                camera_input_type=self.camera_input_type,
+                fuse_vae_embedding_in_latents=False,
+                use_gradient_checkpointing=self.cfg.gradient_checkpointing and self.training,
+            )
         pred = self._crop_condition_latents_prediction(
             pred,
             condition_latents,
