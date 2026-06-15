@@ -7,6 +7,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- `model.denoiser.controlnet_no_text_cross_attn: bool = False` (`src/model/denoiser/wan_ti2v.py`): parallel `controlnet` 모드의 ctrl block에서 text cross-attention을 제거하는 옵션. `True`로 두면 `NewDiTBlock.from_dit_block(..., use_text_cross_attn=False)`로 ctrl block들이 instantiate되어 `cross_attn`/`norm3` 둘 다 생성 안 됨 → text는 main DiT만 처리하고 ctrl branch는 self_attn + scene_cross_attn + FFN만. AC3D-paper-strict (ctrl branch text-blind) 정신을 parallel controlnet 모드에도 적용. 기본값 False로 기존 동작 보존.
+  - 셸: `scripts/train_ti2v/train_ti2vgen_dynamicverse_controlnet_dynamic_no_lora_no_text_ctrl.sh` (`scene_input_type=controlnet`, `camera_input_type=controlnet`, LoRA off, `+model.denoiser.controlnet_no_text_cross_attn=true`, GPU 0). exp_name = `va-wan-ti2v_dynamicverse_dynamic_controlnet_scene_camera_2_no_lora_no_text_ctrl`.
+
 - `model.denoiser.litdit_recon_loss_weight: float = 0.0` + `dataset.recon_target_video_name: str | None = None` — controlnet_lightningdit joint dynamic+background reconstruction 학습. λ>0일 때 wrapper가 LightningDiT ctrl branch의 pre-gate raw prediction을 `target["recon_video"]` (보통 `inpaint_result.mp4`)의 rectified-flow velocity에 supervise. main DiT는 그대로 `target_video_name` (e.g. `video_input.mp4`) velocity 학습. **같은 noise + 같은 timestep**, target만 다른 두 path 동시 학습 — SceneTok recon 능력 보존하면서 dynamic generation 같이.
   - 데이터셋: `dataset_dynamicverse.py`가 `recon_target_video_name` 지정 시 inpaint_result.mp4 같은 indices로 sample → `batch["target"]["recon_video"]`. 같은 crop/rescale 적용.
   - wrapper: `_forward` (controlnet_lightningdit 분기)에서 zero-init gate 적용 전 ctrl_pred를 `self._last_ctrl_pred_raw`에 저장. `training_step`이 raw를 받아 `MSE(recon_pred, process_gt(recon_target_latents, noise, timestep))` 계산 후 `loss += λ * recon_loss`. wandb에 `loss/litdit_recon` 로깅.

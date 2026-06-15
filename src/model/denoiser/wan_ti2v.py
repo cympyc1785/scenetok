@@ -80,6 +80,10 @@ class WanTI2V5BCfg:
     # (typically `inpaint_result.mp4` — background only). Adds
     # `λ · MSE(ctrl_pred_raw, v_recon)` to the main loss.
     litdit_recon_loss_weight: float = 0.0
+    # If True, the parallel `controlnet` mode's ctrl blocks are instantiated
+    # with `use_text_cross_attn=False` (AC3D-paper-strict: text only in main
+    # DiT, ctrl branch text-blind). Default False keeps the existing behaviour.
+    controlnet_no_text_cross_attn: bool = False
     num_target_split: int = 1
     input_shape: int | list[int] = 16
     noise_seed: int | None = None
@@ -403,6 +407,7 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
                     has_image_input=ac3d_has_image_input,
                     camera_input_type="none",
                     scene_input_type=ac3d_scene_input,
+                    use_text_cross_attn=not bool(cfg.controlnet_no_text_cross_attn),
                 )
                 for i in range(ac3d_n)
             ])
