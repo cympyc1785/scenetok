@@ -410,6 +410,16 @@ class DiffusionWrapper(LightningModule):
         self.validation_loader_names = {0: "standard", 1: "unseen"}
         self.predicted = {name: [] for name in self.validation_loader_names.values()}
         self.generated = {name: [] for name in self.validation_loader_names.values()}
+        # Video/context logging accumulates up to `val_vis_num` samples across
+        # validation batches, then flushes once in `on_validation_end`. This
+        # decouples how many videos get logged from `data_loader.val.batch_size`
+        # — a reduced batch_size (e.g. 1, to save VAE-decode memory) still logs
+        # the full set instead of just the first batch.
+        self.val_vis_num = 8
+        self.val_vis_buffer = {
+            name: {"sampled": [], "target": [], "context": [], "scene": []}
+            for name in self.validation_loader_names.values()
+        }
         # Loss NaN/Inf occurrence counter (process-lifetime cumulative).
         # Used by training_step to drop into pdb after 3 occurrences.
         self.nan_loss_count = 0
@@ -1148,38 +1158,25 @@ class DiffusionWrapper(LightningModule):
         if self.global_rank != 0:
             return None
 
-        batch_vis = []
         batch_scene = []
         for j in range(b):
             scene = batch["scene"][j]
             batch_scene.append(scene)
-        
-        if batch_idx == 0:
-            log_tensor_as_video(self.logger, sampled_views, f"{loader_name}/Sampled Video", fps=8, step=val_step, caption=batch_scene)        
-            log_tensor_as_video(self.logger, target_views, f"{loader_name}/Original Video", fps=8, step=val_step, caption=batch_scene)
-            if dataloader_idx == 0:
-                log_tensor_as_video(self.logger, sampled_views, f"Sampled Video", fps=8, step=val_step, caption=batch_scene)        
-                log_tensor_as_video(self.logger, target_views, f"Original Video", fps=8, step=val_step, caption=batch_scene)
-          
-            for j in range(b):
-                scene = batch["scene"][j]
-                context_vis = add_label(hcat(*[context_views[j, i, ...] for i in range(v_c)]), "Context Views")
-                vis = add_label(context_vis, scene)
-                batch_vis.append(prep_image(vis))
-                
-            self.logger.log_image(
-                f"{loader_name}/Context ({self.sampler.cfg.name})",
-                batch_vis,
-                step=val_step,
-                caption=batch_scene,
-            )
-            if dataloader_idx == 0:
-                self.logger.log_image(
-                    f"Context ({self.sampler.cfg.name})",
-                    batch_vis,
-                    step=val_step,
-                    caption=batch_scene,
-                )
+
+        # Accumulate up to `val_vis_num` samples for video/context logging
+        # (flushed once in `on_validation_end`). Replaces the old
+        # `batch_idx == 0` immediate log so a reduced val batch_size still
+        # produces the full set of logged videos.
+        buf = self.val_vis_buffer.setdefault(
+            loader_name, {"sampled": [], "target": [], "context": [], "scene": []}
+        )
+        remaining = self.val_vis_num - len(buf["scene"])
+        if remaining > 0:
+            take = min(remaining, sampled_views.shape[0])
+            buf["sampled"].append(sampled_views[:take].detach().cpu())
+            buf["target"].append(target_views[:take].detach().cpu())
+            buf["context"].append(context_views[:take].detach().cpu())
+            buf["scene"].extend(batch_scene[:take])
 
         # Do a spline interpolation using context poses as "knot" and sample a video
         if self.val_cfg.video and batch_idx == 0:
@@ -1306,12 +1303,42 @@ class DiffusionWrapper(LightningModule):
                         if loader_name == "standard":
                             self.logger.log_metrics({f"{key}": value}, val_step)
 
+        # Flush accumulated video/context logs (up to `val_vis_num` samples,
+        # collected across val batches). Rank 0 only — matches the original
+        # logging guard.
+        if self.global_rank == 0:
+            idx0_name = self.validation_loader_names.get(0)
+            for loader_name, buf in self.val_vis_buffer.items():
+                if len(buf["scene"]) == 0:
+                    continue
+                n = self.val_vis_num
+                sampled = torch.cat(buf["sampled"])[:n].to(self.device, non_blocking=True)
+                target = torch.cat(buf["target"])[:n].to(self.device, non_blocking=True)
+                context = torch.cat(buf["context"])[:n].to(self.device, non_blocking=True)
+                scenes = buf["scene"][:n]
+                log_tensor_as_video(self.logger, sampled, f"{loader_name}/Sampled Video", fps=8, step=val_step, caption=scenes)
+                log_tensor_as_video(self.logger, target, f"{loader_name}/Original Video", fps=8, step=val_step, caption=scenes)
+                vis_list = []
+                v_c = context.shape[1]
+                for j in range(context.shape[0]):
+                    context_vis = add_label(hcat(*[context[j, i, ...] for i in range(v_c)]), "Context Views")
+                    vis = add_label(context_vis, scenes[j])
+                    vis_list.append(prep_image(vis))
+                self.logger.log_image(f"{loader_name}/Context ({self.sampler.cfg.name})", vis_list, step=val_step, caption=scenes)
+                if loader_name == idx0_name:
+                    log_tensor_as_video(self.logger, sampled, "Sampled Video", fps=8, step=val_step, caption=scenes)
+                    log_tensor_as_video(self.logger, target, "Original Video", fps=8, step=val_step, caption=scenes)
+                    self.logger.log_image(f"Context ({self.sampler.cfg.name})", vis_list, step=val_step, caption=scenes)
+
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
 
         for loader_name in self.predicted.keys():
             self.predicted[loader_name].clear()
             self.generated[loader_name].clear()
+        for buf in self.val_vis_buffer.values():
+            for v in buf.values():
+                v.clear()
 
         print("Setting Max Timesteps for training to: ", self.model_cfg.scheduler.num_train_timesteps)
         self.scheduler.set_timesteps(self.model_cfg.scheduler.num_train_timesteps)

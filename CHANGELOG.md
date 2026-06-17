@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+- `src/model/diffusion_wrapper.py` validation video/context logging이 `data_loader.val.batch_size`와 무관하게 항상 최대 8개 sample을 로깅하도록 변경. 기존엔 `batch_idx == 0` 첫 배치(`b`개)만 즉시 로깅 → batch_size를 1로 줄이면 video도 1개만 올라갔음. 이제 `val_vis_buffer`에 batch별로 누적(rank 0, `val_vis_num=8`)한 뒤 `on_validation_end`에서 한 번에 flush (Sampled/Original Video + Context grid, dataloader idx 0인 `standard`는 un-prefixed 패널도 함께). Context Interpolation video는 기존대로 `batch_idx==0` 유지 (per-scene 무거운 생성이라 누적 미적용).
+
 ### Added
 - `dataset.scene_id` / `dataset.force_empty_text` (`src/dataset/dataset_dynamicverse.py`):
   - `scene_id: str | None = None` — DL3DV 패턴 미러. `"<subdataset>/<scene_name>"` (예: `"DAVIS/bike-packing"`) 지정 시 `_collect_scenes`가 그 scene 하나만 반환. `fast_infer_t2v_swap_dataset.py` 단일 scene 추론용 (이전엔 dynamicverse가 scene_id 필드 없어 default scene이 골라지는 버그).
