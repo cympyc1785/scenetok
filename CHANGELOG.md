@@ -7,6 +7,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- `dataset.scene_id` / `dataset.force_empty_text` (`src/dataset/dataset_dynamicverse.py`):
+  - `scene_id: str | None = None` — DL3DV 패턴 미러. `"<subdataset>/<scene_name>"` (예: `"DAVIS/bike-packing"`) 지정 시 `_collect_scenes`가 그 scene 하나만 반환. `fast_infer_t2v_swap_dataset.py` 단일 scene 추론용 (이전엔 dynamicverse가 scene_id 필드 없어 default scene이 골라지는 버그).
+  - `force_empty_text: bool = False` — `True`면 prompt file 존재 여부와 무관하게 모든 scene 통과 + `sample["text"]=""` 강제. recon/no-text 학습(scene+camera condition만)용. 기존 prompt filter 로직은 `if not force_empty_text:` 블록으로 감쌈.
+- `model.denoiser.ac3d_num_layers` ablation 학습 셸 2개 + recon/no-text 학습 셸 1개 (`scripts/train_ti2v/`):
+  - `train_ti2vgen_dynamicverse_controlnet_dynamic_no_lora_layer_6.sh` — base dynamic controlnet + `ac3d_num_layers=6` (default 2 → 6, AC3D 논문 비율). exp `..._2_no_lora_layer_6`, GPU 1.
+  - `train_ti2vgen_dynamicverse_controlnet_dynamic_no_lora_no_text_ctrl_layer_6.sh` — `_no_text_ctrl` + `ac3d_num_layers=6`. exp `..._no_text_ctrl_layer_6`, GPU 3.
+  - `train_ti2vgen_dynamicverse_controlnet_recon_no_lora_no_text.sh` — context/target 둘 다 `inpaint_result.mp4` (default video_name) + `+dataset.force_empty_text=true` → reconstruction 학습 (text="", scene+camera만). exp `..._recon_controlnet_scene_camera_2_no_lora_no_text`, GPU 2.
+
+### Changed
+- `scripts/fast_infer_t2v_swap_dataset.py`: 추론 시 학습 셋업과 모델 init을 맞추기 위한 override 옵션 3개 추가.
+  - `--lora_disabled` — `model.denoiser.lora.enabled=False` 강제. yaml default가 `true`라 no_lora 학습 ckpt 추론 시 `base_layer`/`lora_A`/`lora_B` key mismatch (missing 1200) 발생하던 것 해결.
+  - `--prompt_style` — `dataset.prompt_style` override (예: `category_first`). dynamicverse 모델이 `category.json` dynamic-object description으로 학습됐는데 추론이 `window_dict` (배경 묘사 prompts.json) 쓰던 불일치 해결.
+  - `--static_target_camera` — target extrinsics/intrinsics를 `context[:, 0]`으로 전부 덮어써 정지 카메라 시점 추론.
+  - **중요 버그 수정**: 위 옵션 + `--scene_input_type controlnet --camera_input_type controlnet` 없이 돌리면 모델이 yaml default(`scene_input_type=cross_attention`, `camera_input_type=None`, LoRA on)로 init돼 학습된 `ac3d_*` ctrl branch weight가 전부 unexpected(688)로 버려지고 pure-T2V 비슷한 결과가 나옴. 옵션 명시 시 ckpt 1525 keys가 missing=0/unexpected=0으로 정확히 로드됨.
+
+### Added
 - `model.denoiser.controlnet_no_text_cross_attn: bool = False` (`src/model/denoiser/wan_ti2v.py`): parallel `controlnet` 모드의 ctrl block에서 text cross-attention을 제거하는 옵션. `True`로 두면 `NewDiTBlock.from_dit_block(..., use_text_cross_attn=False)`로 ctrl block들이 instantiate되어 `cross_attn`/`norm3` 둘 다 생성 안 됨 → text는 main DiT만 처리하고 ctrl branch는 self_attn + scene_cross_attn + FFN만. AC3D-paper-strict (ctrl branch text-blind) 정신을 parallel controlnet 모드에도 적용. 기본값 False로 기존 동작 보존.
   - 셸: `scripts/train_ti2v/train_ti2vgen_dynamicverse_controlnet_dynamic_no_lora_no_text_ctrl.sh` (`scene_input_type=controlnet`, `camera_input_type=controlnet`, LoRA off, `+model.denoiser.controlnet_no_text_cross_attn=true`, GPU 0). exp_name = `va-wan-ti2v_dynamicverse_dynamic_controlnet_scene_camera_2_no_lora_no_text_ctrl`.
 

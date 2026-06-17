@@ -82,6 +82,16 @@ def parse_args():
                    help="model.denoiser.scene_input_type override (yaml default가 다르면 명시).")
     p.add_argument("--camera_input_type", default=None,
                    help="model.denoiser.camera_input_type override (yaml default가 다르면 명시).")
+    p.add_argument("--static_target_camera", action="store_true",
+                   help="target extrinsics/intrinsics를 context[:, 0]으로 모두 덮어써서 "
+                        "정지 카메라 시점(첫 context view 고정)에서 dynamic foreground만 "
+                        "움직이게 만든다. context view 1개 추론에 주로 사용.")
+    p.add_argument("--lora_disabled", action="store_true",
+                   help="model.denoiser.lora.enabled=False로 강제. yaml default가 true라 "
+                        "no_lora 학습 ckpt 추론 시 key mismatch 발생 → 이 옵션으로 fix.")
+    p.add_argument("--prompt_style", default=None,
+                   help="dataset.prompt_style override (e.g. category_first for dynamicverse "
+                        "models trained with category.json dynamic-object descriptions).")
     return p.parse_args()
 
 
@@ -145,6 +155,10 @@ def build_cfg(args):
     cfg_dict.model.scheduler.num_inference_steps = args.num_inference_steps
     if "noise_seed" in cfg_dict.model.denoiser:
         cfg_dict.model.denoiser.noise_seed = args.noise_seed
+    if args.lora_disabled:
+        cfg_dict.model.denoiser.lora.enabled = False
+    if args.prompt_style is not None:
+        cfg_dict.dataset.prompt_style = args.prompt_style
     if args.scene_input_type is not None:
         cfg_dict.model.denoiser.scene_input_type = args.scene_input_type
     if args.camera_input_type is not None:
@@ -243,6 +257,12 @@ def main():
             v_t = batch["target"]["extrinsics"].shape[1]
             scene = batch["scene"][0]
             print(f"[infer] scene={scene}, context={v_c}, target={v_t}")
+            if args.static_target_camera:
+                ctx_ext0 = batch["context"]["extrinsics"][:, 0:1]
+                ctx_int0 = batch["context"]["intrinsics"][:, 0:1]
+                batch["target"]["extrinsics"] = ctx_ext0.expand(-1, v_t, -1, -1).clone()
+                batch["target"]["intrinsics"] = ctx_int0.expand(-1, v_t, -1, -1).clone()
+                print(f"[static_target_camera] target extrinsics/intrinsics overwritten with context[:, 0] for all {v_t} views")
 
             # dataset prompt extraction (없으면 빈 문자열 → dataset combo skip)
             dataset_text_raw = batch.get("text", None)

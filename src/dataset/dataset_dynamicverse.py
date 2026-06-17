@@ -96,6 +96,15 @@ class DatasetDynamicverseCfg(DatasetCfgCommon):
     # also restricts to the scenes listed in the JSON. Built by
     # `scripts/build_dynamicverse_eval_index.py`.
     evaluation_index_path: Path | None = None
+    # Optional single-scene override (mirrors DL3DV's `scene_id` pattern). When
+    # set to `"<subdataset>/<scene_name>"` (e.g. `"DAVIS/bike-packing"`),
+    # `_collect_scenes` returns just that one scene — useful for one-off
+    # inference via `fast_infer_t2v_swap_dataset.py`.
+    scene_id: str | None = None
+    # When True: bypass prompt file requirement and force `sample["text"]=""`
+    # for every scene. Use this for recon/no-text training where the model
+    # should learn from scene/camera condition only (no text guidance).
+    force_empty_text: bool = False
     # Some pipelines store rotation in world-to-camera form. `_load_cameras`는
     # `True`면 `[R | t]`를 w2c로 보고 `c2w = inv(w2c)`로 변환. 검증된 dynamicverse
     # cameras.json은 **w2c** (DL3DV transforms.json과 동일 scene의 w2c와
@@ -171,6 +180,16 @@ class DatasetDynamicverse(Dataset):
             return json.load(f)
 
     def _collect_scenes(self) -> list[Path]:
+        # Single-scene override (DL3DV-style). Takes precedence over the
+        # subdataset/eval_index filtering below.
+        if self.cfg.scene_id is not None:
+            scene_dir = self.root / self.cfg.scene_id
+            if not scene_dir.exists():
+                raise FileNotFoundError(
+                    f"dynamicverse scene_id={self.cfg.scene_id!r} not found at {scene_dir}"
+                )
+            print(f"\n\nUsing single dynamicverse scene: {self.cfg.scene_id}\n\n")
+            return [scene_dir]
         excluded = set(self.cfg.excluded_subdatasets)
         unseen = set(self.cfg.unseen_subdatasets)
         # train + val.standard share the "seen" pool (everything except
@@ -194,21 +213,26 @@ class DatasetDynamicverse(Dataset):
                         continue
                 if not (scene_dir / self.cfg.camera_file).exists():
                     continue
-                prompt_path = (
-                    scene_dir / self.cfg.category_file
-                    if self.cfg.prompt_style == "category_first"
-                    else scene_dir / self.cfg.prompt_file
-                )
-                if not prompt_path.exists():
-                    continue
-                # `require_prompt`: drop scenes whose prompts.json lacks a usable
-                # `prompt_key` string. `default_collate` raises (or silently
-                # drops the key) when some samples carry `sample["text"]` and
-                # others don't → text condition is silently lost for the whole
-                # batch. Keep this on for text-conditioned training.
-                if self.cfg.require_prompt and self._load_prompt(scene_dir) is None:
-                    dropped_no_prompt += 1
-                    continue
+                if not self.cfg.force_empty_text:
+                    prompt_path = (
+                        scene_dir / self.cfg.category_file
+                        if self.cfg.prompt_style == "category_first"
+                        else scene_dir / self.cfg.prompt_file
+                    )
+                    if not prompt_path.exists():
+                        # Only required when text supervision is needed.
+                        # `require_prompt=False` keeps scenes with no prompt file
+                        # — they train with text="" (sample["text"] omitted).
+                        if self.cfg.require_prompt:
+                            continue
+                    # `require_prompt`: drop scenes whose prompts.json lacks a usable
+                    # `prompt_key` string. `default_collate` raises (or silently
+                    # drops the key) when some samples carry `sample["text"]` and
+                    # others don't → text condition is silently lost for the whole
+                    # batch. Keep this on for text-conditioned training.
+                    if self.cfg.require_prompt and self._load_prompt(scene_dir) is None:
+                        dropped_no_prompt += 1
+                        continue
                 scenes.append(scene_dir)
         if self.cfg.require_prompt and dropped_no_prompt > 0:
             print(
@@ -442,9 +466,12 @@ class DatasetDynamicverse(Dataset):
                 recon_v, _ = rescale_and_crop(recon_v, dummy_intr, tgt_shape)
                 sample["target"]["recon_video"] = recon_v
 
-        prompt = self._load_prompt(scene_dir)
-        if prompt is not None:
-            sample["text"] = prompt
+        if self.cfg.force_empty_text:
+            sample["text"] = ""
+        else:
+            prompt = self._load_prompt(scene_dir)
+            if prompt is not None:
+                sample["text"] = prompt
         return sample
 
     # ─── helpers ───────────────────────────────────────────────────────────
