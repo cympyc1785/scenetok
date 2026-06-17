@@ -488,12 +488,112 @@ class T2VWrapper(DiffusionWrapper):
         #     )
         return None
 
+    def _reco_training_step(self, batch, batch_idx):
+        """ReCo(Wan2.1 VACE 1.3B) + LightningDiT ctrl branch.
+
+        - main 16ch ReCo latent (width-doubled): 좌=inpaint_result(recon) / 우=video_input(dynamic).
+        - bg 48ch latent (ldt branch 입력): inpaint_result, denoiser 내부 Wan2.2 VAE로 인코딩.
+        - same timestep t로 둘 다 noise. 출력 좌/우 split → recon + dynamic rectified-flow loss.
+        """
+        batch = preprocess_batch(batch)
+        ae_name = self.get_autoencoder_name("target")
+        ae_scale = self.get_autoencoder_scaling_factor("target")
+        chunk = getattr(self.dataset_cfg.view_sampler, "chunk_targets", True)
+
+        # 16ch latents: video_input(dynamic, batch target latent) + inpaint_result(recon_video)
+        dyn_lat = get_latents(autoencoder=self.autoencoder, inputs=batch["target"], view_type="target",
+                              precomputed_latents=self.dataset_cfg.precomputed_latents,
+                              autoencoder_name=ae_name, scaling_factor=ae_scale, chunk_targets=chunk)
+        recon_video = batch["target"].get("recon_video")
+        if recon_video is None:
+            raise ValueError("ReCo 학습은 dataset.recon_target_video_name(inpaint_result.mp4)이 필요합니다.")
+        recon_lat = get_latents(autoencoder=self.autoencoder, inputs={**batch["target"], "latent": recon_video},
+                                view_type="target", precomputed_latents=self.dataset_cfg.precomputed_latents,
+                                autoencoder_name=ae_name, scaling_factor=ae_scale, chunk_targets=chunk)
+
+        device, dtype = dyn_lat.device, dyn_lat.dtype
+        target_pose, temporal_downsample, num_target_latents = self.prepare_target_pose(
+            batch["target"], num_latents=dyn_lat.shape[1])
+        if num_target_latents is not None and num_target_latents != dyn_lat.shape[1]:
+            dyn_lat = dyn_lat[:, :num_target_latents]
+            recon_lat = recon_lat[:, :num_target_latents]
+        # width-doubled main target: 좌 recon | 우 dynamic
+        target_reco = torch.cat([recon_lat, dyn_lat], dim=-1)        # (B,V,16,H,2W)
+        b, v_t = target_reco.shape[:2]
+
+        # bg 48ch latent (inpaint_result frames → denoiser 내부 VAE)
+        bg_clean = self.denoiser.encode_bg(recon_video.to(device=device, dtype=dtype))
+        if num_target_latents is not None and num_target_latents != bg_clean.shape[1]:
+            bg_clean = bg_clean[:, :num_target_latents]
+
+        # scene tokens (context → compressor)
+        scene_tokens = None
+        tokens = None
+        if self.model_cfg.compressor is not None:
+            context_latents = get_latents(autoencoder=self.autoencoder, inputs=batch["context"], view_type="context",
+                                          precomputed_latents=self.dataset_cfg.precomputed_latents,
+                                          autoencoder_name=self.get_autoencoder_name("context"),
+                                          scaling_factor=self.get_autoencoder_scaling_factor("context"))
+            context_inputs = CompressorInputs(
+                view=context_latents,
+                pose=CameraInputs(intrinsics=batch["context"]["intrinsics"], extrinsics=batch["context"]["extrinsics"]),
+                mask=None)
+            if self.frozen_compressor:
+                with torch.no_grad():
+                    tokens, *_ = self.compressor(inputs=context_inputs)
+            else:
+                tokens, *_ = self.compressor(inputs=context_inputs)
+            scene_tokens = tokens.sample() if self.model_cfg.compressor.scene_token_projection == "kl" else tokens
+
+        # timestep (b,v) + noise (same t for both branches, independent noise per channel-count)
+        timestep = self.get_noise_level((b,), dtype=dtype)
+        timestep = repeat(timestep, "b -> b v", v=v_t)
+        noise_reco = torch.randn_like(target_reco)
+        noisy_reco = self.scheduler.add_noise(target_reco, noise_reco, timestep)
+        noise_bg = torch.randn_like(bg_clean)
+        noisy_bg = self.scheduler.add_noise(bg_clean, noise_bg, timestep)
+
+        # scene tokens은 ldt branch의 cnd_proj로만 들어감 (main ReCo DiT는 scene 직접 미사용)
+        # → raw_state로만 전달, state(projected)는 None.
+        raw_scene_tokens = scene_tokens if scene_tokens is not None else torch.zeros(
+            (b, self.denoiser.num_scene_tokens, self.denoiser.cond_dim), device=device, dtype=dtype)
+
+        denoiser_input = DenoiserInputs(
+            view=noisy_reco, pose=target_pose, timestep=self.rescale_timesteps(timestep=timestep),
+            state=None, text=self.get_text_condition(batch, device=device),
+            condition_latents=noisy_bg, raw_state=raw_scene_tokens)
+
+        pred = self.denoiser(inputs=denoiser_input, temporal_downsample=temporal_downsample, chunk_targets=chunk)
+        if isinstance(pred, tuple):
+            pred = pred[0]
+        gt = self.process_gt(target_reco, noise_reco, timestep)      # (B,V,16,H,2W)
+
+        wh = gt.shape[-1] // 2
+        loss_recon = F.mse_loss(pred[..., :wh], gt[..., :wh])        # 좌: background recon
+        loss_dyn = F.mse_loss(pred[..., wh:], gt[..., wh:])          # 우: dynamic
+        recon_w = float(getattr(self.denoiser.cfg, "recon_loss_weight", 1.0))
+        loss = recon_w * loss_recon + loss_dyn
+
+        current_lr = self.optimizers().param_groups[0]["lr"]
+        if self.global_rank == 0:
+            print(f"Train step {self.step_tracker.get_step()}; loss = {loss.item():.4f} "
+                  f"(recon {loss_recon.item():.4f} dyn {loss_dyn.item():.4f}) lr = {current_lr}")
+        self.log("loss/diffusion", loss)
+        self.log("loss/reco_recon", loss_recon)
+        self.log("loss/reco_dynamic", loss_dyn)
+        return loss
+
     def training_step(self, batch, batch_idx):
         if batch is None:  # safe_collate returned None (entire batch was None-filtered)
             return None
         if self.step_tracker is not None:
             self.step_tracker.set_step(self.global_step)
             self.log("step_tracker/step", self.step_tracker.get_step())
+
+        # ReCo(Wan2.1 VACE) + LightningDiT ctrl branch — width-doubled dual-loss path.
+        from src.model.denoiser.reco_wan_vace import RecoWanVace1_3BDenoiser
+        if isinstance(self.denoiser, RecoWanVace1_3BDenoiser):
+            return self._reco_training_step(batch, batch_idx)
 
         batch = preprocess_batch(batch)
         target_latents = get_latents(

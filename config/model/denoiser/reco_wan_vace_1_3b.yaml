@@ -1,0 +1,53 @@
+name: reco_wan_vace_1_3b
+
+camera:
+  name: ray
+  input_shape: [30, 52]   # ldt branch ray grid (Wan2.2 latent patch grid)
+  normalize: false
+  origin_first: false
+  scale: [1.0, 1.0]
+  embedding:
+    name: time_embed
+    in_channels: 6
+    dropout_prob: 0.0
+    fourier: true
+    freq_origin: 15
+    freq_direction: 15
+
+model_root: src/model/ReCo/checkpoints/Wan2.1-VACE-1.3B
+dit_pattern: diffusion_pytorch_model*.safetensors
+text_encoder_path: null
+tokenizer_path: null
+seq_len: 512
+clean: whitespace
+gradient_checkpointing: true
+
+# LightningDiT ctrl branch (va-wan_dl3dv 48ch warm-start)
+lightningdit_ckpt_path: checkpoints/va-wan_dl3dv_256-480.ckpt
+lightningdit_hidden_size: 1024
+lightningdit_num_heads: 16
+lightningdit_mlp_ratio: 4.0
+lightningdit_in_channels: 48
+reco_latent_channels: 16
+
+# 내부 background VAE (Wan2.2 48ch) — ldt branch 입력 인코딩
+bg_vae_ckpt_path: checkpoints/Wan2.2_VAE.pth
+bg_latent_channels: 48
+bg_scaling_factor: 1.0
+
+scene_input_type: controlnet
+camera_input_type: controlnet_lightningdit
+num_target_split: 2
+input_shape: [30, 52]
+noise_seed: null
+vace_scale: 1.0
+recon_loss_weight: 1.0
+ckpt_path: null
+load_strict: false
+
+lora:
+  enabled: true
+  rank: 128
+  alpha: 128
+  target_modules: q,k,v,o,ffn.0,ffn.2
+  checkpoint: src/model/ReCo/checkpoints/ReCo/2026_01_16_v1_release.ckpt

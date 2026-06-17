@@ -1,0 +1,8 @@
+name: wan
+
+pretrained_from: src/model/ReCo/checkpoints/Wan2.1-VACE-1.3B/Wan2.1_VAE.pth
+
+kwargs:
+  in_channels: 3
+  latent_channels: 16
+  scaling_factor: 1.0

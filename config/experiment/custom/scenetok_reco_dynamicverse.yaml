@@ -1,0 +1,115 @@
+# @package _global_
+#
+# ReCo (Wan2.1 VACE 1.3B) + LightningDiT ControlNet branch, trained on dynamicverse.
+# Mirrors `scenetok_va-wan-ti2v_dynamicverse.yaml` but swaps:
+#   - denoiser: reco_wan_vace_1_3b (Wan2.1 VACE 1.3B + ReCo LoRA + LightningDiT ctrl)
+#   - target autoencoder: wan16 (Wan2.1 VAE, 16ch) — ReCo main latent
+#     (denoiser 내부에 Wan2.2 48ch VAE도 보유 — ldt branch background latent용)
+# ReCo width-doubled 출력: 좌=recon(inpaint_result) / 우=dynamic(video_input).
+# dataset은 target=video_input.mp4 + recon_target=inpaint_result.mp4 (셸에서 지정).
+
+defaults:
+  - override /dataset: dynamicverse
+  - override /dataset/view_sampler: caption_window
+  - override /model/scheduler: rf
+  - override /model/denoiser: reco_wan_vace_1_3b
+  - override /model/autoencoders/context: va
+  - override /model/autoencoders/target: wan16
+  - override /model/compressor: mv_B1
+  - override /model/compressor/camera: ray
+  - override /model/compressor/camera/embedding: lvsm
+
+dataset:
+  root: ./WorldTraj/dynamicverse
+  context_shape: [256, 448]
+  target_shape: [480, 832]
+
+  view_sampler:
+    num_context_views: 12
+    num_target_views: 10
+    prompts_filename: prompts.json
+
+data_loader:
+  train:
+    batch_size: 1
+  val:
+    standard:
+      shuffle: false
+      batch_size: 1
+      max_batches: 4
+      num_workers: 2
+      seed: 0
+      interval: 5000
+      persistent_workers: false
+    unseen:
+      shuffle: false
+      batch_size: 1
+      max_batches: 4
+      num_workers: 2
+      seed: 0
+      interval: 5000
+      persistent_workers: false
+
+val:
+  video_length: 37
+  window_shift: 5
+
+sampler:
+  clean_targets: 5
+
+freeze:
+  denoiser: false
+  compressor: true
+  autoencoder: true
+
+model:
+  text_encoder: null
+
+  scheduler:
+    sampling_type: random_uniform
+    num_inference_steps: 50
+    kwargs:
+      weighting: shifted
+      timestep_shift: 8
+
+  compressor:
+    ckpt_path: checkpoints/va-wan_dl3dv_256x448.ckpt
+    load_strict: false
+    kl_weights: [0.0, 0.0]
+    input_shape: [16, 28]
+    num_scene_tokens: 1024
+    causal_self_atten: false
+    gradient_checkpointing: false
+    token_dim: 64
+    init_large: true
+    camera_conditioning: adaLN
+    scene_token_projection: kl
+    mask_context: false
+    camera:
+      input_shape: [128, 224]
+      embedding:
+        patch_size: 16
+    kwargs:
+      use_rope_2d: true
+      use_rope_3d: false
+
+trainer:
+  max_steps: 5_000_001
+  val_check_interval: 5000
+  task_steps: null
+  accumulate_grad_batches: 1
+  gradient_clip_val: 0.1
+  precision: bf16-mixed
+
+optimizer:
+  name: AdamW
+  lr: 1.0e-4
+  scale_lr: false
+  milestones: [2000]
+  scheduler:
+    - name: LinearLR
+      frequency: 1
+      interval: step
+      kwargs:
+        start_factor: 5.e-4
+        total_iters: 2000

@@ -76,8 +76,16 @@ class RecoWanVace1_3BCfg:
     lightningdit_in_channels: int = 48     # va-wan_dl3dv LightningDiT는 Wan2.2 48ch
     # ReCo VACE latent (Wan2.1) 채널 — ldt 출력(48ch)을 이리로 매핑.
     reco_latent_channels: int = 16
+    # ── 내부 보유 background VAE (Wan2.2 48ch) — ldt branch 입력 인코딩용 ──────
+    bg_vae_ckpt_path: str | Path = "checkpoints/Wan2.2_VAE.pth"
+    bg_latent_channels: int = 48
+    bg_scaling_factor: float = 1.0
     # ── conditioning routing (호환용; ReCo는 항상 LightningDiT ctrl 사용) ─────
     scene_input_type: Literal["none", "controlnet"] = "controlnet"
+    # `_derive_camera_shapes`가 latent-domain ray로 인식하도록 (camera.input_shape
+    # = latent_shape). ReCo 내부에선 routing에 안 쓰이고 ldt branch가 latent grid
+    # ray를 쓰므로 controlnet_lightningdit으로 둔다.
+    camera_input_type: str = "controlnet_lightningdit"
     num_target_split: int = 1
     input_shape: int | list[int] = field(default_factory=lambda: [30, 52])
     noise_seed: int | None = None
@@ -132,6 +140,16 @@ class RecoWanVace1_3BDenoiser(Denoiser[RecoWanVace1_3BCfg]):
             self._enable_lora(self.vace, cfg.lora, prefix="(VACE)")
             if cfg.lora.checkpoint is not None:
                 self._load_reco_lora(str(cfg.lora.checkpoint))
+
+        # 3.5) 내부 background VAE (Wan2.2 48ch, frozen) — ldt branch 입력 인코딩
+        from src.model.autoencoder.autoencoder_wan import AutoencoderWan, WanKwargsCfg
+        self.bg_vae = AutoencoderWan(WanKwargsCfg(
+            latent_channels=cfg.bg_latent_channels, scaling_factor=cfg.bg_scaling_factor
+        ))
+        self.bg_vae.from_pretrained(str(cfg.bg_vae_ckpt_path))
+        for p in self.bg_vae.parameters():
+            p.requires_grad = False
+        self.bg_scaling_factor = float(cfg.bg_scaling_factor)
 
         # 4) LightningDiT ctrl branch (warm-start) + ldt2reco_proj (zero-init)
         ref_param = next(self.model.parameters())
@@ -246,6 +264,30 @@ class RecoWanVace1_3BDenoiser(Denoiser[RecoWanVace1_3BCfg]):
         if cfg.lightningdit_ckpt_path is not None:
             print(cyan(f"(ReCo) LightningDiT ctrl branch warm-started from {cfg.lightningdit_ckpt_path}"))
 
+    def encode_text_condition(self, text, device: torch.device):
+        """T5 text encoder → raw context (B, L, 4096). model_fn_wan_video가 내부에서
+        `dit.text_embedding`(4096→1536)을 적용하므로 여기선 projection 하지 않는다."""
+        if text is None:
+            text = ""
+        ids, mask = self.tokenizer(text, return_mask=True)
+        ids, mask = ids.to(device), mask.to(device)
+        with torch.no_grad():
+            text_state = self.text_encoder(ids, mask)
+            seq_lens = mask.gt(0).sum(dim=1).long()
+            for i, v in enumerate(seq_lens):
+                text_state[i, v:] = 0
+        return text_state.to(dtype=next(self.model.parameters()).dtype)
+
+    @torch.no_grad()
+    def encode_bg(self, frames: Tensor) -> Tensor:
+        """inpaint_result frames (B, V, 3, H, W) → Wan2.2 48ch background latent (B, V, 48, h, w)."""
+        vae_dtype = next(self.bg_vae.parameters()).dtype
+        out_dtype = frames.dtype
+        lat = self.bg_vae.encode(frames.to(dtype=vae_dtype))
+        if self.bg_scaling_factor != 1.0:
+            lat = lat * self.bg_scaling_factor
+        return lat.to(dtype=out_dtype)
+
     def _set_trainable_parameters(self) -> None:
         # 전체 freeze 후, trainable: ReCo LoRA(DiT+VACE) + LightningDiT 전체 + projector.
         for p in self.model.parameters():
@@ -253,6 +295,8 @@ class RecoWanVace1_3BDenoiser(Denoiser[RecoWanVace1_3BCfg]):
         for p in self.vace.parameters():
             p.requires_grad = False
         for p in self.text_encoder.parameters():
+            p.requires_grad = False
+        for p in self.bg_vae.parameters():
             p.requires_grad = False
         for name, p in self.model.named_parameters():
             if "lora_" in name:
@@ -319,6 +363,14 @@ class RecoWanVace1_3BDenoiser(Denoiser[RecoWanVace1_3BCfg]):
             raise ValueError("RecoWanVace._forward: condition_latents(48ch background latent)가 필요합니다.")
         raw_scene = getattr(inputs, "raw_state", None)
         proj_scene = self.ldt_branch.cnd_proj(raw_scene) if raw_scene is not None else None
+        # bg(Wan2.2 VAE /16)와 ldt x_embedder가 기대하는 grid(va-wan ckpt native /8)가 다를 수 있음
+        # → ldt img_size로 resize 후 입력.
+        ldt_hw = tuple(int(s) for s in self.ldt_branch.model.x_embedder.img_size)
+        if bg.shape[-2:] != ldt_hw:
+            bf, bv = bg.shape[0], bg.shape[1]
+            bg_flat = rearrange(bg, "b v c h w -> (b v) c h w")
+            bg_flat = torch.nn.functional.interpolate(bg_flat, size=ldt_hw, mode="bilinear", align_corners=False)
+            bg = rearrange(bg_flat, "(b v) c h w -> b v c h w", b=bf, v=bv)
         ctrl_inputs = DenoiserInputs(
             view=bg, pose=inputs.pose, timestep=timestep, state=proj_scene, text=None, condition_latents=None,
         )
@@ -329,19 +381,30 @@ class RecoWanVace1_3BDenoiser(Denoiser[RecoWanVace1_3BCfg]):
         self._last_ldt_pred = ldt_pred                               # logging용
 
         # 2) 48→16 projector (zero-init) → ReCo VACE source slot
-        ref_latent = self.ldt2reco_proj(ldt_pred)                    # (B,16,F,H,W)
+        ref_latent = self.ldt2reco_proj(ldt_pred)                    # (B,16,F,H_ld,W_ld)
+        # ldt(Wan2.2 VAE /16) grid ≠ ReCo(Wan2.1 VAE /8) grid → ReCo half-width 해상도로 resize.
+        H_r, Wd_r = latents.shape[-2], latents.shape[-1]
+        Wh_r = Wd_r // 2
+        if ref_latent.shape[-2:] != (H_r, Wh_r):
+            bc, cc, fc = ref_latent.shape[:3]
+            flat = rearrange(ref_latent, "b c f h w -> (b f) c h w")
+            flat = torch.nn.functional.interpolate(flat, size=(H_r, Wh_r), mode="bilinear", align_corners=False)
+            ref_latent = rearrange(flat, "(b f) c h w -> b c f h w", b=bc, f=fc)
         self._last_ref_latent = ref_latent
 
-        # 3) vace_context (96ch, width-doubled)
+        # 3) vace_context (96ch, width-doubled, ReCo grid)
         vace_context = self._build_vace_context(ref_latent)
 
         # 4) ReCo VACE + main DiT forward (text context는 wrapper가 인코딩해 inputs.text로 전달)
         context = inputs.text
+        # model_fn_wan_video는 1-D timestep(B,) 기대 (seperated_timestep=False). uniform
+        # sampling이라 per-view 값이 동일 → 첫 view 값 사용.
+        ts_main = timestep if timestep.ndim == 1 else timestep[:, 0]
         pred = model_fn_wan_video(
             dit=self.model,
             vace=self.vace,
             latents=latents,
-            timestep=timestep,
+            timestep=ts_main,
             context=context,
             vace_context=vace_context,
             vace_scale=float(self.cfg.vace_scale),
