@@ -29,6 +29,8 @@ DIFFSYNTH_ROOT = Path(__file__).resolve().parents[1] / "DiffSynth-Studio"
 if str(DIFFSYNTH_ROOT) not in sys.path:
     sys.path.insert(0, str(DIFFSYNTH_ROOT))
 
+from einops import rearrange
+
 from diffsynth.core import load_state_dict
 from diffsynth.models.model_loader import ModelPool
 from diffsynth.models.wan_video_text_encoder import HuggingfaceTokenizer
@@ -279,10 +281,70 @@ class RecoWanVace1_3BDenoiser(Denoiser[RecoWanVace1_3BCfg]):
         # ckpt_path는 wrapper의 load_state_dict 경로로 처리됨 (별도 no-op).
         return
 
-    def _forward(self, inputs: DenoiserInputs, **kwargs) -> Float[Tensor, "batch view channel height width"]:
-        # NOTE: 실제 forward(vace_context 96ch 구성 + width-doubled split)는 다음 단계(#33)에서
-        # 구현. 현 단계는 loader/branch 구성 검증용 — 호출 시 명확히 막아둔다.
-        raise NotImplementedError(
-            "RecoWanVace1_3BDenoiser._forward는 아직 미구현 (loader/branch 검증 단계). "
-            "다음 단계에서 vace_context 구성 + ReCo forward + width split을 추가."
+    def _build_vace_context(self, ref_latent: Tensor) -> Tensor:
+        """ref_latent (B, 16, F, H, W_half) → ReCo vace_context (B, 96, F, H, 2*W_half).
+
+        plan: 좌=recon(background render, mask 0 → 보존/복원), 우=dynamic(mask 1 → 생성).
+          inactive = [ref_render | zeros]     (preserve 영역에 LightningDiT render)
+          reactive = zeros                    (edit 영역 원본 content 없음 → 0)
+          mask(64ch) = [0(좌) | 1(우)]         (latent 도메인에서 직접 구성)
+          vace_context = [inactive(16) | reactive(16) | mask(64)] = 96ch
+        """
+        b, c, f, h, wh = ref_latent.shape
+        zeros = torch.zeros_like(ref_latent)
+        inactive = torch.cat([ref_latent, zeros], dim=-1)          # (B,16,F,H,2W)
+        reactive = torch.zeros_like(inactive)                      # (B,16,F,H,2W)
+        video_lat = torch.cat([inactive, reactive], dim=1)         # (B,32,F,H,2W)
+        mask = torch.zeros((b, 64, f, h, 2 * wh), dtype=ref_latent.dtype, device=ref_latent.device)
+        mask[..., wh:] = 1.0                                       # 우측(dynamic) 생성 영역
+        return torch.cat([video_lat, mask], dim=1)                 # (B,96,F,H,2W)
+
+    def _forward(self, inputs: DenoiserInputs, temporal_downsample: int = 1,
+                 chunk_targets: bool = False, **kwargs) -> Float[Tensor, "batch view channel height width"]:
+        """ReCo(Wan2.1 VACE) + LightningDiT ctrl branch, same-t co-sampling.
+
+        기대 입력 (wrapper가 채움):
+          inputs.view             : (B, V, 16, H, 2W) ReCo width-doubled noisy latent (좌 recon / 우 dynamic)
+          inputs.condition_latents: (B, V, 48, H, W)  background(inpaint_result) va-wan noisy latent (ldt용, same t)
+          inputs.raw_state        : (B, N, 64)        raw scene tokens (ldt cnd_proj용)
+          inputs.text             : (B, L, 4096)      text context embeddings
+          inputs.pose, inputs.timestep
+        """
+        latents = rearrange(inputs.view, "b v c h w -> b c v h w")   # (B,16,F,H,2W)
+        timestep = inputs.timestep if inputs.timestep.ndim >= 1 else inputs.timestep.unsqueeze(0)
+
+        # 1) LightningDiT ctrl branch: 48ch background latent을 same-t에서 denoise
+        bg = inputs.condition_latents
+        if bg is None:
+            raise ValueError("RecoWanVace._forward: condition_latents(48ch background latent)가 필요합니다.")
+        raw_scene = getattr(inputs, "raw_state", None)
+        proj_scene = self.ldt_branch.cnd_proj(raw_scene) if raw_scene is not None else None
+        ctrl_inputs = DenoiserInputs(
+            view=bg, pose=inputs.pose, timestep=timestep, state=proj_scene, text=None, condition_latents=None,
         )
+        ldt_pred, _ = self.ldt_branch._forward(
+            inputs=ctrl_inputs, temporal_downsample=temporal_downsample, chunk_targets=chunk_targets,
+        )
+        ldt_pred = rearrange(ldt_pred, "b v c h w -> b c v h w")     # (B,48,F,H,W)
+        self._last_ldt_pred = ldt_pred                               # logging용
+
+        # 2) 48→16 projector (zero-init) → ReCo VACE source slot
+        ref_latent = self.ldt2reco_proj(ldt_pred)                    # (B,16,F,H,W)
+        self._last_ref_latent = ref_latent
+
+        # 3) vace_context (96ch, width-doubled)
+        vace_context = self._build_vace_context(ref_latent)
+
+        # 4) ReCo VACE + main DiT forward (text context는 wrapper가 인코딩해 inputs.text로 전달)
+        context = inputs.text
+        pred = model_fn_wan_video(
+            dit=self.model,
+            vace=self.vace,
+            latents=latents,
+            timestep=timestep,
+            context=context,
+            vace_context=vace_context,
+            vace_scale=float(self.cfg.vace_scale),
+            use_gradient_checkpointing=self.cfg.gradient_checkpointing and self.training,
+        )
+        return rearrange(pred, "b c v h w -> b v c h w")             # (B,V,16,H,2W)

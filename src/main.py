@@ -180,7 +180,7 @@ def train(cfg_dict: DictConfig):
         val_check_interval=cfg.trainer.val_check_interval,
         mode=cfg.mode,
     )
-    if cfg.model.denoiser.name in ("wan_ti2v_5b", "wan_t2v_14b"):
+    if cfg.model.denoiser.name in ("wan_ti2v_5b", "wan_t2v_14b", "reco_wan_vace_1_3b"):
         if cfg.mode == "train" and checkpoint_path is not None and not resume:
             model_wrapper = T2VWrapper.load_from_checkpoint(checkpoint_path, **kwargs)
         else:
