@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- `src/model/denoiser/reco_wan_vace.py` (**WIP**) — ReCo(Wan2.1 VACE 1.3B) denoiser + LightningDiT ControlNet branch. `RecoWanVace1_3BDenoiser`: 메인 diffsynth로 ReCo DiT(1.3B, in_dim=16) + VaceWanModel 로드, DiT/VACE에 LoRA(rank128) inject 후 ReCo pretrained LoRA(`2026_01_16_v1_release.ckpt`, DiT 600 + VACE 300 키 100% 매칭) 적용, LightningDiT ctrl branch(va-wan_dl3dv 48ch warm-start) + `ldt2reco_proj`(Conv3d 48→16, zero-init) 구성. construction dry-run 검증 완료 (trainable 822M: ReCo LoRA + LightningDiT + projector; frozen base 8.66B). `_forward`는 아직 미구현(NotImplementedError stub) — `__init__.py`/`main.py` routing 미등록이라 기존 경로 영향 없음. 설계: same-t co-sampling (ldt가 background `inpaint_result` va-wan 48ch latent denoise → projector → ReCo VACE source; ReCo 16ch width-doubled 좌=recon/우=dynamic), loss는 ReCo 출력만.
+- `scripts/measure_da3_colmap_scale.py` — DL3DV 여러 scene에서 DA3-정규화 카메라와 COLMAP-정규화 카메라 사이의 단일 scale 상수 α를 측정. scene별로 COLMAP c2w(첫 프레임 reference-relative, centroid 대비 95퍼센타일 거리 정규화 → v_C)와 DA3 npz(`da3/exports/mini_npz/results.npz`의 extrinsics/depth, first-frame median depth 정규화 → v_DA3)를 만들고, Procrustes 회전 정렬 후 LS scale `α = Σ(v_DA3·v_C)/Σ|v_DA3|²` + 정렬 ATE 기록. ATE 임계 초과 scene 필터 → α median/IQR/CV(robust) → α vs depth 산점도 + hold-out 검증 → CV 기준 "단일 상수 가능/불가" 판정. summary.json + alpha_vs_depth.png 저장. DA3는 precompute된 npz 사용(재추론 없음).
+
 ### Changed
 - `src/model/diffusion_wrapper.py` validation video/context logging이 `data_loader.val.batch_size`와 무관하게 항상 최대 8개 sample을 로깅하도록 변경. 기존엔 `batch_idx == 0` 첫 배치(`b`개)만 즉시 로깅 → batch_size를 1로 줄이면 video도 1개만 올라갔음. 이제 `val_vis_buffer`에 batch별로 누적(rank 0, `val_vis_num=8`)한 뒤 `on_validation_end`에서 한 번에 flush (Sampled/Original Video + Context grid, dataloader idx 0인 `standard`는 un-prefixed 패널도 함께). Context Interpolation video는 기존대로 `batch_idx==0` 유지 (per-scene 무거운 생성이라 누적 미적용).
 
@@ -19,6 +23,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - `train_ti2vgen_dynamicverse_controlnet_recon_no_lora_no_text.sh` — context/target 둘 다 `inpaint_result.mp4` (default video_name) + `+dataset.force_empty_text=true` → reconstruction 학습 (text="", scene+camera만). exp `..._recon_controlnet_scene_camera_2_no_lora_no_text`, GPU 2.
 
 ### Changed
+- `scripts/fast_infer_t2v_swap_dataset.py`: DL3DV가 val/test에서 고정 evaluation_index를 써 `--num_context_views` override가 무시되던 문제 — batch 로드 직후 context를 첫 N view로 truncate하는 로직 추가 (`v_c > num_context_views`이면 `context[k][:, :n]`). static-camera + context=1 추론이 폴더명(`ctx1`)과 실제로 일치하게 됨.
 - `scripts/fast_infer_t2v_swap_dataset.py`: 추론 시 학습 셋업과 모델 init을 맞추기 위한 override 옵션 3개 추가.
   - `--lora_disabled` — `model.denoiser.lora.enabled=False` 강제. yaml default가 `true`라 no_lora 학습 ckpt 추론 시 `base_layer`/`lora_A`/`lora_B` key mismatch (missing 1200) 발생하던 것 해결.
   - `--prompt_style` — `dataset.prompt_style` override (예: `category_first`). dynamicverse 모델이 `category.json` dynamic-object description으로 학습됐는데 추론이 `window_dict` (배경 묘사 prompts.json) 쓰던 불일치 해결.

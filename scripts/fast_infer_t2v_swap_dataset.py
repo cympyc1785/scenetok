@@ -257,6 +257,16 @@ def main():
             v_t = batch["target"]["extrinsics"].shape[1]
             scene = batch["scene"][0]
             print(f"[infer] scene={scene}, context={v_c}, target={v_t}")
+            # DL3DV val/test uses a fixed evaluation_index → `num_context_views`
+            # override is ignored by the dataset. Truncate here so the model
+            # actually sees only the first N context views.
+            if v_c > args.num_context_views:
+                n_ctx = max(int(args.num_context_views), 1)
+                for k, val in list(batch["context"].items()):
+                    if torch.is_tensor(val) and val.dim() >= 2 and val.shape[1] == v_c:
+                        batch["context"][k] = val[:, :n_ctx].contiguous()
+                v_c = n_ctx
+                print(f"[context-truncate] context views → {n_ctx}")
             if args.static_target_camera:
                 ctx_ext0 = batch["context"]["extrinsics"][:, 0:1]
                 ctx_int0 = batch["context"]["intrinsics"][:, 0:1]
