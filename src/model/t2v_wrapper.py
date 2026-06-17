@@ -1,5 +1,6 @@
 import math
 import os
+import contextlib
 
 from .diffusion import first_stage_encode, last_stage_decode
 from .diffusion_wrapper import *
@@ -582,6 +583,99 @@ class T2VWrapper(DiffusionWrapper):
         self.log("loss/reco_recon", loss_recon)
         self.log("loss/reco_dynamic", loss_dyn)
         return loss
+
+    def _reco_encode_dual_latents(self, batch):
+        """ReCo 16ch width-doubled GT(좌 recon / 우 dynamic) + 48ch bg GT + scene/pose/text.
+        training/validation 공용. returns dict."""
+        ae_name = self.get_autoencoder_name("target")
+        ae_scale = self.get_autoencoder_scaling_factor("target")
+        chunk = getattr(self.dataset_cfg.view_sampler, "chunk_targets", True)
+        dyn_lat = get_latents(autoencoder=self.autoencoder, inputs=batch["target"], view_type="target",
+                              precomputed_latents=self.dataset_cfg.precomputed_latents,
+                              autoencoder_name=ae_name, scaling_factor=ae_scale, chunk_targets=chunk)
+        recon_video = batch["target"].get("recon_video")
+        if recon_video is None:
+            raise ValueError("ReCo는 dataset.recon_target_video_name(inpaint_result.mp4)이 필요합니다.")
+        recon_lat = get_latents(autoencoder=self.autoencoder, inputs={**batch["target"], "latent": recon_video},
+                                view_type="target", precomputed_latents=self.dataset_cfg.precomputed_latents,
+                                autoencoder_name=ae_name, scaling_factor=ae_scale, chunk_targets=chunk)
+        target_pose, temporal_downsample, num_target_latents = self.prepare_target_pose(
+            batch["target"], num_latents=dyn_lat.shape[1])
+        if num_target_latents is not None and num_target_latents != dyn_lat.shape[1]:
+            dyn_lat, recon_lat = dyn_lat[:, :num_target_latents], recon_lat[:, :num_target_latents]
+        target_reco = torch.cat([recon_lat, dyn_lat], dim=-1)
+        device, dtype = target_reco.device, target_reco.dtype
+        bg_clean = self.denoiser.encode_bg(recon_video.to(device=device, dtype=dtype))
+        if num_target_latents is not None and num_target_latents != bg_clean.shape[1]:
+            bg_clean = bg_clean[:, :num_target_latents]
+        scene_tokens = None
+        if self.model_cfg.compressor is not None:
+            ctx_lat = get_latents(autoencoder=self.autoencoder, inputs=batch["context"], view_type="context",
+                                  precomputed_latents=self.dataset_cfg.precomputed_latents,
+                                  autoencoder_name=self.get_autoencoder_name("context"),
+                                  scaling_factor=self.get_autoencoder_scaling_factor("context"))
+            ci = CompressorInputs(view=ctx_lat, pose=CameraInputs(
+                intrinsics=batch["context"]["intrinsics"], extrinsics=batch["context"]["extrinsics"]), mask=None)
+            with torch.no_grad() if self.frozen_compressor else contextlib.nullcontext():
+                tokens, *_ = self.compressor(inputs=ci)
+            scene_tokens = tokens.sample() if self.model_cfg.compressor.scene_token_projection == "kl" else tokens
+        b = target_reco.shape[0]
+        raw_scene = scene_tokens if scene_tokens is not None else torch.zeros(
+            (b, self.denoiser.num_scene_tokens, self.denoiser.cond_dim), device=device, dtype=dtype)
+        return dict(target_reco=target_reco, dyn_lat=dyn_lat, recon_lat=recon_lat, bg_clean=bg_clean,
+                    raw_scene=raw_scene, target_pose=target_pose, temporal_downsample=temporal_downsample,
+                    device=device, dtype=dtype)
+
+    @torch.no_grad()
+    def _reco_validation_step(self, batch, batch_idx, dataloader_idx=None):
+        if batch is None or batch_idx != 0 or self.global_rank != 0:
+            return None
+        step = self.step_tracker.get_step()
+        val_step = (step + 1) // self.val_check_interval
+        loader_name = self.validation_loader_names.get(dataloader_idx or 0, f"val_{dataloader_idx}")
+        b, v_c = batch["context"]["extrinsics"].shape[:2]
+        batch = preprocess_batch(batch, index=v_c // 2)
+        d = self._reco_encode_dual_latents(batch)
+        target_reco, bg_clean = d["target_reco"], d["bg_clean"]
+        text = self.denoiser.encode_text_condition(batch.get("text"), device=d["device"])
+        td = d["temporal_downsample"]
+        b, v_t = target_reco.shape[:2]
+        wh = target_reco.shape[-1] // 2
+
+        # full-sequence flow sampling (bg teacher-forced from GT at each t)
+        self.scheduler.set_timesteps(self.model_cfg.scheduler.num_inference_steps)
+        ts_list = self.scheduler.timesteps  # cpu (next_timestep이 cpu 비교) — step 내부서 device 처리
+        x = torch.randn_like(target_reco)
+        noise_bg = torch.randn_like(bg_clean)
+        for i in range(len(ts_list) - 1):
+            t = ts_list[i]
+            ts_full = t.reshape(1, 1).expand(b, v_t).to(device=d["device"], dtype=d["dtype"])
+            x_in = self.scheduler.scale_model_input(x, ts_full)
+            bg_t = self.scheduler.add_noise(bg_clean, noise_bg, ts_full)
+            inp = DenoiserInputs(view=x_in, pose=d["target_pose"], timestep=self.rescale_timesteps(ts_full),
+                                 state=None, text=text, condition_latents=bg_t, raw_state=d["raw_scene"])
+            pred = self.denoiser(inputs=inp, temporal_downsample=td, chunk_targets=False)
+            if isinstance(pred, tuple):
+                pred = pred[0]
+            x = self.scheduler.step(pred, t, x).prev_sample
+
+        ae = self.autoencoder["target"]
+        recon_vid = ae.decode(x[..., :wh].to(d["dtype"]))
+        dyn_vid = ae.decode(x[..., wh:].to(d["dtype"]))
+        ref_lat = rearrange(self.denoiser._last_ref_latent, "b c f h w -> b f c h w")
+        ldt_vid = ae.decode(ref_lat.to(d["dtype"]))
+        scenes = batch.get("scene", [f"val{j}" for j in range(b)])
+        log_tensor_as_video(self.logger, recon_vid, f"{loader_name}/ReCo Recon (left)", fps=8, step=val_step, caption=scenes)
+        log_tensor_as_video(self.logger, dyn_vid, f"{loader_name}/ReCo Dynamic (right)", fps=8, step=val_step, caption=scenes)
+        log_tensor_as_video(self.logger, ldt_vid, f"{loader_name}/LightningDiT ref (ldt→VACE)", fps=8, step=val_step, caption=scenes)
+        torch.cuda.empty_cache()
+        return None
+
+    def validation_step(self, batch, batch_idx, dataloader_idx=None):
+        from src.model.denoiser.reco_wan_vace import RecoWanVace1_3BDenoiser
+        if isinstance(self.denoiser, RecoWanVace1_3BDenoiser):
+            return self._reco_validation_step(batch, batch_idx, dataloader_idx)
+        return super().validation_step(batch, batch_idx, dataloader_idx)
 
     def training_step(self, batch, batch_idx):
         if batch is None:  # safe_collate returned None (entire batch was None-filtered)
