@@ -56,7 +56,7 @@ def geodesic_deg(Rp: torch.Tensor, Rg: torch.Tensor) -> torch.Tensor:
 
 
 def load_scene(scene_dir: Path, num_frames: int, hw: tuple[int, int]):
-    """Return (frames (V,3,H,W) in [-1,1], poses_rel9 (V,9), Rrel (V,3,3))."""
+    """Return (frames (V,3,H,W) in [-1,1], c2w (V,4,4) raw camera-to-world)."""
     tj = json.load(open(scene_dir / "transforms.json"))
     frames = tj["frames"]
     order = np.argsort([f["file_path"] for f in frames])
@@ -74,15 +74,20 @@ def load_scene(scene_dir: Path, num_frames: int, hw: tuple[int, int]):
         imgs.append(torch.from_numpy(np.array(im)).float() / 255.0 * 2 - 1)
         c2w.append(np.array(fr["transform_matrix"], dtype=np.float64))
     frames_t = torch.stack(imgs).permute(0, 3, 1, 2)        # (V,3,H,W)
-    c2w = np.stack(c2w)                                      # (V,4,4)
-    ref_inv = np.linalg.inv(c2w[0])
-    rel = ref_inv[None] @ c2w                                # reference-relative
-    R = rel[:, :3, :3]
-    t = rel[:, :3, 3]
+    return frames_t, np.stack(c2w)                          # (V,3,H,W), (V,4,4)
+
+
+def build_target(c2w: np.ndarray, mode: str):
+    """c2w (V,4,4) → (target9 (V,9)=[6D rot|trans], R (V,3,3)).
+    absolute: frame0-relative pose.  relative: pose w.r.t. previous frame (frame0=identity)."""
+    if mode == "relative":
+        rel = np.stack([np.eye(4)] + [np.linalg.inv(c2w[i - 1]) @ c2w[i] for i in range(1, len(c2w))])
+    else:
+        rel = np.linalg.inv(c2w[0])[None] @ c2w
+    R, t = rel[:, :3, :3], rel[:, :3, 3]
     s = max(np.percentile(np.linalg.norm(t, axis=1), 95), 1e-6)
-    t = t / s
-    target9 = np.concatenate([rot_to_6d(R), t], axis=1)      # (V,9)
-    return frames_t, torch.from_numpy(target9).float(), torch.from_numpy(R).float()
+    target9 = np.concatenate([rot_to_6d(R), t / s], axis=1)  # (V,9)
+    return torch.from_numpy(target9).float(), torch.from_numpy(R).float()
 
 
 def load_prompt(scene_dir: Path) -> str:
@@ -116,9 +121,11 @@ def main():
     ap.add_argument("--hw", default="480,832")
     ap.add_argument("--layers", default="all")              # "all" or "0,5,10,..."
     ap.add_argument("--noise_levels", default="0.1,0.3,0.5,0.7,0.9")
-    ap.add_argument("--val_frac", type=float, default=0.3)
-    ap.add_argument("--n_pc", type=int, default=256)        # PCA dims for the linear probe
-    ap.add_argument("--pool_grid", type=int, default=4)     # G×G spatial grid pooling (1 = global mean)
+    ap.add_argument("--val_frac", type=float, default=0.2)   # λ tuning split
+    ap.add_argument("--test_frac", type=float, default=0.2)  # reported split
+    ap.add_argument("--n_pc", type=int, default=0)           # 0 = raw features (canonical); >0 = PCA dims
+    ap.add_argument("--pool_grid", type=int, default=1)      # 1 = global mean (canonical); G>1 = G×G grid
+    ap.add_argument("--pose_target", choices=["absolute", "relative"], default="relative")  # adjacent-frame vs frame0-relative
     ap.add_argument("--in_distribution", action="store_true")  # native TI2V: clean 1st frame + real prompt + fused embedding
     ap.add_argument("--out", default="results/probe_wan_dl3dv")
     ap.add_argument("--device", default="cuda")
@@ -169,7 +176,7 @@ def main():
 
     for si, sc in enumerate(scenes):
         try:
-            frames, tgt9, Rrel = load_scene(Path(sc), args.num_frames, (H, W))
+            frames, c2w = load_scene(Path(sc), args.num_frames, (H, W))
         except Exception as e:
             print(f"  skip {sc}: {e}"); continue
         vae_dtype = next(vae.parameters()).dtype
@@ -178,10 +185,11 @@ def main():
             lat = vae.encode(frames)                              # (1,Vlat,48,h,w)
         lat = rearrange(lat, "b v c h w -> b c v h w").to(dtype)
         b, c, f, h, w = lat.shape
-        # align GT poses (V pixel) → Vlat latent frames via linspace
+        # align GT poses (V pixel) → Vlat latent frames via linspace, then build target on aligned set
         pix_idx = np.linspace(0, args.num_frames - 1, f).round().astype(int)
-        tgt = tgt9[pix_idx].to(dev)                                # (f,9)
-        Rg = Rrel[pix_idx].to(dev)
+        tgt9_lat, Rg_lat = build_target(c2w[pix_idx], args.pose_target)
+        tgt = tgt9_lat.to(dev)                                     # (f,9)
+        Rg = Rg_lat.to(dev)
         scene_ctx = encode_text(load_prompt(Path(sc))) if args.in_distribution else ctx
         for t_lvl in noise_levels:
             # diffsynth/base-Wan convention: sigma=t_lvl ∈ [0,1] but model timestep = sigma*1000.
@@ -215,11 +223,17 @@ def main():
         hd.remove()
 
     # ── fit probe per (layer, noise) + eval ──
+    # Canonical linear probe: standardized RAW features (optional PCA only if --n_pc>0),
+    # train/val/test 3-split by scene (λ tuned on val, reported on TEST → no leakage).
     os.makedirs(args.out, exist_ok=True)
     results = []
-    n_scenes_used = len(feats[layers[0]][noise_levels[0]])
-    n_val = max(1, int(n_scenes_used * args.val_frac))
-    print(f"[probe] scenes used={n_scenes_used}, val={n_val}")
+    n_tot = len(feats[layers[0]][noise_levels[0]])
+    n_te = max(1, int(n_tot * args.test_frac))
+    n_va = max(1, int(n_tot * args.val_frac))
+    n_tr = n_tot - n_va - n_te
+    assert n_tr > 0, f"too few scenes: total={n_tot}, val={n_va}, test={n_te}"
+    print(f"[probe] scenes train/val/test = {n_tr}/{n_va}/{n_te}; pose_target={args.pose_target}, "
+          f"n_pc={args.n_pc if args.n_pc > 0 else 'raw'}")
     def rot_trans_err(pred, Rgt, Ygt):
         Rp = sixd_to_rot(pred[:, :6])
         return (geodesic_deg(Rp, Rgt).mean().item(),
@@ -228,40 +242,40 @@ def main():
     for L in layers:
         for t_lvl in noise_levels:
             Xs = feats[L][t_lvl]; Ys = targets[L][t_lvl]; Rs = Rgt_store[L][t_lvl]
-            # split by scene
-            Xtr = torch.cat(Xs[:-n_val]).double().to(dev); Ytr = torch.cat(Ys[:-n_val]).double().to(dev)
-            Xva = torch.cat(Xs[-n_val:]).double().to(dev); Yva = torch.cat(Ys[-n_val:]).double().to(dev)
-            Rtr = torch.cat(Rs[:-n_val]).to(dev); Rva = torch.cat(Rs[-n_val:]).to(dev)
-            # z-score standardize features (train stats) — DiT activations vary wildly in scale
+            cat = lambda lst, a, b, d=False: (torch.cat(lst[a:b]).double() if d else torch.cat(lst[a:b])).to(dev)
+            Xtr = cat(Xs, 0, n_tr, True); Ytr = cat(Ys, 0, n_tr, True)
+            Xva = cat(Xs, n_tr, n_tr + n_va, True); Yva = cat(Ys, n_tr, n_tr + n_va, True); Rva = cat(Rs, n_tr, n_tr + n_va)
+            Xte = cat(Xs, n_tr + n_va, n_tot, True); Yte = cat(Ys, n_tr + n_va, n_tot, True); Rte = cat(Rs, n_tr + n_va, n_tot)
+            # z-score standardize (train stats)
             mu, sd = Xtr.mean(0, keepdim=True), Xtr.std(0, keepdim=True).clamp_min(1e-6)
-            Xtr = (Xtr - mu) / sd; Xva = (Xva - mu) / sd
-            # PCA reduction (train-fit) — D(3072) >> N(~500) → raw ridge overfits badly
-            n_pc = min(args.n_pc, Xtr.shape[0] - 1, Xtr.shape[1])
-            U, S, Vh = torch.linalg.svd(Xtr, full_matrices=False)
-            P = Vh[:n_pc].T                                        # (D, n_pc)
-            Xtr = Xtr @ P; Xva = Xva @ P
-            # ridge λ search on a small holdout from train (last 20% of train scenes)
+            Xtr = (Xtr - mu) / sd; Xva = (Xva - mu) / sd; Xte = (Xte - mu) / sd
+            if args.n_pc > 0:                                     # optional PCA (off by default = raw features)
+                n_pc = min(args.n_pc, Xtr.shape[0] - 1, Xtr.shape[1])
+                Vh = torch.linalg.svd(Xtr, full_matrices=False)[2]
+                P = Vh[:n_pc].T; Xtr = Xtr @ P; Xva = Xva @ P; Xte = Xte @ P
+            # ridge weight-decay (λ) tuned on VAL (rot err), reported on TEST
             best = None
-            for lam in (1e-3, 1e-1, 1e0, 1e1, 1e2):
+            for lam in (1e-2, 1e-1, 1e0, 1e1, 1e2, 1e3):
                 W_ = ridge_fit(Xtr, Ytr, lam=lam)
                 ve, _ = rot_trans_err(ridge_pred(Xva, W_).float(), Rva, Yva)
                 if best is None or ve < best[0]:
                     best = (ve, W_, lam)
             W_ = best[1]
-            tr_rot, tr_tr = rot_trans_err(ridge_pred(Xtr, W_).float(), Rtr, Ytr)
-            va_rot, va_tr = rot_trans_err(ridge_pred(Xva, W_).float(), Rva, Yva)
-            # predict-train-mean baseline (val): how much does the probe beat constant prediction?
-            base = Ytr.mean(0, keepdim=True).repeat(Yva.shape[0], 1).float()
-            base_rot, base_tr = rot_trans_err(base, Rva, Yva)
-            results.append(dict(layer=L, noise=t_lvl, rot_err_deg=va_rot, trans_err=va_tr,
+            tr_rot, tr_tr = rot_trans_err(ridge_pred(Xtr, W_).float(), torch.cat(Rs[:n_tr]).to(dev), Ytr)
+            te_rot, te_tr = rot_trans_err(ridge_pred(Xte, W_).float(), Rte, Yte)
+            base = Ytr.mean(0, keepdim=True).repeat(Yte.shape[0], 1).float()  # predict-train-mean on TEST
+            base_rot, base_tr = rot_trans_err(base, Rte, Yte)
+            results.append(dict(layer=L, noise=t_lvl, rot_err_deg=te_rot, trans_err=te_tr,
                                 train_rot_err_deg=tr_rot, train_trans_err=tr_tr,
                                 baseline_rot_err_deg=base_rot, baseline_trans_err=base_tr, lam=best[2]))
-            print(f"  layer {L:2d} noise {t_lvl:.2f}: rot {va_rot:6.2f}° (tr {tr_rot:6.2f}, base {base_rot:6.2f}) "
-                  f"trans {va_tr:.3f} (tr {tr_tr:.3f}, base {base_tr:.3f}) λ={best[2]:g}")
+            print(f"  layer {L:2d} noise {t_lvl:.2f}: TEST rot {te_rot:6.2f}° (tr {tr_rot:6.2f}, base {base_rot:6.2f}) "
+                  f"trans {te_tr:.3f} (tr {tr_tr:.3f}, base {base_tr:.3f}) λ={best[2]:g}")
 
     with open(os.path.join(args.out, "probe_results.json"), "w") as fjson:
         json.dump(dict(layers=layers, noise_levels=noise_levels, results=results,
-                       n_scenes=n_scenes_used, num_frames=args.num_frames), fjson, indent=2)
+                       n_train=n_tr, n_val=n_va, n_test=n_te, num_frames=args.num_frames,
+                       pose_target=args.pose_target, n_pc=args.n_pc, pool_grid=args.pool_grid,
+                       in_distribution=args.in_distribution), fjson, indent=2)
 
     # heatmap
     try:
