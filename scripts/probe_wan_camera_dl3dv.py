@@ -85,6 +85,17 @@ def load_scene(scene_dir: Path, num_frames: int, hw: tuple[int, int]):
     return frames_t, torch.from_numpy(target9).float(), torch.from_numpy(R).float()
 
 
+def load_prompt(scene_dir: Path) -> str:
+    """DL3DV per-scene caption (prompts_*.json → ['0']['prompt_scene_simple']['detail']). '' if absent."""
+    for pj in sorted(scene_dir.glob("prompts_*.json")):
+        try:
+            d = json.load(open(pj))
+            return d["0"]["prompt_scene_simple"]["detail"]
+        except Exception:
+            continue
+    return ""
+
+
 def ridge_fit(X, Y, lam=1e-2):
     """closed-form ridge with bias. X (N,D), Y (N,K) → W (D+1,K)."""
     Xb = torch.cat([X, torch.ones(X.shape[0], 1, device=X.device, dtype=X.dtype)], 1)
@@ -108,6 +119,7 @@ def main():
     ap.add_argument("--val_frac", type=float, default=0.3)
     ap.add_argument("--n_pc", type=int, default=256)        # PCA dims for the linear probe
     ap.add_argument("--pool_grid", type=int, default=4)     # G×G spatial grid pooling (1 = global mean)
+    ap.add_argument("--in_distribution", action="store_true")  # native TI2V: clean 1st frame + real prompt + fused embedding
     ap.add_argument("--out", default="results/probe_wan_dl3dv")
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
@@ -129,10 +141,13 @@ def main():
     layers = list(range(n_layers)) if args.layers == "all" else [int(x) for x in args.layers.split(",")]
     print(f"[probe] DiT layers={n_layers}, probing {layers}, noise={noise_levels}")
 
-    # empty text context (unconditional probing)
-    with torch.no_grad():
-        ids, mask = tok("", return_mask=True); ids, mask = ids.to(dev), mask.to(dev)
-        ctx = text_encoder(ids, mask)
+    def encode_text(prompt: str):
+        with torch.no_grad():
+            ids, mask = tok(prompt, return_mask=True); ids, mask = ids.to(dev), mask.to(dev)
+            return text_encoder(ids, mask)
+    ctx = encode_text("")  # empty text (off-distribution default)
+    print(f"[probe] in_distribution={args.in_distribution} (clean 1st frame + real prompt + fused embedding)"
+          if args.in_distribution else "[probe] off-distribution (empty text, all frames noised, no fused embedding)")
 
     # forward hooks → capture each block output
     captured = {}
@@ -167,15 +182,19 @@ def main():
         pix_idx = np.linspace(0, args.num_frames - 1, f).round().astype(int)
         tgt = tgt9[pix_idx].to(dev)                                # (f,9)
         Rg = Rrel[pix_idx].to(dev)
+        scene_ctx = encode_text(load_prompt(Path(sc))) if args.in_distribution else ctx
         for t_lvl in noise_levels:
             # diffsynth/base-Wan convention: sigma=t_lvl ∈ [0,1] but model timestep = sigma*1000.
             ts = torch.full((1,), float(t_lvl) * 1000.0, device=dev, dtype=dtype)
             noise = torch.randn_like(lat)
             noisy = (1 - t_lvl) * lat + t_lvl * noise              # rectified-flow interpolation
+            if args.in_distribution:
+                noisy[:, :, 0] = lat[:, :, 0]                      # frame 0 = clean conditioning (native TI2V)
             captured.clear()
             with torch.no_grad():
-                _ = model_fn_wan_video(dit=dit, latents=noisy, timestep=ts, context=ctx,
-                                       vace=None, use_gradient_checkpointing=False)
+                _ = model_fn_wan_video(dit=dit, latents=noisy, timestep=ts, context=scene_ctx,
+                                       vace=None, use_gradient_checkpointing=False,
+                                       fuse_vae_embedding_in_latents=args.in_distribution)
             Hp, Wp = h // p_h, w // p_w
             for L in layers:
                 tok_feat = captured[L][0]                          # (f*Hp*Wp, dim)
