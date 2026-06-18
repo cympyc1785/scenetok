@@ -626,13 +626,24 @@ class T2VWrapper(DiffusionWrapper):
                     raw_scene=raw_scene, target_pose=target_pose, temporal_downsample=temporal_downsample,
                     device=device, dtype=dtype)
 
+    # 메트릭(PSNR/FVD)용 누적 영상 상한 — full-seq sampling이 배치마다 비싸서 cap.
+    RECO_METRIC_MAX_VIDEOS = 24
+
     @torch.no_grad()
     def _reco_validation_step(self, batch, batch_idx, dataloader_idx=None):
-        if batch is None or batch_idx != 0 or self.global_rank != 0:
+        if batch is None or self.global_rank != 0:
             return None
         step = self.step_tracker.get_step()
         val_step = (step + 1) // self.val_check_interval
         loader_name = self.validation_loader_names.get(dataloader_idx or 0, f"val_{dataloader_idx}")
+        if not hasattr(self, "_reco_metric_buf"):
+            self._reco_metric_buf = {}
+        buf = self._reco_metric_buf.setdefault(
+            loader_name, {"pred_recon": [], "gt_recon": [], "pred_dyn": [], "gt_dyn": []})
+        n_done = len(buf["pred_dyn"])
+        # 첫 배치(영상 로깅)는 항상, 이후 배치는 메트릭 cap까지만 sampling.
+        if batch_idx != 0 and n_done >= self.RECO_METRIC_MAX_VIDEOS:
+            return None
         b, v_c = batch["context"]["extrinsics"].shape[:2]
         batch = preprocess_batch(batch, index=v_c // 2)
         d = self._reco_encode_dual_latents(batch)
@@ -660,22 +671,63 @@ class T2VWrapper(DiffusionWrapper):
             x = self.scheduler.step(pred, t, x).prev_sample
 
         ae = self.autoencoder["target"]
-        recon_vid = ae.decode(x[..., :wh].to(d["dtype"]))
-        dyn_vid = ae.decode(x[..., wh:].to(d["dtype"]))
-        ref_lat = rearrange(self.denoiser._last_ref_latent, "b c f h w -> b f c h w")
-        ldt_vid = ae.decode(ref_lat.to(d["dtype"]))
-        scenes = batch.get("scene", [f"val{j}" for j in range(b)])
-        log_tensor_as_video(self.logger, recon_vid, f"{loader_name}/ReCo Recon (left)", fps=8, step=val_step, caption=scenes)
-        log_tensor_as_video(self.logger, dyn_vid, f"{loader_name}/ReCo Dynamic (right)", fps=8, step=val_step, caption=scenes)
-        log_tensor_as_video(self.logger, ldt_vid, f"{loader_name}/LightningDiT ref (ldt→VACE)", fps=8, step=val_step, caption=scenes)
+        # decode는 [-1,1] → [0,1] (last_stage_decode와 동일). 로깅/메트릭 공통.
+        to01 = lambda v: (v.float() / 2 + 0.5).clamp(0, 1)
+        recon_vid = to01(ae.decode(x[..., :wh].to(d["dtype"])))      # (b, vd, 3, H, W)
+        dyn_vid = to01(ae.decode(x[..., wh:].to(d["dtype"])))
+        # 메트릭용 GT 디코드 (좌=recon GT, 우=dynamic GT)
+        gt_recon = to01(ae.decode(target_reco[..., :wh].to(d["dtype"])))
+        gt_dyn = to01(ae.decode(target_reco[..., wh:].to(d["dtype"])))
+        if n_done < self.RECO_METRIC_MAX_VIDEOS:
+            buf["pred_recon"].append(recon_vid.half().cpu()); buf["gt_recon"].append(gt_recon.half().cpu())
+            buf["pred_dyn"].append(dyn_vid.half().cpu()); buf["gt_dyn"].append(gt_dyn.half().cpu())
+
+        if batch_idx == 0:  # 정성 영상 로깅 (첫 배치만)
+            ref_lat = rearrange(self.denoiser._last_ref_latent, "b c f h w -> b f c h w")
+            ldt_vid = to01(ae.decode(ref_lat.to(d["dtype"])))
+            scenes = batch.get("scene", [f"val{j}" for j in range(b)])
+            log_tensor_as_video(self.logger, recon_vid, f"{loader_name}/ReCo Recon (left)", fps=8, step=val_step, caption=scenes)
+            log_tensor_as_video(self.logger, dyn_vid, f"{loader_name}/ReCo Dynamic (right)", fps=8, step=val_step, caption=scenes)
+            log_tensor_as_video(self.logger, ldt_vid, f"{loader_name}/LightningDiT ref (ldt→VACE)", fps=8, step=val_step, caption=scenes)
         torch.cuda.empty_cache()
         return None
+
+    def _reco_on_validation_end(self):
+        """ReCo PSNR/FVD flush: recon(좌)·dynamic(우) 각각 GT 대비. rank0 only."""
+        if self.global_rank != 0:
+            return
+        step = self.step_tracker.get_step()
+        val_step = (step + 1) // self.val_check_interval
+        for loader_name, buf in getattr(self, "_reco_metric_buf", {}).items():
+            for tag in ("recon", "dyn"):
+                preds, gts = buf[f"pred_{tag}"], buf[f"gt_{tag}"]
+                if not preds:
+                    continue
+                pred = torch.cat(preds); gt = torch.cat(gts)          # (N, vd, 3, H, W) fp16 cpu
+                vd = pred.shape[1]
+                print(f"[reco-metric] {loader_name}/{tag}: {pred.shape[0]} videos × {vd} frames")
+                pf = rearrange(pred, "b v c h w -> (b v) c h w")
+                gf = rearrange(gt, "b v c h w -> (b v) c h w")
+                psnr = self.metric(pf.float().to(self.device), gf.float().to(self.device), psnr=True).get("psnr")
+                if psnr is not None:
+                    self.logger.log_metrics({f"{loader_name}/{tag}/psnr": psnr}, val_step)
+                fvd = self.metric(pf.float(), gf.float(), num_views=vd, fvd=True).get("fvd")
+                self.metric.reset_fvd()
+                if fvd is not None:
+                    self.logger.log_metrics({f"{loader_name}/{tag}/fvd": fvd}, val_step)
+        self._reco_metric_buf = {}
 
     def validation_step(self, batch, batch_idx, dataloader_idx=None):
         from src.model.denoiser.reco_wan_vace import RecoWanVace1_3BDenoiser
         if isinstance(self.denoiser, RecoWanVace1_3BDenoiser):
             return self._reco_validation_step(batch, batch_idx, dataloader_idx)
         return super().validation_step(batch, batch_idx, dataloader_idx)
+
+    def on_validation_end(self):
+        from src.model.denoiser.reco_wan_vace import RecoWanVace1_3BDenoiser
+        if isinstance(self.denoiser, RecoWanVace1_3BDenoiser):
+            return self._reco_on_validation_end()
+        return super().on_validation_end()
 
     def training_step(self, batch, batch_idx):
         if batch is None:  # safe_collate returned None (entire batch was None-filtered)
