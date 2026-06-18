@@ -636,8 +636,10 @@ class T2VWrapper(DiffusionWrapper):
         step = self.step_tracker.get_step()
         val_step = (step + 1) // self.val_check_interval
         loader_name = self.validation_loader_names.get(dataloader_idx or 0, f"val_{dataloader_idx}")
-        if not hasattr(self, "_reco_metric_buf"):
+        # validation 라운드가 바뀌면 buffer reset (sanity-val 잔여물이 섞이지 않게).
+        if getattr(self, "_reco_metric_val_step", None) != val_step:
             self._reco_metric_buf = {}
+            self._reco_metric_val_step = val_step
         buf = self._reco_metric_buf.setdefault(
             loader_name, {"pred_recon": [], "gt_recon": [], "pred_dyn": [], "gt_dyn": []})
         n_done = len(buf["pred_dyn"])
@@ -711,10 +713,17 @@ class T2VWrapper(DiffusionWrapper):
                 psnr = self.metric(pf.float().to(self.device), gf.float().to(self.device), psnr=True).get("psnr")
                 if psnr is not None:
                     self.logger.log_metrics({f"{loader_name}/{tag}/psnr": psnr}, val_step)
-                fvd = self.metric(pf.float(), gf.float(), num_views=vd, fvd=True).get("fvd")
-                self.metric.reset_fvd()
-                if fvd is not None:
-                    self.logger.log_metrics({f"{loader_name}/{tag}/fvd": fvd}, val_step)
+                # FVD는 분포 메트릭이라 표본이 너무 적으면(예: sanity-val 1개) 불안정/에러 → skip.
+                if pred.shape[0] >= 4:
+                    try:
+                        fvd = self.metric(pf.float(), gf.float(), num_views=vd, fvd=True).get("fvd")
+                    except Exception as e:
+                        print(f"[reco-metric] FVD skip ({loader_name}/{tag}): {e}"); fvd = None
+                    self.metric.reset_fvd()
+                    if fvd is not None:
+                        self.logger.log_metrics({f"{loader_name}/{tag}/fvd": fvd}, val_step)
+                else:
+                    print(f"[reco-metric] FVD skip ({loader_name}/{tag}): only {pred.shape[0]} video(s)")
         self._reco_metric_buf = {}
 
     def validation_step(self, batch, batch_idx, dataloader_idx=None):
