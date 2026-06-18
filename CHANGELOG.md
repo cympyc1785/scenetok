@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- `scripts/probe_wan_camera_dl3dv.py` — AC3D-style camera linear probing on the Wan2.2 TI2V-5B video DiT, using DL3DV. Wan2.2 VAE(48ch) encode → forward-hook 각 DiT block(30개) hidden state 추출 → 각 noise level에서 rectified-flow noise `(1-σ)·lat+σ·noise` (timestep=σ·1000) 주입 forward → 프레임별 feature pooling(global mean 또는 `--pool_grid G`의 G×G grid pooling, 공간 layout 보존) → z-score 표준화 + train-fit PCA(`--n_pc`) → closed-form ridge(λ search) → reference-relative pose(6D rot[col0|col1] + 95퍼센타일 정규화 translation) 회귀. geodesic rotation error(deg) + translation L2 + train-error/predict-mean baseline 동반 출력, layer×noise heatmap. **결과(150 scene, DL3DV): camera 신호 거의 없음** — val rotation 66–68° = baseline 66°, translation 0.43 vs 0.45, layer/noise 무관하게 flat (global mean / 4×4 grid pool 모두 동일). AC3D(mid-layer rot ~10–40°)와 불일치. probe 자체는 정상(6D layout 수정 후 train rot 11–25°까지 fit) → off-distribution 추론(TI2V-5B first-frame fused conditioning 없이 empty text)이 유력 원인으로 남음.
 - **ReCo 통합 완성 (#34/#35, smoke PASS)**: T2VWrapper `_reco_training_step` 분기 + config/셸. `RecoWanVace1_3BDenoiser`이면 width-doubled dual-loss 경로:
   - main 16ch ReCo latent (Wan2.1 VAE, /8 → 60x104): 좌=`inpaint_result`(recon) / 우=`video_input`(dynamic) width-concat → (B,V,16,H,2W).
   - bg 48ch latent (Wan2.2 VAE, /16 → 30x52): `inpaint_result`을 denoiser 내부 `bg_vae`(Wan2.2)로 인코딩 → same-t noise → ldt branch 입력. `_forward`가 bg를 ldt grid로, ldt 출력 ref를 ReCo grid로 bilinear resize (두 VAE downsample 다름).
