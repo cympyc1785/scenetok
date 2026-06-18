@@ -1,0 +1,96 @@
+{
+  "description": "Scene-varied variants of the remaining camera-motion types (dolly_in/out, pan L/R, tilt_up, orbit, drone, zoom_in, descend). CAMERA-motion sentence kept verbatim from camera_motion_t2v.json; only scene/subject changed. 2 variants per type.",
+  "negative_prompt": "static shot, fixed camera, no camera movement, jitter, blurry, distorted, low quality, text, watermark",
+  "prompts": [
+    {
+      "id": "01_dolly_in_v2",
+      "camera_move": "dolly in (push in)",
+      "prompt": "The camera slowly dollies forward, pushing in toward a lone lighthouse at the end of a rocky pier under a grey sky. Smooth steady camera motion moving straight ahead, waves crashing below. Cinematic, photorealistic."
+    },
+    {
+      "id": "01_dolly_in_v3",
+      "camera_move": "dolly in (push in)",
+      "prompt": "The camera slowly dollies forward, pushing in toward an ornate wooden door at the end of a candle-lit hallway. Smooth steady camera motion moving straight ahead, shadows flickering on the walls. Cinematic, photorealistic."
+    },
+    {
+      "id": "02_dolly_out_v2",
+      "camera_move": "dolly out (pull back)",
+      "prompt": "The camera slowly pulls back, dollying away from a lone astronaut standing on a red rocky plain, gradually revealing more of the vast Martian desert. Smooth backward camera motion. Cinematic, photorealistic."
+    },
+    {
+      "id": "02_dolly_out_v3",
+      "camera_move": "dolly out (pull back)",
+      "prompt": "The camera slowly pulls back, dollying away from a street musician playing guitar on a corner, gradually revealing more of the busy city sidewalk. Smooth backward camera motion. Cinematic, photorealistic."
+    },
+    {
+      "id": "03_pan_left_v2",
+      "camera_move": "pan left",
+      "prompt": "The camera pans smoothly to the left across a row of colorful beach houses along the shore, sweeping past each facade one after another. Steady horizontal rotation of the camera. Cinematic, photorealistic."
+    },
+    {
+      "id": "03_pan_left_v3",
+      "camera_move": "pan left",
+      "prompt": "The camera pans smoothly to the left across a snowy mountain ridge line, sweeping past the jagged peaks one after another. Steady horizontal rotation of the camera. Cinematic, photorealistic."
+    },
+    {
+      "id": "04_pan_right_v2",
+      "camera_move": "pan right",
+      "prompt": "The camera pans smoothly to the right across a long art gallery wall hung with framed paintings, sweeping past each painting. Steady horizontal camera rotation. Cinematic, photorealistic."
+    },
+    {
+      "id": "04_pan_right_v3",
+      "camera_move": "pan right",
+      "prompt": "The camera pans smoothly to the right across a harbor lined with fishing boats at dawn, sweeping past the moored boats. Steady horizontal camera rotation. Cinematic, photorealistic."
+    },
+    {
+      "id": "05_tilt_up_v2",
+      "camera_move": "tilt up",
+      "prompt": "The camera tilts upward from the base of a towering waterfall, slowly craning its view up the cascading water toward the cliff top. Smooth vertical camera tilt. Cinematic, photorealistic."
+    },
+    {
+      "id": "05_tilt_up_v3",
+      "camera_move": "tilt up",
+      "prompt": "The camera tilts upward from the foot of a gothic cathedral, slowly craning its view up the stone facade toward the spires. Smooth vertical camera tilt. Cinematic, photorealistic."
+    },
+    {
+      "id": "06_orbit_around_v2",
+      "camera_move": "orbit / arc around subject",
+      "prompt": "The camera orbits in a smooth circular arc around a marble statue of a warrior in a museum hall, revealing it from every angle as the camera circles. Steady 360 orbiting camera motion. Cinematic, photorealistic."
+    },
+    {
+      "id": "06_orbit_around_v3",
+      "camera_move": "orbit / arc around subject",
+      "prompt": "The camera orbits in a smooth circular arc around a steaming bowl of ramen on a wooden table, revealing it from every angle as the camera circles. Steady 360 orbiting camera motion. Cinematic, photorealistic."
+    },
+    {
+      "id": "09_drone_flyover_v2",
+      "camera_move": "aerial drone flyover",
+      "prompt": "An aerial drone shot flies forward over a dense tropical rainforest canopy with a waterfall, the camera gliding steadily ahead high above the landscape. Smooth forward aerial camera motion. Cinematic, photorealistic."
+    },
+    {
+      "id": "09_drone_flyover_v3",
+      "camera_move": "aerial drone flyover",
+      "prompt": "An aerial drone shot flies forward over a coastal city skyline at sunset, the camera gliding steadily ahead high above the landscape. Smooth forward aerial camera motion. Cinematic, photorealistic."
+    },
+    {
+      "id": "10_zoom_in_v2",
+      "camera_move": "zoom in",
+      "prompt": "The camera slowly zooms in on a hummingbird hovering at a flower, the framing tightening steadily until its wings fill the frame. Smooth optical zoom-in, background unchanged. Cinematic, photorealistic."
+    },
+    {
+      "id": "10_zoom_in_v3",
+      "camera_move": "zoom in",
+      "prompt": "The camera slowly zooms in on a vintage pocket watch resting on a desk, the framing tightening steadily until its dial fills the frame. Smooth optical zoom-in, background unchanged. Cinematic, photorealistic."
+    },
+    {
+      "id": "12_descend_topdown_v2",
+      "camera_move": "descend to top-down",
+      "prompt": "The camera descends straight down from above toward a circular hedge maze in a garden, smoothly lowering into a top-down bird's-eye view of the maze. Steady downward craning camera motion. Cinematic, photorealistic."
+    },
+    {
+      "id": "12_descend_topdown_v3",
+      "camera_move": "descend to top-down",
+      "prompt": "The camera descends straight down from above toward a busy roundabout with cars, smoothly lowering into a top-down bird's-eye view of the traffic. Steady downward craning camera motion. Cinematic, photorealistic."
+    }
+  ]
+}

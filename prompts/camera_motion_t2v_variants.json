@@ -1,0 +1,36 @@
+{
+  "description": "Scene-varied variants of the strongest camera-motion types (07 crane_up, 08 tracking, 11 handheld). The CAMERA-motion sentence is kept verbatim from camera_motion_t2v.json; only the scene/subject text is changed. 2 variants per type → isolate whether the camera move is robust across different content.",
+  "negative_prompt": "static shot, fixed camera, no camera movement, jitter, blurry, distorted, low quality, text, watermark",
+  "prompts": [
+    {
+      "id": "07_crane_up_v2",
+      "camera_move": "crane up (boom up)",
+      "prompt": "The camera cranes upward and rises high above a frozen lake dotted with ice skaters, lifting smoothly to a high vantage point looking down at the skaters. Steady upward boom camera motion. Cinematic, photorealistic."
+    },
+    {
+      "id": "07_crane_up_v3",
+      "camera_move": "crane up (boom up)",
+      "prompt": "The camera cranes upward and rises high above a vast sunflower field at golden hour, lifting smoothly to a high vantage point looking down at the rows of flowers. Steady upward boom camera motion. Cinematic, photorealistic."
+    },
+    {
+      "id": "08_tracking_follow_v2",
+      "camera_move": "tracking / following shot",
+      "prompt": "A tracking shot follows a galloping brown horse across a wide desert plain, the camera moving alongside at the same speed keeping the horse centered. Smooth lateral tracking camera motion. Cinematic, photorealistic."
+    },
+    {
+      "id": "08_tracking_follow_v3",
+      "camera_move": "tracking / following shot",
+      "prompt": "A tracking shot follows a red sports car speeding along a coastal highway, the camera moving alongside at the same speed keeping the car centered. Smooth lateral tracking camera motion. Cinematic, photorealistic."
+    },
+    {
+      "id": "11_handheld_walkthrough_v2",
+      "camera_move": "handheld walk-through (FPV)",
+      "prompt": "A handheld first-person camera walks forward along a narrow path through a dense green bamboo forest, the view advancing steadily deeper inside. Smooth forward walking camera motion. Cinematic, photorealistic."
+    },
+    {
+      "id": "11_handheld_walkthrough_v3",
+      "camera_move": "handheld walk-through (FPV)",
+      "prompt": "A handheld first-person camera walks forward down a neon-lit night market alley crowded with food stalls, the view advancing steadily deeper inside. Smooth forward walking camera motion. Cinematic, photorealistic."
+    }
+  ]
+}
