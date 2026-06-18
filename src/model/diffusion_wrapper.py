@@ -1,4 +1,5 @@
 
+import time
 import torch
 import einops
 import numpy as np
@@ -423,6 +424,8 @@ class DiffusionWrapper(LightningModule):
         # Loss NaN/Inf occurrence counter (process-lifetime cumulative).
         # Used by training_step to drop into pdb after 3 occurrences.
         self.nan_loss_count = 0
+        # Wall-clock timestamp of the previous logged train step (for per-step timing).
+        self._last_train_step_time = None
 
 
 
@@ -1106,12 +1109,15 @@ class DiffusionWrapper(LightningModule):
         opt = self.optimizers()
         current_lr = opt.param_groups[0]["lr"]
         if self.global_rank == 0:
+            now = time.perf_counter()
+            step_dt = (now - self._last_train_step_time) if self._last_train_step_time is not None else 0.0
+            self._last_train_step_time = now
             print(
                 f"Train step {self.step_tracker.get_step()}; "
                 # f"scene = {batch['scene']}; "
                 # f"context = {batch['context']['index'].tolist()}; "
                 # f"target = {batch['target']['index'][:, [0, 16, -1]].tolist()}; "
-                f"loss = {loss.item():.4f} lr = {current_lr}"
+                f"loss = {loss.item():.4f} lr = {current_lr}; time = {step_dt:.1f} sec"
             )
         self.log("loss/diffusion", loss) 
 

@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+- `src/model/diffusion_wrapper.py` train step 로그에 per-step 소요시간 추가: `Train step N; loss = ... lr = ...; time = X.X sec` (직전 logged step과의 wall-clock 차이, `time.perf_counter` 기준, rank 0). 첫 step은 `0.0 sec`.
+
 ### Added
 - **Structured (coarse/fine) scene latent** (branch `structured_latent`): scene token을 COARSE/FINE 두 그룹으로 구조적으로 분리하고 학습 중 그룹 단위 랜덤 마스킹. 256×448 context → 480×832 target.
   - `src/model/compressor/mvae_compressor.py`: cfg에 `structured_latent`/`num_coarse_tokens`(128)/`num_fine_tokens`(896)/`coarse_downsample`/`coarse_kl_scale`(10)/`fine_kl_scale`(1)/`group_mask_enabled`/`group_mask_probs`([both,coarse,fine]=0.5/0.25/0.25) 추가. `scene_tokens`(1024)의 앞 128=coarse·뒤 896=fine으로 보고, zero-init `level_embed`(2개)로 그룹 구분(step0엔 flat baseline과 동일), out_proj 후 coarse/fine를 별도 `DiagonalGaussianDistribution`으로 split해 `StructuredGaussian`(`.sample()`=concat, `.coarse`/`.fine` 노출)로 반환. 학습용 `group_mask_token`(token_dim, denoiser.null_tokens 비의존) 추가.
