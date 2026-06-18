@@ -225,8 +225,13 @@ def main():
     base_eul = Yeul_tr.mean(0, keepdim=True).repeat(Yeul_te.shape[0], 1)
     base_tr = Ytr_tr.mean(0, keepdim=True).repeat(Ytr_te.shape[0], 1)
     base_rot, base_trans = traj_err(base_eul, base_tr)
-    print(f"[probe-re10k] baseline: rot {base_rot:.2f}°  trans {base_trans:.3f}")
+    def trans_cos(pred_tr):  # shape-only: cosine between predicted & GT translation trajectory (per sample)
+        a, b = pred_tr.float(), Ytr_te.float()
+        return torch.nn.functional.cosine_similarity(a, b, dim=1).mean().item()
+    base_cos = trans_cos(base_tr)
+    print(f"[probe-re10k] baseline: rot {base_rot:.2f}°  trans {base_trans:.3f}  trans_cos {base_cos:.3f}")
 
+    saved = {}                                                # probe weights per (layer,noise)
     for L in layers:
         for t_lvl in noise_levels:
             Xs = torch.stack(feats[L][t_lvl]).double()       # (N, dim)
@@ -248,16 +253,23 @@ def main():
             W_ = best[1]
             pt = ridge_pred(Xte, W_); fe = pt.shape[1] // 2
             te_rot, te_trans = traj_err(pt[:, :fe], pt[:, fe:])
+            te_cos = trans_cos(pt[:, fe:])                     # translation shape (direction) match
             raw_mse = (pt - torch.cat([Yeul_te, Ytr_te], 1)).pow(2).mean().item()
             results.append(dict(layer=L, noise=t_lvl, rot_err_deg=te_rot, trans_err=te_trans,
-                                raw_mse=raw_mse, lam=best[2]))
+                                trans_cos=te_cos, raw_mse=raw_mse, lam=best[2]))
+            saved[f"{L}_{t_lvl}"] = dict(W=W_.half().cpu(), mu=mu.half().cpu(), sd=sd.half().cpu(),
+                                         pred=pt.float().cpu())   # test prediction [euler|trans] (N_te, F*6)
             print(f"  layer {L:2d} noise {t_lvl:.3f}: rot {te_rot:6.2f}° trans {te_trans:.3f} "
-                  f"raw_mse {raw_mse:.4f} (base rot {base_rot:.1f} trans {base_trans:.2f}) λ={best[2]:g}")
+                  f"trans_cos {te_cos:+.3f} (base {base_cos:+.3f}) raw_mse {raw_mse:.4f} λ={best[2]:g}")
+    torch.save(dict(weights=saved, layers=layers, noise_levels=noise_levels,
+                    gt_test=dict(euler=Yeul_te.float().cpu(), trans=Ytr_te.float().cpu(), R=Rgt_te.float().cpu()),
+                    target_layout="[euler(F*3) | trans(F*3)], standardize x with (x-mu)/sd then [x|1]@W",
+                    num_frames=args.num_frames), os.path.join(args.out, "probe_weights.pt"))
 
     with open(os.path.join(args.out, "probe_results.json"), "w") as f:
         json.dump(dict(layers=layers, noise_levels=noise_levels, results=results, n_scenes=n_used,
                        num_frames=args.num_frames, baseline_rot=base_rot, baseline_trans=base_trans,
-                       mode="ac3d_trajectory_re10k"), f, indent=2)
+                       baseline_trans_cos=base_cos, mode="ac3d_trajectory_re10k"), f, indent=2)
     try:
         import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
         for metric in ["rot_err_deg", "trans_err"]:
