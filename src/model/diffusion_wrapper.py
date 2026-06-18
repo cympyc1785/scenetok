@@ -918,6 +918,25 @@ class DiffusionWrapper(LightningModule):
             if self.model_cfg.mask_tokens:
                 token_mask, ratios, num_false = random_mask_biased(B=scene_tokens.shape[0], N=scene_tokens.shape[1], M=0.6, device="cpu")
 
+            # Structured (coarse/fine) group masking: per sample, randomly keep
+            # {both, coarse-only, fine-only}. Masked-out groups are replaced with the
+            # denoiser null token in preprocess_scene_tokens, so each level is forced to
+            # be independently usable and the two become complementary.
+            if getattr(self.model_cfg.compressor, "structured_latent", False) \
+                    and getattr(self.model_cfg.compressor, "group_mask_enabled", False):
+                nc = tokens.num_coarse
+                B, N = scene_tokens.shape[0], scene_tokens.shape[1]
+                probs = list(self.model_cfg.compressor.group_mask_probs)  # [both, coarse_only, fine_only]
+                modes = np.random.choice(3, size=B, p=probs)
+                absent = torch.zeros(B, N, dtype=torch.bool, device=scene_tokens.device)
+                for i, m in enumerate(modes):
+                    if m == 1:      # coarse-only -> mask fine group
+                        absent[i, nc:] = True
+                    elif m == 2:    # fine-only -> mask coarse group
+                        absent[i, :nc] = True
+                mask_tok = self.compressor.group_mask_token.to(scene_tokens.dtype).view(1, 1, -1)
+                scene_tokens = torch.where(absent.unsqueeze(-1), mask_tok, scene_tokens)
+
 
         else:
             # for unconditional sampling (rendering)
@@ -1007,8 +1026,7 @@ class DiffusionWrapper(LightningModule):
         # Apply KL divergence weighting and scheduling
         kl_weight = 0.0
         if self.model_cfg.compressor.scene_token_projection == "kl" and conditional_tokens and self.model_cfg.compressor is not None and not self.frozen_compressor:
-            kl_raw = tokens.kl()
-            kl = kl_raw / (tokens.mean.shape[1] * tokens.mean.shape[2])
+            # Annealed base KL weight (shared schedule).
             if self.global_step <= self.model_cfg.compressor.kl_schedule[0]:
                 kl_weight = self.model_cfg.compressor.kl_weights[0]
             elif self.global_step <= self.model_cfg.compressor.kl_schedule[1] and self.global_step > self.model_cfg.compressor.kl_schedule[0]:
@@ -1016,9 +1034,27 @@ class DiffusionWrapper(LightningModule):
                 kl_weight = (1 - t) * self.model_cfg.compressor.kl_weights[0] + t*self.model_cfg.compressor.kl_weights[1]
             else:
                 kl_weight = self.model_cfg.compressor.kl_weights[1]
-            loss = loss + kl_weight * kl
-            self.log("loss/kl", kl.mean())
-            self.log("loss/kl_raw", kl_raw.mean())
+
+            if getattr(self.model_cfg.compressor, "structured_latent", False):
+                # Per-group KL with bottleneck asymmetry: coarse gets a larger scale so it
+                # is squeezed into a low-rate global summary; fine keeps capacity for detail.
+                c_dist, f_dist = tokens.coarse, tokens.fine
+                coarse_kl_raw = c_dist.kl()
+                fine_kl_raw = f_dist.kl()
+                coarse_kl = coarse_kl_raw / (c_dist.mean.shape[1] * c_dist.mean.shape[2])
+                fine_kl = fine_kl_raw / (f_dist.mean.shape[1] * f_dist.mean.shape[2])
+                kl = (self.model_cfg.compressor.coarse_kl_scale * coarse_kl
+                      + self.model_cfg.compressor.fine_kl_scale * fine_kl)
+                loss = loss + kl_weight * kl
+                self.log("loss/kl", kl.mean())
+                self.log("loss/kl_coarse", coarse_kl.mean())
+                self.log("loss/kl_fine", fine_kl.mean())
+            else:
+                kl_raw = tokens.kl()
+                kl = kl_raw / (tokens.mean.shape[1] * tokens.mean.shape[2])
+                loss = loss + kl_weight * kl
+                self.log("loss/kl", kl.mean())
+                self.log("loss/kl_raw", kl_raw.mean())
         loss = loss.mean()
 
         # Loss NaN/Inf tracking. On every NaN we (a) diagnose the batch for

@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- **Structured (coarse/fine) scene latent** (branch `structured_latent`): scene token을 COARSE/FINE 두 그룹으로 구조적으로 분리하고 학습 중 그룹 단위 랜덤 마스킹. 256×448 context → 480×832 target.
+  - `src/model/compressor/mvae_compressor.py`: cfg에 `structured_latent`/`num_coarse_tokens`(128)/`num_fine_tokens`(896)/`coarse_downsample`/`coarse_kl_scale`(10)/`fine_kl_scale`(1)/`group_mask_enabled`/`group_mask_probs`([both,coarse,fine]=0.5/0.25/0.25) 추가. `scene_tokens`(1024)의 앞 128=coarse·뒤 896=fine으로 보고, zero-init `level_embed`(2개)로 그룹 구분(step0엔 flat baseline과 동일), out_proj 후 coarse/fine를 별도 `DiagonalGaussianDistribution`으로 split해 `StructuredGaussian`(`.sample()`=concat, `.coarse`/`.fine` 노출)로 반환. 학습용 `group_mask_token`(token_dim, denoiser.null_tokens 비의존) 추가.
+  - `src/model/diffusion_wrapper.py`: structured일 때 그룹 마스킹(per-sample both/coarse-only/fine-only → 마스킹된 그룹을 `group_mask_token`으로 `torch.where` 치환) + per-group KL(coarse는 `coarse_kl_scale`배 강하게, `loss/kl_coarse`·`loss/kl_fine` 로깅). 비-structured 기존 경로/KL은 그대로 보존.
+  - config `config/experiment/custom/scenetok_va-wan_shift4_dl3dv_finetuned_wide_structured.yaml`: target 480×832(denoiser `input_shape [30,52]`, camera `[240,416]`, in_channels 48), compressor structured 필드. 셸 `scripts/train_scenetok/train_scenetok_dl3dv_256-480_structured.sh`(GPU3, num_workers=0).
+  - **현 단계(Phase 1)**: bottleneck(KL) 비대칭 + level emb + 그룹 마스킹 + 480 출력 동작 확인(sanity-val·train forward/backward GPU 100%). receptive-field 비대칭(coarse가 downsample된 context attend, `coarse_downsample`)은 Phase 2에서 추가 예정.
+
+- **va-wan2.1 학습 셋업**: target video decoder를 Wan2.2 VAE(48ch, spatial 16×) 대신 **Wan2.1 VAE(16ch, spatial 8×)** 로 교체. (코드 16ch 경로는 이미 `autoencoder_wan.py`의 `latent_channels==16 → WanVideoVAE(z_dim=16)`로 배선돼 있어 config 위주 작업.)
+  - `config/model/autoencoders/target/wan2.1.yaml` (신규): `name: wan`, `latent_channels: 16`, `pretrained_from: checkpoints/Wan2.1_VAE.pth`. (`checkpoints/Wan2.1_VAE.pth`는 `ReCo/checkpoints/Wan2.1-VACE-1.3B/Wan2.1_VAE.pth` symlink.)
+  - `config/experiment/custom/scenetok_va-wan2.1_dl3dv_finetuned_wide.yaml` (신규): `scenetok_va-wan_shift4_dl3dv_finetuned_wide` 기반. target AE → `wan2.1`, 256×448에서 Wan2.1 latent이 16ch@32×56(vs Wan2.2 48ch@16×28)이라 `denoiser.kwargs.in_channels 48→16`, `denoiser.input_shape [16,28]→[32,56]`, target-camera ray `input_shape [128,224]→[256,448]`(/patch8=32×56). compressor(context VA-VAE)는 그대로. `va-wan_dl3dv.ckpt`에서 `load_strict=false` finetune → transformer body는 로드, 채널 불일치된 latent in/out projection만 reinit.
+  - 셸 `scripts/train_scenetok/train_scenetok_dl3dv_256_finetune_va-wan2.1.sh`: config를 새 va-wan2.1 config로 교체. exp `scenetok_va-wan2.1_dl3dv_256_finetune_small`, GPU 0.
+
+### Fixed
+- `src/model/autoencoder/autoencoder_wan.py` `decode`: validation decode 단계 OOM 완화. Wan VAE는 temporal-causal VAE라 한 영상의 latent 프레임들은 함께 decode해야 하지만(내부 `feat_cache`로 시간축 consistency 유지) **batch 차원은 완전히 독립**이고 `decode`가 호출마다 cache를 reset함. 기존엔 batch(b)를 통째로 decode → 480×832에서 decoder activation peak로 OOM(`9.26 GiB` 부족). 이제 b>1이면 sample 1개씩 순차 decode 후 concat → 결과 **bit-identical**, peak 메모리 ~÷batch. temporal 경로(1 latent씩 causal cache decode)는 그대로라 consistency 영향 없음. b==1은 기존 경로 유지. decode는 `generate_batch_with_scene`(`@torch.no_grad`)·validation no_grad에서만 호출되고 학습 loss는 latent 공간이라 backward 영향 없음(encode 미변경).
+
 ### Changed
 - `src/model/diffusion_wrapper.py` validation video/context logging이 `data_loader.val.batch_size`와 무관하게 항상 최대 8개 sample을 로깅하도록 변경. 기존엔 `batch_idx == 0` 첫 배치(`b`개)만 즉시 로깅 → batch_size를 1로 줄이면 video도 1개만 올라갔음. 이제 `val_vis_buffer`에 batch별로 누적(rank 0, `val_vis_num=8`)한 뒤 `on_validation_end`에서 한 번에 flush (Sampled/Original Video + Context grid, dataloader idx 0인 `standard`는 un-prefixed 패널도 함께). Context Interpolation video는 기존대로 `batch_idx==0` 유지 (per-scene 무거운 생성이라 누적 미적용).
 

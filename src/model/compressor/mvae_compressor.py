@@ -45,6 +45,31 @@ class AggregatorKwargsCfg:
     use_rmsnorm: bool=True
     wo_shift: bool=False
 
+class StructuredGaussian:
+    """Coarse/fine pair of DiagonalGaussianDistributions for structured scene tokens.
+
+    Quacks like a single DiagonalGaussianDistribution for the existing wrapper code
+    (`.sample()` returns coarse+fine concatenated along the token axis, `.mean` is the
+    concatenated mean), while also exposing `.coarse`/`.fine` for per-group scaled KL
+    and `.num_coarse` so the wrapper can build group masks.
+    """
+    def __init__(self, coarse: DiagonalGaussianDistribution, fine: DiagonalGaussianDistribution):
+        self.coarse = coarse
+        self.fine = fine
+        self.num_coarse = coarse.mean.shape[1]
+        self.mean = torch.cat([coarse.mean, fine.mean], dim=1)
+
+    def sample(self):
+        return torch.cat([self.coarse.sample(), self.fine.sample()], dim=1)
+
+    def mode(self):
+        return torch.cat([self.coarse.mode(), self.fine.mode()], dim=1)
+
+    def kl(self):
+        # Unscaled combined KL (per-batch); the wrapper applies per-group scales separately.
+        return self.coarse.kl() + self.fine.kl()
+
+
 @dataclass
 class MVAECompressorCfg:
     name: Literal["mvae_compressor"]
@@ -74,6 +99,15 @@ class MVAECompressorCfg:
     freeze_after: int = -1  # Number of optimization steps after which to freeze the compressor (if -1, never freeze)
     unfreeze_after: int = -1
     freeze_q_after: int = -1  # Number of optimization steps after which to freeze the compressor (if -1, never freeze)
+    # --- structured (coarse/fine) scene latent ---
+    structured_latent: bool = False               # split scene tokens into coarse + fine groups
+    num_coarse_tokens: int = 128                  # coarse group size (global, downsampled-context, strong KL)
+    num_fine_tokens: int = 896                    # fine group size (detail, full-context, weak KL); sum == num_scene_tokens
+    coarse_downsample: int = 2                    # spatial pooling factor of context seen by coarse queries (receptive-field asymmetry)
+    coarse_kl_scale: float = 1.0                  # KL multiplier on coarse group (bottleneck asymmetry)
+    fine_kl_scale: float = 1.0                    # KL multiplier on fine group
+    group_mask_enabled: bool = False              # random group masking during training
+    group_mask_probs: list = field(default_factory=lambda: [0.5, 0.25, 0.25])  # [both, coarse_only, fine_only]
 class PositionEmbeddingSine(nn.Module):
     """
     This is a more standard version of the position embedding, very similar to the one
@@ -147,6 +181,23 @@ class MVAECompressor(Compressor[MVAECompressorCfg]):
             torch.nn.init.normal_(self.scene_tokens, std=5.0)
         elif cfg.init_small:
             torch.nn.init.normal_(self.scene_tokens, std=0.02)
+
+        # Structured (coarse/fine) latent: the first num_coarse_tokens of scene_tokens are
+        # the COARSE group, the rest are FINE. A learnable per-group level embedding (zero-init,
+        # so identical to the flat baseline at step 0) lets the aggregator/denoiser tell them apart.
+        self.structured_latent = cfg.structured_latent
+        if self.structured_latent:
+            assert cfg.num_coarse_tokens + cfg.num_fine_tokens == cfg.num_scene_tokens, (
+                f"num_coarse_tokens ({cfg.num_coarse_tokens}) + num_fine_tokens ({cfg.num_fine_tokens}) "
+                f"must equal num_scene_tokens ({cfg.num_scene_tokens})"
+            )
+            assert cfg.scene_token_projection == "kl", "structured_latent currently requires scene_token_projection=kl"
+            self.num_coarse_tokens = cfg.num_coarse_tokens
+            self.level_embed = nn.Parameter(torch.zeros(2, cfg.kwargs.hidden_size))
+            # Learned "absent group" token (token_dim space) used when a group is masked
+            # out during training. Self-contained (does not depend on denoiser.null_tokens,
+            # which only exists when cfg_train=True).
+            self.group_mask_token = nn.Parameter(torch.zeros(cfg.token_dim))
 
 
         self.norm_before_proj = cfg.norm_before_proj
@@ -299,21 +350,36 @@ class MVAECompressor(Compressor[MVAECompressorCfg]):
 
 
         x = self.scene_tokens.expand(b, -1, -1)
+        if self.structured_latent:
+            # Tag coarse (first num_coarse_tokens) vs fine (rest) with a learnable level embedding.
+            nc = self.num_coarse_tokens
+            level = torch.cat([
+                self.level_embed[0].expand(nc, -1),
+                self.level_embed[1].expand(x.shape[1] - nc, -1),
+            ], dim=0).unsqueeze(0)
+            x = x + level
         if self.use_scene_norm:
             x = self.scene_norm(x)
         for block in self.aggregate:
             if self.cfg.gradient_checkpointing:
-                x, y, qk = checkpoint(block, x, pemb, y, self.feat_rope, self.causal, v, use_reentrant=False) 
+                x, y, qk = checkpoint(block, x, pemb, y, self.feat_rope, self.causal, v, use_reentrant=False)
             else:
-                x, y, qk = block(x, c=pemb, y=y, feat_rope=self.feat_rope, causal=self.causal, num_views=v) 
+                x, y, qk = block(x, c=pemb, y=y, feat_rope=self.feat_rope, causal=self.causal, num_views=v)
 
-                    
+
         if self.cfg.reproject_out:
             if self.norm_before_proj:
                 x = self.norm(x)
             x = self.out_proj(x)
             if self.cfg.scene_token_projection == "kl":
-                x = DiagonalGaussianDistribution(x)
+                if self.structured_latent:
+                    nc = self.num_coarse_tokens
+                    x = StructuredGaussian(
+                        DiagonalGaussianDistribution(x[:, :nc]),
+                        DiagonalGaussianDistribution(x[:, nc:]),
+                    )
+                else:
+                    x = DiagonalGaussianDistribution(x)
             else:
                 if not self.norm_before_proj:
                     x = self.norm(x)
