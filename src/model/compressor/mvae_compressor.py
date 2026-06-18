@@ -2,6 +2,7 @@
 
 import math
 import torch
+import torch.nn.functional as F
 
 from dataclasses import dataclass, field
 from torch import nn
@@ -104,6 +105,7 @@ class MVAECompressorCfg:
     num_coarse_tokens: int = 128                  # coarse group size (global, downsampled-context, strong KL)
     num_fine_tokens: int = 896                    # fine group size (detail, full-context, weak KL); sum == num_scene_tokens
     coarse_downsample: int = 2                    # spatial pooling factor of context seen by coarse queries (receptive-field asymmetry)
+    coarse_receptive_field: bool = False          # Phase 2: coarse queries attend to a coarse_downsample-pooled context (off => both groups see full context)
     coarse_kl_scale: float = 1.0                  # KL multiplier on coarse group (bottleneck asymmetry)
     fine_kl_scale: float = 1.0                    # KL multiplier on fine group
     group_mask_enabled: bool = False              # random group masking during training
@@ -232,6 +234,27 @@ class MVAECompressor(Compressor[MVAECompressorCfg]):
             )
         else:
             self.feat_rope = None
+
+        # Phase 2 receptive-field asymmetry: a separate RoPE matching the coarse_downsample-pooled
+        # per-view context grid, so coarse queries attend to a lower-resolution context.
+        self.coarse_receptive_field = self.structured_latent and cfg.coarse_receptive_field
+        if self.coarse_receptive_field:
+            ds = cfg.coarse_downsample
+            ch = (cfg.input_shape[0] // cfg.kwargs.patch_size) // ds
+            cw = (cfg.input_shape[1] // cfg.kwargs.patch_size) // ds
+            assert ch > 0 and cw > 0, f"coarse_downsample={ds} too large for context grid"
+            if cfg.kwargs.use_rope_3d:
+                self.feat_rope_coarse = RotaryEmbedding3D(
+                    cfg.kwargs.hidden_size // cfg.kwargs.num_heads, sizes=(num_views, ch, cw))
+            elif cfg.kwargs.use_rope_2d:
+                self.feat_rope_coarse = VisionRotaryEmbeddingFast(
+                    dim=cfg.kwargs.hidden_size // cfg.kwargs.num_heads // 2, pt_seq_len=(ch, cw))
+            else:
+                self.feat_rope_coarse = None
+            self._coarse_ds = ds
+            self._ctx_grid = (cfg.input_shape[0] // cfg.kwargs.patch_size,
+                              cfg.input_shape[1] // cfg.kwargs.patch_size)
+
         self.aggregate = nn.ModuleList([
             LightningDiTBlock(
                 cfg.kwargs.hidden_size, 
@@ -360,11 +383,36 @@ class MVAECompressor(Compressor[MVAECompressorCfg]):
             x = x + level
         if self.use_scene_norm:
             x = self.scene_norm(x)
-        for block in self.aggregate:
-            if self.cfg.gradient_checkpointing:
-                x, y, qk = checkpoint(block, x, pemb, y, self.feat_rope, self.causal, v, use_reentrant=False)
+
+        if self.coarse_receptive_field:
+            # Phase 2 receptive-field asymmetry: coarse queries attend to a pooled (low-res)
+            # context, fine queries to the full context. Two passes through the shared blocks.
+            nc = self.num_coarse_tokens
+            xc, xf = x[:, :nc], x[:, nc:]
+            gh, gw = self._ctx_grid
+            ds = self._coarse_ds
+            y_grid = rearrange(y, "b (v gh gw) c -> (b v) c gh gw", v=v, gh=gh, gw=gw)
+            y_coarse = rearrange(F.avg_pool2d(y_grid, kernel_size=ds), "(b v) c h w -> b (v h w) c", v=v)
+            if pemb is not None:
+                p_grid = rearrange(pemb, "b (v gh gw) c -> (b v) c gh gw", v=v, gh=gh, gw=gw)
+                pemb_coarse = rearrange(F.avg_pool2d(p_grid, kernel_size=ds), "(b v) c h w -> b (v h w) c", v=v)
             else:
-                x, y, qk = block(x, c=pemb, y=y, feat_rope=self.feat_rope, causal=self.causal, num_views=v)
+                pemb_coarse = None
+            yc, yf = y_coarse, y
+            for block in self.aggregate:
+                if self.cfg.gradient_checkpointing:
+                    xc, yc, _ = checkpoint(block, xc, pemb_coarse, yc, self.feat_rope_coarse, self.causal, v, use_reentrant=False)
+                    xf, yf, _ = checkpoint(block, xf, pemb, yf, self.feat_rope, self.causal, v, use_reentrant=False)
+                else:
+                    xc, yc, _ = block(xc, c=pemb_coarse, y=yc, feat_rope=self.feat_rope_coarse, causal=self.causal, num_views=v)
+                    xf, yf, _ = block(xf, c=pemb, y=yf, feat_rope=self.feat_rope, causal=self.causal, num_views=v)
+            x = torch.cat([xc, xf], dim=1)
+        else:
+            for block in self.aggregate:
+                if self.cfg.gradient_checkpointing:
+                    x, y, qk = checkpoint(block, x, pemb, y, self.feat_rope, self.causal, v, use_reentrant=False)
+                else:
+                    x, y, qk = block(x, c=pemb, y=y, feat_rope=self.feat_rope, causal=self.causal, num_views=v)
 
 
         if self.cfg.reproject_out:

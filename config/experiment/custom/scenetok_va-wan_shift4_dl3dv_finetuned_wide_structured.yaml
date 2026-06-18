@@ -121,6 +121,7 @@ model:
     num_coarse_tokens: 128
     num_fine_tokens: 896
     coarse_downsample: 2             # coarse queries attend to context pooled 2x (receptive-field asymmetry)
+    coarse_receptive_field: true     # Phase 2 on/off: true=coarse over pooled context (2-pass), false=both see full context
     coarse_kl_scale: 10.0            # stronger KL bottleneck on coarse (bottleneck asymmetry)
     fine_kl_scale: 1.0
     group_mask_enabled: true
