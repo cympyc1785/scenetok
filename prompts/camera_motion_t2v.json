@@ -1,0 +1,66 @@
+{
+  "description": "Camera-motion T2V test prompts for Wan2.2 TI2V-5B. Each prompt describes a mostly static scene with an explicit, dominant CAMERA movement, so generated videos reveal whether the model renders the camera move (not just object motion). Use the `prompt` field as the text input to scripts/diffsynth_pure_t2v_fp32.py (--prompt). Save each output together with its text input.",
+  "negative_prompt": "static shot, fixed camera, no camera movement, jitter, blurry, distorted, low quality, text, watermark",
+  "prompts": [
+    {
+      "id": "01_dolly_in",
+      "camera_move": "dolly in (push in)",
+      "prompt": "The camera slowly dollies forward, pushing in toward a single wooden chair in the center of an empty sunlit room. Smooth steady camera motion moving straight ahead, dust floating in the light. Cinematic, photorealistic."
+    },
+    {
+      "id": "02_dolly_out",
+      "camera_move": "dolly out (pull back)",
+      "prompt": "The camera slowly pulls back, dollying away from a lit campfire on a quiet beach at dusk, gradually revealing more of the wide empty shoreline. Smooth backward camera motion. Cinematic, photorealistic."
+    },
+    {
+      "id": "03_pan_left",
+      "camera_move": "pan left",
+      "prompt": "The camera pans smoothly to the left across a long bookshelf filled with old leather books, sweeping past the spines one after another. Steady horizontal rotation of the camera. Cinematic, photorealistic."
+    },
+    {
+      "id": "04_pan_right",
+      "camera_move": "pan right",
+      "prompt": "The camera pans smoothly to the right across a city skyline at sunset, sweeping past skyscraper after skyscraper. Steady horizontal camera rotation. Cinematic, photorealistic."
+    },
+    {
+      "id": "05_tilt_up",
+      "camera_move": "tilt up",
+      "prompt": "The camera tilts upward from the base of a giant redwood tree, slowly craning its view up the towering trunk toward the canopy and sky. Smooth vertical camera tilt. Cinematic, photorealistic."
+    },
+    {
+      "id": "06_orbit_around",
+      "camera_move": "orbit / arc around subject",
+      "prompt": "The camera orbits in a smooth circular arc around a vintage red sports car parked in an empty studio, revealing it from every angle as the camera circles. Steady 360 orbiting camera motion. Cinematic, photorealistic."
+    },
+    {
+      "id": "07_crane_up",
+      "camera_move": "crane up (boom up)",
+      "prompt": "The camera cranes upward and rises high above a crowded outdoor market, lifting smoothly to a high vantage point looking down at the stalls. Steady upward boom camera motion. Cinematic, photorealistic."
+    },
+    {
+      "id": "08_tracking_follow",
+      "camera_move": "tracking / following shot",
+      "prompt": "A tracking shot follows a lone cyclist riding down a tree-lined road, the camera moving alongside at the same speed keeping the rider centered. Smooth lateral tracking camera motion. Cinematic, photorealistic."
+    },
+    {
+      "id": "09_drone_flyover",
+      "camera_move": "aerial drone flyover",
+      "prompt": "An aerial drone shot flies forward over a vast green mountain valley with a winding river below, the camera gliding steadily ahead high above the landscape. Smooth forward aerial camera motion. Cinematic, photorealistic."
+    },
+    {
+      "id": "10_zoom_in",
+      "camera_move": "zoom in",
+      "prompt": "The camera slowly zooms in on a single blooming red rose in a quiet garden, the framing tightening steadily until the petals fill the frame. Smooth optical zoom-in, background unchanged. Cinematic, photorealistic."
+    },
+    {
+      "id": "11_handheld_walkthrough",
+      "camera_move": "handheld walk-through (FPV)",
+      "prompt": "A handheld first-person camera walks forward through the doorway of an old stone castle and down a torch-lit corridor, the view advancing steadily deeper inside. Smooth forward walking camera motion. Cinematic, photorealistic."
+    },
+    {
+      "id": "12_descend_topdown",
+      "camera_move": "descend to top-down",
+      "prompt": "The camera descends straight down from above toward a spiral staircase, smoothly lowering into a top-down bird's-eye view of the winding steps. Steady downward craning camera motion. Cinematic, photorealistic."
+    }
+  ]
+}
