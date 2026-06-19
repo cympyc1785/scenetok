@@ -92,6 +92,10 @@ class RecoWanVace1_3BCfg:
     vace_scale: float = 1.0
     # ReCo 출력 좌/우 split loss 가중치 (wrapper에서 사용). left=recon, right=dynamic.
     recon_loss_weight: float = 1.0
+    dynamic_loss_weight: float = 1.0
+    # True면 ReCo(DiT/VACE LoRA) freeze → LightningDiT ctrl branch + ldt2reco_proj만 학습.
+    # recon-우선 phase: freeze_reco=true + dynamic_loss_weight=0 으로 ldt만 recon에 fit.
+    freeze_reco: bool = False
     ckpt_path: str | Path | None = None
     load_strict: bool = False
     lora: RecoLoRACfg = field(default_factory=RecoLoRACfg)
@@ -298,12 +302,13 @@ class RecoWanVace1_3BDenoiser(Denoiser[RecoWanVace1_3BCfg]):
             p.requires_grad = False
         for p in self.bg_vae.parameters():
             p.requires_grad = False
-        for name, p in self.model.named_parameters():
-            if "lora_" in name:
-                p.requires_grad = True
-        for name, p in self.vace.named_parameters():
-            if "lora_" in name:
-                p.requires_grad = True
+        if not self.cfg.freeze_reco:                        # recon-우선 phase면 ReCo LoRA도 freeze
+            for name, p in self.model.named_parameters():
+                if "lora_" in name:
+                    p.requires_grad = True
+            for name, p in self.vace.named_parameters():
+                if "lora_" in name:
+                    p.requires_grad = True
         for p in self.ldt_branch.parameters():
             p.requires_grad = True
         for p in self.ldt2reco_proj.parameters():

@@ -573,7 +573,8 @@ class T2VWrapper(DiffusionWrapper):
         loss_recon = F.mse_loss(pred[..., :wh], gt[..., :wh])        # 좌: background recon
         loss_dyn = F.mse_loss(pred[..., wh:], gt[..., wh:])          # 우: dynamic
         recon_w = float(getattr(self.denoiser.cfg, "recon_loss_weight", 1.0))
-        loss = recon_w * loss_recon + loss_dyn
+        dyn_w = float(getattr(self.denoiser.cfg, "dynamic_loss_weight", 1.0))
+        loss = recon_w * loss_recon + dyn_w * loss_dyn       # recon-우선 phase: dyn_w=0
 
         current_lr = self.optimizers().param_groups[0]["lr"]
         if self.global_rank == 0:
