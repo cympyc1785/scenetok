@@ -95,7 +95,8 @@ def main():
     ap.add_argument("--num_frames", type=int, default=49)
     ap.add_argument("--hw", default="480,720")              # CogVideoX-5b native
     ap.add_argument("--layers", default="all")
-    ap.add_argument("--noise_levels", default="0.3,0.5,0.7,0.9,0.96")
+    ap.add_argument("--noise_levels", default="0.125,0.25,0.375,0.5,0.625,0.75,0.875,1.0")  # AC3D σ
+    ap.add_argument("--n_pc", type=int, default=512)
     ap.add_argument("--val_frac", type=float, default=0.2)
     ap.add_argument("--test_frac", type=float, default=0.2)
     ap.add_argument("--out", default="results/probe_cogvideox_re10k")
@@ -162,7 +163,9 @@ def main():
                     tr(hidden_states=noisy, encoder_hidden_states=prompt_embeds,
                        timestep=ts_idx.to(dtype), image_rotary_emb=rope, return_dict=False)
                 for L in layers:
-                    feats[L][s].append(captured[L][0].float().mean(0).cpu())      # global pool → (dim,)
+                    tok = captured[L][0]                                          # (T_lat*Hp*Wp, dim) video tokens
+                    pf = tok.reshape(T_lat, tok.shape[0] // T_lat, -1).float().mean(1)  # (f, dim) per-frame avg-pool (keep time)
+                    feats[L][s].append(pf.half().cpu())
             euler_store.append(torch.from_numpy(eul).float().reshape(-1))
             trans_store.append(torch.from_numpy(t_).float().reshape(-1))
             R_store.append(torch.from_numpy(Rrel).float())
@@ -196,15 +199,22 @@ def main():
         return torch.nn.functional.cosine_similarity(pred_tr.float(), Ytr_te.float(), dim=1).mean().item()
     base_cos = trans_cos(Ytr_tr.mean(0, keepdim=True).repeat(Ytr_te.shape[0], 1))
     print(f"[probe-cog] baseline: rot {base_rot:.2f}°  trans {base_trans:.3f}  trans_cos {base_cos:.3f}")
+    def pca_unroll(Xpf, n_pc):
+        N_, f_, D = Xpf.shape
+        flat_tr = Xpf[:n_tr].reshape(-1, D).double().to(dev)
+        mu_p = flat_tr.mean(0, keepdim=True); npc = min(n_pc, flat_tr.shape[0] - 1, D)
+        P = torch.linalg.svd(flat_tr - mu_p, full_matrices=False)[2][:npc].T
+        proj = lambda x: ((x.reshape(-1, D).double().to(dev) - mu_p) @ P).reshape(x.shape[0], -1)
+        return proj(Xpf[:n_tr]), proj(Xpf[n_tr:n_tr+n_va]), proj(Xpf[n_tr+n_va:])
     saved = {}
     for L in layers:
         for s in noise_levels:
-            Xtr, Xva, Xte = split(torch.stack(feats[L][s]).double())
+            Xtr, Xva, Xte = pca_unroll(torch.stack(feats[L][s]), args.n_pc)   # per-frame PCA + unroll
             mu, sd = Xtr.mean(0, keepdim=True), Xtr.std(0, keepdim=True).clamp_min(1e-6)
             Xtr, Xva, Xte = (Xtr - mu) / sd, (Xva - mu) / sd, (Xte - mu) / sd
             Ycat_tr = torch.cat([Yeul_tr, Ytr_tr], 1)
             best = None
-            for lam in (1e-1, 1e0, 1e1, 1e2, 1e3):
+            for lam in (1e0, 1e1, 1e2, 1e3, 1e4, 1e5):
                 W_ = ridge_fit(Xtr, Ycat_tr, lam); pv = ridge_pred(Xva, W_); fe = pv.shape[1] // 2
                 vrot, _ = err(pv[:, :fe], pv[:, fe:], Rgt_va, Ytr_va)
                 if best is None or vrot < best[0]:

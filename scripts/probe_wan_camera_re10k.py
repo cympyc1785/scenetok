@@ -121,7 +121,8 @@ def main():
     ap.add_argument("--num_frames", type=int, default=49)      # AC3D uses 49
     ap.add_argument("--hw", default="480,832")
     ap.add_argument("--layers", default="all")
-    ap.add_argument("--noise_levels", default="0.3,0.5,0.7,0.9,0.96")
+    ap.add_argument("--noise_levels", default="0.125,0.25,0.375,0.5,0.625,0.75,0.875,1.0")  # AC3D σ
+    ap.add_argument("--n_pc", type=int, default=512)           # AC3D: PCA per-frame dim→512, unroll
     ap.add_argument("--val_frac", type=float, default=0.2)
     ap.add_argument("--test_frac", type=float, default=0.2)
     ap.add_argument("--out", default="results/probe_wan_re10k")
@@ -178,6 +179,7 @@ def main():
             with torch.no_grad():
                 lat = vae.encode(frames.unsqueeze(0).to(dev, vae_dtype))
             lat = rearrange(lat, "b v c h w -> b c v h w").to(dtype)
+            f_lat = lat.shape[2]
             for t_lvl in noise_levels:
                 ts = torch.full((1,), float(t_lvl) * 1000.0, device=dev, dtype=dtype)
                 noisy = (1 - t_lvl) * lat + t_lvl * torch.randn_like(lat)
@@ -186,7 +188,9 @@ def main():
                     model_fn_wan_video(dit=dit, latents=noisy, timestep=ts, context=ctx,
                                        vace=None, use_gradient_checkpointing=False)
                 for L in layers:
-                    feats[L][t_lvl].append(captured[L][0].float().mean(0).cpu())  # global pool → (dim,)
+                    tok = captured[L][0]                                          # (f*Hp*Wp, dim)
+                    pf = tok.reshape(f_lat, tok.shape[0] // f_lat, -1).float().mean(1)  # (f, dim) per-frame spatial avg-pool (AC3D-style; keep time)
+                    feats[L][t_lvl].append(pf.half().cpu())
             euler_store.append(torch.from_numpy(eul).float().reshape(-1))   # (F*3,)
             trans_store.append(torch.from_numpy(tr).float().reshape(-1))
             R_store.append(torch.from_numpy(Rrel).float())                  # (F,3,3)
@@ -231,16 +235,27 @@ def main():
     base_cos = trans_cos(base_tr)
     print(f"[probe-re10k] baseline: rot {base_rot:.2f}°  trans {base_trans:.3f}  trans_cos {base_cos:.3f}")
 
+    def pca_unroll(Xpf, n_pc):
+        # Xpf: (N, f, dim) per-frame features. PCA(dim→n_pc) fit on TRAIN frames, project, unroll → (N, f*n_pc).
+        N_, f_, D = Xpf.shape
+        flat_tr = Xpf[:n_tr].reshape(-1, D).double().to(dev)
+        mu_p = flat_tr.mean(0, keepdim=True)
+        npc = min(n_pc, flat_tr.shape[0] - 1, D)
+        Vh = torch.linalg.svd(flat_tr - mu_p, full_matrices=False)[2]
+        P = Vh[:npc].T                                                # (D, npc)
+        proj = lambda x: ((x.reshape(-1, D).double().to(dev) - mu_p) @ P).reshape(x.shape[0], -1)  # (n, f*npc)
+        return proj(Xpf[:n_tr]), proj(Xpf[n_tr:n_tr+n_va]), proj(Xpf[n_tr+n_va:])
+
     saved = {}                                                # probe weights per (layer,noise)
     for L in layers:
         for t_lvl in noise_levels:
-            Xs = torch.stack(feats[L][t_lvl]).double()       # (N, dim)
-            Xtr, Xva, Xte = split(Xs)
+            Xpf = torch.stack(feats[L][t_lvl])               # (N, f, dim) per-frame (AC3D: keep time)
+            Xtr, Xva, Xte = pca_unroll(Xpf, args.n_pc)       # → (N, f*n_pc) unrolled
             mu, sd = Xtr.mean(0, keepdim=True), Xtr.std(0, keepdim=True).clamp_min(1e-6)
             Xtr, Xva, Xte = (Xtr - mu) / sd, (Xva - mu) / sd, (Xte - mu) / sd
             Ycat_tr = torch.cat([Yeul_tr, Ytr_tr], 1)        # joint trajectory (F*6)
             best = None
-            for lam in (1e-1, 1e0, 1e1, 1e2, 1e3):
+            for lam in (1e0, 1e1, 1e2, 1e3, 1e4, 1e5):
                 W_ = ridge_fit(Xtr, Ycat_tr, lam)
                 pv = ridge_pred(Xva, W_)
                 fe = pv.shape[1] // 2
