@@ -68,6 +68,11 @@ class WanTI2V5BCfg:
     scene_input_type: Literal["none", "cross_attention", "new_cross_attention", "latent_concat", "controlnet"] = "cross_attention"
     scene_projection: Literal["linear", "mlp"] = "linear"
     ac3d_num_layers: int = 2
+    # VACE식 interval injection (camera_input_type="controlnet" parallel 모드 전용):
+    # 1이면 기존대로 main block 0..N-1(연속) 주입. k>1이면 ctrl block j를 main block
+    # j*k (= 0,k,2k,…)에 주입해 네트워크 전체에 분산 (VACE vace_layers 패턴).
+    # k>1이면 ctrl block 수는 자동으로 ceil(n_blocks/k)가 됨(ac3d_num_layers 무시).
+    controlnet_inject_interval: int = 1
     # controlnet_lightningdit 전용: LightningDiT 분기의 hidden_size / num_heads / SwiGLU
     # 등 하이퍼파라미터. 기본값은 va-wan_dl3dv_256-480.ckpt의 LightningDiT denoiser와 일치.
     lightningdit_hidden_size: int = 1024
@@ -397,19 +402,27 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
             # path is enabled only for scene_input_type="controlnet" so the
             # controlnet branch's residual carries scene guidance too (zero-init
             # scene_cross_attn_proj → initial contribution 0, Wan prior preserved).
-            ac3d_n = max(int(cfg.ac3d_num_layers), 1)
-            ac3d_n = min(ac3d_n, len(self.model.blocks))
+            # Injection block ids. interval=1 → first N consecutive (기존 동작).
+            # interval=k>1 → VACE식 [0,k,2k,…] 전체 분산, ctrl block 수 = len(ids).
+            interval = max(int(getattr(cfg, "controlnet_inject_interval", 1)), 1)
+            if interval > 1:
+                inject_ids = list(range(0, len(self.model.blocks), interval))
+            else:
+                ac3d_n = min(max(int(cfg.ac3d_num_layers), 1), len(self.model.blocks))
+                inject_ids = list(range(ac3d_n))
+            self.model.ac3d_inject_ids = inject_ids
+            ac3d_n = len(inject_ids)
             ac3d_has_image_input = bool(getattr(self.model, "has_image_input", False))
             ac3d_scene_input = "new_cross_attention" if self.scene_input_type == "controlnet" else "none"
             self.model.ac3d_blocks = nn.ModuleList([
                 NewDiTBlock.from_dit_block(
-                    self.model.blocks[i],
+                    self.model.blocks[bid],   # clone from the target main block (VACE: role-matched)
                     has_image_input=ac3d_has_image_input,
                     camera_input_type="none",
                     scene_input_type=ac3d_scene_input,
                     use_text_cross_attn=not bool(cfg.controlnet_no_text_cross_attn),
                 )
-                for i in range(ac3d_n)
+                for bid in inject_ids
             ])
             # Per-layer zero-init projectors (ControlNet's signature pattern —
             # initial contribution = 0 → Wan prior preserved at t=0)
@@ -1544,15 +1557,20 @@ def simple_wan_video_fn(
             x, context, cross_attention_scene_context, t_mod, scene_t_mod, freqs, recam_camera_embedding
         )
 
-        # Parallel mode: residual added AFTER main block.
+        # Parallel mode: residual added AFTER main block. interval injection 시
+        # ctrl residual j는 main block ac3d_inject_ids[j]에 더해짐 (VACE식 분산).
+        _inject_ids = getattr(dit, "ac3d_inject_ids", None)
+        _ridx = (_inject_ids.index(block_id) if (_inject_ids is not None and block_id in _inject_ids)
+                 else (block_id if _inject_ids is None else None))
         if (
             not ac3d_feedback_mode
             and not ac3d_paper_mode
             and not ac3d_litdit_mode
             and ac3d_residuals is not None
-            and block_id < len(ac3d_residuals)
+            and _ridx is not None
+            and _ridx < len(ac3d_residuals)
         ):
-            res = ac3d_residuals[block_id]
+            res = ac3d_residuals[_ridx]
             # Main x may have scene_latent_tokens appended → only add residual
             # to the patch-token portion (first `n_patches` tokens).
             n_patches = res.shape[1]
