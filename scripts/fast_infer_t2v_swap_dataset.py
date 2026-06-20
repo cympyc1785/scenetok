@@ -82,6 +82,10 @@ def parse_args():
                    help="model.denoiser.scene_input_type override (yaml default가 다르면 명시).")
     p.add_argument("--camera_input_type", default=None,
                    help="model.denoiser.camera_input_type override (yaml default가 다르면 명시).")
+    p.add_argument("--single_cfg", action="store_true",
+                   help="cfg sweep 없이 --cfg_scale 값 하나만 (기본은 [user_cfg,1.0] 스윕).")
+    p.add_argument("--text_modes", default=None,
+                   help="텍스트 combo 제한, 콤마구분 (예: 'empty,user'). 미지정시 전체.")
     p.add_argument("--static_target_camera", action="store_true",
                    help="target extrinsics/intrinsics를 context[:, 0]으로 모두 덮어써서 "
                         "정지 카메라 시점(첫 context view 고정)에서 dynamic foreground만 "
@@ -245,6 +249,11 @@ def main():
         ("dataset",  None),
     ]
     cfg_scales = [user_cfg, 1.0] if abs(user_cfg - 1.0) > 1e-6 else [user_cfg]
+    if getattr(args, "single_cfg", False):              # --single_cfg: cfg sweep 끄고 user_cfg만
+        cfg_scales = [user_cfg]
+    if getattr(args, "text_modes", None):               # 텍스트 combo 제한 (예: "empty,user")
+        keep = set(m.strip() for m in args.text_modes.split(","))
+        combos_template = [(n, v) for (n, v) in combos_template if n in keep]
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(loader):
