@@ -22,6 +22,7 @@ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-2} exec -a reco_reconly_scenetok_le
   dataset.target_video_name=video_input.mp4 \
   dataset.recon_target_video_name=inpaint_result.mp4 \
   dataset.prompt_style=category_first \
+  +dataset.force_empty_text=true \
   trainer.devices=${gpus} \
   trainer.num_nodes=${num_nodes} \
   trainer.num_sanity_val_steps=1 \
