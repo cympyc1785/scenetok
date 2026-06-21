@@ -65,7 +65,11 @@ class WanTI2V5BCfg:
     camera_input_type: Literal["none", "recam_attention", "cross_attention", "new_cross_attention", "adaln", "wan_control", "channel_concat", "controlnet", "controlnet_feedback", "controlnet_ac3d", "controlnet_lightningdit"] | None = None
     enable_recam_attention: bool | None = None
     camera_context_spatial_pool: int = 1
-    scene_input_type: Literal["none", "cross_attention", "new_cross_attention", "latent_concat", "controlnet"] = "cross_attention"
+    scene_input_type: Literal["none", "cross_attention", "new_cross_attention", "parallel_cross_attention", "latent_concat", "controlnet"] = "cross_attention"
+    # True면 scene CA를 text CA와 sequential이 아니라 IP-Adapter식 parallel(둘 다 self-attn
+    # 직후 같은 base를 query, residual 합산)로. scene_input_type=controlnet(scene→ctrl 블록)에서
+    # ctrl 블록의 CA topology만 바꿈. (variant A: Q projection은 여전히 text/scene 별도)
+    scene_parallel_ca: bool = False
     scene_projection: Literal["linear", "mlp"] = "linear"
     ac3d_num_layers: int = 2
     # VACE식 interval injection (camera_input_type="controlnet" parallel 모드 전용):
@@ -148,7 +152,8 @@ class NewDiTBlock(nn.Module):
             # controlnet_ac3d 분기: ac3d 블록은 scene cross-attn만 가짐
             # (text는 main DiT 분기에서만 처리). norm3도 같이 빠짐.
             self.cross_attn = None
-        self.use_scene_cross_attn = self.scene_input_type == "new_cross_attention"
+        self.use_scene_cross_attn = self.scene_input_type in ("new_cross_attention", "parallel_cross_attention")
+        self.scene_parallel = self.scene_input_type == "parallel_cross_attention"
         if self.use_scene_cross_attn:
             self.scene_cross_attn = CrossAttention(dim, num_heads, eps, has_image_input=False)
             self.scene_cross_attn_proj = nn.Linear(dim, dim)
@@ -241,16 +246,24 @@ class NewDiTBlock(nn.Module):
             self_attn = self.recam_projector(self_attn)
 
         x = self.gate(x, gate_msa, self_attn)
-        if self.use_text_cross_attn:
-            x = x + self.cross_attn(self.norm3(x), context)
-
-        if self.use_scene_cross_attn:
-            input_x = self.norm4(x)
-            # input_x = modulate(self.norm4(x), shift_scene, scale_scene)
-            scene_residual = self.scene_cross_attn(input_x, scene_context)
-            scene_residual = self.scene_cross_attn_proj(scene_residual)
-            # x = self.gate(x, gate_scene, scene_residual)
-            x = x + scene_residual
+        if self.use_scene_cross_attn and self.scene_parallel:
+            # IP-Adapter식 (variant A): text·scene CA가 self-attn 직후 같은 base를
+            # query로 병렬 계산 → residual 합산. (scene이 text 거친 x를 안 봄)
+            base = x
+            update = 0.0
+            if self.use_text_cross_attn:
+                update = update + self.cross_attn(self.norm3(base), context)
+            scene_residual = self.scene_cross_attn(self.norm4(base), scene_context)
+            update = update + self.scene_cross_attn_proj(scene_residual)
+            x = base + update
+        else:
+            # sequential (기존 new_cross_attention): text CA → 그 결과 x를 scene CA가 query.
+            if self.use_text_cross_attn:
+                x = x + self.cross_attn(self.norm3(x), context)
+            if self.use_scene_cross_attn:
+                scene_residual = self.scene_cross_attn(self.norm4(x), scene_context)
+                scene_residual = self.scene_cross_attn_proj(scene_residual)
+                x = x + scene_residual
         
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
@@ -413,7 +426,8 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
             self.model.ac3d_inject_ids = inject_ids
             ac3d_n = len(inject_ids)
             ac3d_has_image_input = bool(getattr(self.model, "has_image_input", False))
-            ac3d_scene_input = "new_cross_attention" if self.scene_input_type == "controlnet" else "none"
+            ac3d_scene_input = (("parallel_cross_attention" if bool(getattr(cfg, "scene_parallel_ca", False))
+                                 else "new_cross_attention") if self.scene_input_type == "controlnet" else "none")
             self.model.ac3d_blocks = nn.ModuleList([
                 NewDiTBlock.from_dit_block(
                     self.model.blocks[bid],   # clone from the target main block (VACE: role-matched)
@@ -464,7 +478,8 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
             ac3d_n = max(int(cfg.ac3d_num_layers), 1)
             ac3d_n = min(ac3d_n, len(self.model.blocks))
             ac3d_has_image_input = bool(getattr(self.model, "has_image_input", False))
-            ac3d_scene_input = "new_cross_attention" if self.scene_input_type == "controlnet" else "none"
+            ac3d_scene_input = (("parallel_cross_attention" if bool(getattr(cfg, "scene_parallel_ca", False))
+                                 else "new_cross_attention") if self.scene_input_type == "controlnet" else "none")
             self.model.ac3d_blocks = nn.ModuleList([
                 NewDiTBlock.from_dit_block(
                     self.model.blocks[i],
@@ -512,7 +527,8 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
             ac3d_n = max(int(cfg.ac3d_num_layers), 1)
             ac3d_n = min(ac3d_n, len(self.model.blocks))
             ac3d_has_image_input = bool(getattr(self.model, "has_image_input", False))
-            ac3d_scene_input = "new_cross_attention" if self.scene_input_type == "controlnet" else "none"
+            ac3d_scene_input = (("parallel_cross_attention" if bool(getattr(cfg, "scene_parallel_ca", False))
+                                 else "new_cross_attention") if self.scene_input_type == "controlnet" else "none")
             self.model.ac3d_blocks = nn.ModuleList([
                 NewDiTBlock.from_dit_block(
                     self.model.blocks[i],
@@ -1191,14 +1207,14 @@ def simple_wan_video_fn(
     timestep: torch.Tensor = None,
     context: torch.Tensor = None,
     scene_context: torch.Tensor = None,
-    scene_input_type: Literal["none", "cross_attention", "new_cross_attention", "latent_concat", "controlnet"] = "cross_attention",
+    scene_input_type: Literal["none", "cross_attention", "new_cross_attention", "parallel_cross_attention", "latent_concat", "controlnet"] = "cross_attention",
     camera_context: torch.Tensor = None,
     camera_input_type: Literal["none", "recam_attention", "cross_attention", "new_cross_attention", "adaln", "wan_control", "channel_concat", "controlnet", "controlnet_feedback", "controlnet_ac3d", "controlnet_lightningdit"] | None = None,
     fuse_vae_embedding_in_latents: bool = False,
     use_gradient_checkpointing: bool = False,
     use_gradient_checkpointing_offload: bool = False,
 ):
-    if scene_input_type not in ("none", "cross_attention", "new_cross_attention", "latent_concat", "controlnet"):
+    if scene_input_type not in ("none", "cross_attention", "new_cross_attention", "parallel_cross_attention", "latent_concat", "controlnet"):
         raise ValueError(
             f"Unsupported scene_input_type={scene_input_type!r}. "
             "Expected 'none', 'cross_attention', 'new_cross_attention', 'latent_concat', or 'controlnet'."
