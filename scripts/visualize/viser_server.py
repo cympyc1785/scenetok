@@ -392,8 +392,30 @@ def main():
             torch.save({"target_c2w_edited": torch.tensor(S["tgt_poses"], dtype=torch.float32),
                         "scene": scene_hash, "source_bundle": str(S["bundle_path"]),
                         "context_frame_check": diff}, out_dir / "poses.pt")
-            gui_status.value = f"saved → {out_dir.name}/generated.mp4 {tuple(sampled.shape)}"
-            print(f"[viser-gen] saved → {out_dir}")
+
+            # Screenshot the viser 3D scene from each connected client's viewpoint.
+            shots = 0
+            try:
+                clients = server.get_clients()
+                from PIL import Image
+                for cid, cl in clients.items():
+                    try:
+                        asp = float(getattr(cl.camera, "aspect", 0) or 0)
+                        h = 900; wpx = int(round(h * asp)) if asp > 0 else 1600
+                        img = cl.get_render(height=h, width=wpx, transport_format="png")
+                        name = "viser_screenshot.png" if len(clients) == 1 else f"viser_screenshot_client{cid}.png"
+                        Image.fromarray(img).save(out_dir / name)
+                        shots += 1
+                    except Exception as ce:
+                        print(f"[viser-gen] screenshot client {cid} failed: {ce}")
+                if not clients:
+                    print("[viser-gen] no connected client → no screenshot")
+            except Exception as se:
+                print("[viser-gen] screenshot error:", se)
+
+            gui_status.value = (f"saved → {out_dir.name}/generated.mp4 {tuple(sampled.shape)}"
+                                f"{f' + {shots} screenshot' if shots else ''}")
+            print(f"[viser-gen] saved → {out_dir} (screenshots={shots})")
         except Exception as e:
             import traceback; traceback.print_exc()
             gui_status.value = f"generate ERROR: {e}"; print("[viser-gen] error:", e)
