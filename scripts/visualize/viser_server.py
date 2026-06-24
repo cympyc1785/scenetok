@@ -345,14 +345,18 @@ def main():
                 return o
             b = _to_dev(batch)
 
-            ctx_ext = b["context"]["extrinsics"]                 # (1,16,4,4) absolute (world)
-            ctx_int = b["context"]["intrinsics"]
+            ctx_ext = b["context"]["extrinsics"]                 # (1,V,4,4) absolute (world)
             ctx_lat = b["context"]["latent"]
+            v_c = ctx_ext.shape[1]
             ctx0_abs = ctx_ext[0, 0]                             # dataset ctx0 == bundle ctx0
             edited_rel = torch.tensor(S["tgt_poses"], dtype=ctx_ext.dtype, device=dev)  # (T,4,4) rel→ctx0
             edited_abs = ctx0_abs.unsqueeze(0) @ edited_rel      # back to world; preprocess re-relativizes
             T = edited_abs.shape[0]
-            tgt_int = ctx_int[0, 0].unsqueeze(0).repeat(T, 1, 1).to(ctx_int.dtype)
+            # Target intrinsics MUST be the dataset's GT target K (NOT context K):
+            # config sets scale_context_focal_by_256 → context focal is scaled ~15x,
+            # which is wrong for target rays. DL3DV uses one K per scene → repeat [0].
+            gt_tgt_int = b["target"]["intrinsics"]
+            tgt_int = gt_tgt_int[0, 0].unsqueeze(0).repeat(T, 1, 1).to(gt_tgt_int.dtype)
             b["target"] = {
                 "extrinsics": edited_abs.unsqueeze(0),
                 "intrinsics": tgt_int.unsqueeze(0),
@@ -360,16 +364,19 @@ def main():
                                       device=dev, dtype=ctx_lat.dtype),
                 "index": torch.arange(T, device=dev).unsqueeze(0),
             }
-            b = preprocess_batch(b, index=0)
-
-            # sanity: dataset context (now relative) should match the bundle's context c2w
+            # Reference frame = MIDDLE context view (v_c//2), matching the canonical
+            # eval_context_view_count sweep — the model's camera-ray embedding was
+            # trained with this reference, not index 0.
+            # Sanity (before preprocess): bundle-derived world poses vs dataset GT world.
+            ds_ctx_abs = ctx_ext[0].float().cpu().numpy().astype(np.float64)
+            ds_ctx_rel0 = np.linalg.inv(ds_ctx_abs[0])[None] @ ds_ctx_abs   # relative to ctx0
             bundle_ctx = np.asarray(bundle["c2w"], dtype=np.float64)
-            ds_ctx = b["context"]["extrinsics"][0].float().cpu().numpy().astype(np.float64)
-            n = min(len(bundle_ctx), len(ds_ctx))
-            diff = float(np.abs(bundle_ctx[:n] - ds_ctx[:n]).max())
+            n = min(len(bundle_ctx), len(ds_ctx_rel0))
+            diff = float(np.abs(bundle_ctx[:n] - ds_ctx_rel0[:n]).max())
             print(f"[viser-gen] context frame check: max|bundle-dataset|={diff:.4f} (want ~0)")
             if diff > 0.1:
                 print("[viser-gen] WARN: context frames diverge — edited poses may be misaligned")
+            b = preprocess_batch(b, index=v_c // 2)
 
             wrapper = G["wrapper"]; prec = G["precision"]
             with torch.no_grad(), torch.amp.autocast(device_type="cuda", dtype=prec,
