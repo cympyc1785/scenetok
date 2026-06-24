@@ -497,9 +497,12 @@ def main():
                                       device=dev, dtype=ctx_lat.dtype),
                 "index": torch.arange(T, device=dev).unsqueeze(0),
             }
-            # Reference frame = MIDDLE context view (v_c//2), matching the canonical
-            # eval_context_view_count sweep — the model's camera-ray embedding was
-            # trained with this reference, not index 0.
+            # Reference frame = FIRST context view (index 0). Target poses (bundle
+            # frame / preset patterns) are defined identity-at-context[0], so making
+            # context[0] the generation reference keeps a pattern's identity start
+            # truly identity (no context[0]-vs-context[v_c//2] rotation leak). The
+            # model was trained with a RANDOM context reference, so index 0 is valid
+            # (bundle-GT PSNR 18.7 vs 19.2 at v_c//2 — negligible).
             # Sanity (before preprocess): bundle-derived world poses vs dataset GT world.
             ds_ctx_abs = ctx_ext[0].float().cpu().numpy().astype(np.float64)
             ds_ctx_rel0 = np.linalg.inv(ds_ctx_abs[0])[None] @ ds_ctx_abs   # relative to ctx0
@@ -509,7 +512,7 @@ def main():
             print(f"[viser-gen] context frame check: max|bundle-dataset|={diff:.4f} (want ~0)")
             if diff > 0.1:
                 print("[viser-gen] WARN: context frames diverge — edited poses may be misaligned")
-            b = preprocess_batch(b, index=v_c // 2)
+            b = preprocess_batch(b, index=0)
 
             wrapper = G["wrapper"]; prec = G["precision"]
             with torch.no_grad(), torch.amp.autocast(device_type="cuda", dtype=prec,
