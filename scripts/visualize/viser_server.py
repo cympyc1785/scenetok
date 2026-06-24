@@ -41,6 +41,15 @@ DEFAULT_CONFIG = Path(__file__).resolve().parent / "viser_config.json"
 DEFAULT_EVAL_INDEX = REPO / "assets/evaluation_index/dl3dv_c16_37_caption_standard.json"
 
 
+def save_gif(images, path, fps=12):
+    """images: (T,3,H,W) float[0,1] tensor → animated gif."""
+    from PIL import Image
+    arr = (images.clamp(0, 1).permute(0, 2, 3, 1).cpu().numpy() * 255).astype("uint8")
+    frames = [Image.fromarray(a) for a in arr]
+    frames[0].save(str(path), save_all=True, append_images=frames[1:],
+                   duration=int(1000 / max(fps, 1)), loop=0)
+
+
 def load_bundle(path: str):
     p = Path(path)
     if p.suffix == ".npz":
@@ -514,6 +523,10 @@ def main():
             save_image_video(images=sampled[0], indices=torch.arange(sampled.shape[1]),
                              output_dir=out_dir, name="generated", save_img=False,
                              save_video=True, fps=args.fps)
+            try:
+                save_gif(sampled[0], out_dir / "generated.gif", fps=args.fps)
+            except Exception as ge:
+                print("[viser-gen] gif save failed:", ge)
             torch.save({"target_c2w_edited": torch.tensor(S["tgt_poses"], dtype=torch.float32),
                         "scene": scene_hash, "source_bundle": str(S["bundle_path"]),
                         "context_frame_check": diff}, out_dir / "poses.pt")
