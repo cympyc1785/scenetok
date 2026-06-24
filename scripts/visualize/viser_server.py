@@ -195,6 +195,9 @@ def main():
     gui_translate = server.gui.add_number("translate amount", 0.5, step=0.01)
     gui_rotate = server.gui.add_number("rotate deg", 30.0, step=1.0)
     gui_apply = server.gui.add_button("Apply pattern")
+    # ── load target poses from a saved .pt ──
+    gui_ptpath = server.gui.add_text("target .pt path", "")
+    gui_loadpt = server.gui.add_button("Load target .pt")
     # ── manual gizmo editing ──
     gui_sel = server.gui.add_text("target idx (e.g. 0-5,10 / all)", "all")
     gui_select = server.gui.add_button("Select for edit")
@@ -365,21 +368,19 @@ def main():
             poses.append(M)
         return np.stack(poses)
 
-    def apply_pattern(_=None):
-        if S["bundle"] is None:
-            gui_status.value = "load a bundle first (Reload)"; return
+    def _set_target(poses):
+        """Replace the target-camera frustums/path with `poses` (N,4,4 in bundle
+        frame) and reset tgt_poses/tgt_orig. Used by pattern + .pt loaders."""
+        poses = np.asarray(poses, dtype=np.float64)
+        if poses.ndim == 2:
+            poses = poses[None]
         _clear_gizmo()
-        T = S["tgt_orig"].shape[0] if S["tgt_orig"] is not None else 37
-        amount = float(gui_translate.value); deg = float(gui_rotate.value)
-        name = gui_pattern.value
-        poses = _make_pattern_poses(name, T, amount, deg)
-        # remove existing target frustums/path
         for h in S["tgt_handles"]:
             try: h.remove()
             except Exception: pass
             if h in S["current"]:
                 S["current"].remove(h)
-        d = S["bundle"]; scale = S["scale"]
+        d = S["bundle"] or {}; scale = S["scale"]; T = poses.shape[0]
         K0 = np.asarray(d["target_intrinsics"])[0] if "target_intrinsics" in d else (
             np.asarray(d["intrinsics"])[0] if "intrinsics" in d else None)
         intr = np.tile(K0, (T, 1, 1)) if K0 is not None else None
@@ -391,8 +392,55 @@ def main():
         S["tgt_frustums"] = th[:T]
         S["tgt_path"] = next((h for h in th if getattr(h, "_is_frustum_path", False)), None)
         S["tgt_poses"] = poses.copy(); S["tgt_orig"] = poses.copy()
+        return T
+
+    def apply_pattern(_=None):
+        if S["bundle"] is None:
+            gui_status.value = "load a bundle first (Reload)"; return
+        T = S["tgt_orig"].shape[0] if S["tgt_orig"] is not None else 37
+        amount = float(gui_translate.value); deg = float(gui_rotate.value)
+        name = gui_pattern.value
+        poses = _make_pattern_poses(name, T, amount, deg)
+        _set_target(poses)
         gui_status.value = f"pattern {name}: T={T} amt={amount:.3f} deg={deg:.0f}"
         print("[viser]", gui_status.value)
+
+    def load_target_pt(_=None):
+        """Load target camera poses from a saved .pt (bundle frame). Accepts a
+        dict with target_c2w_edited / target_c2w / poses / c2w, or a raw
+        tensor/array of shape (N,4,4)."""
+        path = gui_ptpath.value.strip()
+        if not path:
+            gui_status.value = "enter a .pt path"; return
+        if S["bundle"] is None:
+            gui_status.value = "load a bundle first (Reload)"; return
+        try:
+            import torch
+            obj = torch.load(path, map_location="cpu", weights_only=False)
+            poses = None
+            if isinstance(obj, dict):
+                for k in ("target_c2w_edited", "target_c2w", "poses", "c2w", "extrinsics"):
+                    if k in obj:
+                        poses = obj[k]; break
+                if poses is None:  # single-entry dict → take the only value
+                    vals = [v for v in obj.values() if hasattr(v, "shape")]
+                    poses = vals[0] if len(vals) == 1 else None
+            else:
+                poses = obj
+            if poses is None:
+                gui_status.value = "no pose tensor found in .pt"; return
+            if hasattr(poses, "detach"):
+                poses = poses.detach().cpu().numpy()
+            poses = np.asarray(poses, dtype=np.float64)
+            if poses.ndim == 2 and poses.shape == (4, 4):
+                poses = poses[None]
+            if poses.ndim != 3 or poses.shape[-2:] != (4, 4):
+                gui_status.value = f"bad pose shape {poses.shape}, want (N,4,4)"; return
+            T = _set_target(poses)
+            gui_status.value = f"loaded {Path(path).name}: {T} target poses"
+            print("[viser]", gui_status.value)
+        except Exception as e:
+            gui_status.value = f"load .pt ERROR: {e}"; print("[viser] load .pt error:", e)
 
     def generate(_=None):
         if G["wrapper"] is None:
@@ -497,7 +545,8 @@ def main():
 
     gui_reload.on_click(reload); gui_select.on_click(select)
     gui_save.on_click(save); gui_reset.on_click(reset)
-    gui_apply.on_click(apply_pattern); gui_generate.on_click(generate)
+    gui_apply.on_click(apply_pattern); gui_loadpt.on_click(load_target_pt)
+    gui_generate.on_click(generate)
     reload()
     print("[viser] panel: Reload / Select for edit / Save edited / Reset / Generate video. Ctrl-C to stop.")
     try:
