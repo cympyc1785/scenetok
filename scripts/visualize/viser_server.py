@@ -375,11 +375,13 @@ def main():
         if poses.ndim == 2:
             poses = poses[None]
         _clear_gizmo()
+        old_ids = {id(h) for h in S["tgt_handles"]}
         for h in S["tgt_handles"]:
             try: h.remove()
             except Exception: pass
-            if h in S["current"]:
-                S["current"].remove(h)
+        # identity-based removal — `in`/`.remove` would trigger handle __eq__
+        # (element-wise numpy compare on .points → broadcast error)
+        S["current"] = [c for c in S["current"] if id(c) not in old_ids]
         d = S["bundle"] or {}; scale = S["scale"]; T = poses.shape[0]
         K0 = np.asarray(d["target_intrinsics"])[0] if "target_intrinsics" in d else (
             np.asarray(d["intrinsics"])[0] if "intrinsics" in d else None)
