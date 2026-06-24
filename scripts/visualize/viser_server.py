@@ -240,7 +240,8 @@ def main():
 
     S = {"current": [], "tgt_frustums": [], "tgt_path": None, "tgt_poses": None,
          "tgt_orig": None, "gizmo": None, "bundle_path": None,
-         "tgt_handles": [], "bundle": None, "scale": 0.3}
+         "tgt_handles": [], "bundle": None, "scale": 0.3,
+         "tgt_gen": 0, "tgt_reset": None}
     # model state (loaded once at startup)
     G = {"wrapper": None, "loader": None, "device": args.device, "precision": None,
          "cache": {}, "scanned": False}
@@ -318,6 +319,7 @@ def main():
                 S["tgt_frustums"] = th[:nt]                 # frustum handles come first
                 S["tgt_path"] = next((h for h in th if getattr(h, "_is_frustum_path", False)), None)
                 S["tgt_poses"] = tc.copy(); S["tgt_orig"] = tc.copy()
+                S["tgt_reset"] = tc.copy()                  # original bundle target → Reset baseline
             gui_status.value = f"loaded {Path(cfg['data']).name}: ctx={len(d['c2w'])} tgt={nt}"
             print("[viser]", gui_status.value)
         except Exception as e:
@@ -363,13 +365,14 @@ def main():
         gui_status.value = f"saved → {out.name}"; print("[viser] saved", out)
 
     def reset(_=None):
-        if S["tgt_orig"] is None: return
-        _clear_gizmo()
-        S["tgt_poses"] = S["tgt_orig"].copy()
-        for i, h in enumerate(S["tgt_frustums"]):
-            w, p = _from44(S["tgt_poses"][i]); h.wxyz = w; h.position = p
-        _refresh_path()
-        gui_status.value = "target poses reset"
+        # Restore the ORIGINAL bundle target (undo patterns / .pt loads / gizmo
+        # edits). Rebuild via _set_target so frustums refresh reliably.
+        base = S["tgt_reset"] if S["tgt_reset"] is not None else S["tgt_orig"]
+        if base is None:
+            gui_status.value = "nothing to reset"; return
+        _set_target(base.copy())
+        gui_status.value = "target reset to bundle original"
+        print("[viser] target reset")
 
     def _rotx(a):
         c, s = np.cos(a), np.sin(a)
@@ -422,10 +425,14 @@ def main():
         K0 = np.asarray(d["target_intrinsics"])[0] if "target_intrinsics" in d else (
             np.asarray(d["intrinsics"])[0] if "intrinsics" in d else None)
         intr = np.tile(K0, (T, 1, 1)) if K0 is not None else None
+        # Unique node prefix each call: re-adding the SAME /target/* names right
+        # after removing them makes viser drop the update (stale frustums). A fresh
+        # prefix guarantees the new poses render.
+        S["tgt_gen"] += 1
         th = add_view_frustums(server, poses, intrinsics=intr, scale=scale * 0.6,
-                               prefix="target", color_start=(40, 220, 120), color_end=(120, 40, 220),
-                               path_color=(255, 40, 40), add_world_axes=False,
-                               add_gui_color=False, return_all=True)
+                               prefix=f"target_v{S['tgt_gen']}", color_start=(40, 220, 120),
+                               color_end=(120, 40, 220), path_color=(255, 40, 40),
+                               add_world_axes=False, add_gui_color=False, return_all=True)
         S["current"] += th; S["tgt_handles"] = th
         S["tgt_frustums"] = th[:T]
         S["tgt_path"] = next((h for h in th if getattr(h, "_is_frustum_path", False)), None)
