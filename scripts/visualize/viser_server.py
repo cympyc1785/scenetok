@@ -379,26 +379,29 @@ def main():
         c, s = np.cos(a), np.sin(a)
         return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]], dtype=np.float64)
 
-    def _make_pattern_poses(name, T, amount, deg):
-        """Trajectory starting at context[0] (identity in bundle frame), ramping
-        linearly to `amount` (translate) or `deg`° (rotate) over T frames.
+    def _make_pattern_poses(name, T, amount, deg, base=None):
+        """Trajectory anchored at `base` (4x4 c2w; default identity), ramping a
+        LOCAL move/rotate over T frames: pose[i] = base @ delta_local(i). So the
+        pattern is a relative-pose offset from `base` in base's own camera frame
+        (move along base's ±X/±Z, rotate about base's local axes).
         OpenCV camera local axes: +X right, +Y down, +Z forward."""
+        base = np.eye(4, dtype=np.float64) if base is None else np.asarray(base, dtype=np.float64)
         th = np.radians(deg)
         move = {"move_forward": (0, 0, 1), "move_back": (0, 0, -1),
                 "move_right": (1, 0, 0), "move_left": (-1, 0, 0)}
         poses = []
         for t in range(T):
             f = (t / (T - 1)) if T > 1 else 1.0
-            M = np.eye(4)
+            delta = np.eye(4)
             if name in move:
-                M[:3, 3] = f * amount * np.array(move[name], dtype=np.float64)
+                delta[:3, 3] = f * amount * np.array(move[name], dtype=np.float64)
             else:
                 a = f * th
-                if name == "rotate_up":      M[:3, :3] = _rotx(a)
-                elif name == "rotate_down":  M[:3, :3] = _rotx(-a)
-                elif name == "rotate_right": M[:3, :3] = _roty(a)
-                else:                        M[:3, :3] = _roty(-a)   # rotate_left
-            poses.append(M)
+                if name == "rotate_up":      delta[:3, :3] = _rotx(a)
+                elif name == "rotate_down":  delta[:3, :3] = _rotx(-a)
+                elif name == "rotate_right": delta[:3, :3] = _roty(a)
+                else:                        delta[:3, :3] = _roty(-a)   # rotate_left
+            poses.append(base @ delta)
         return np.stack(poses)
 
     def _set_target(poses):
@@ -435,9 +438,18 @@ def main():
         T = S["tgt_orig"].shape[0] if S["tgt_orig"] is not None else 37
         amount = float(gui_translate.value); deg = float(gui_rotate.value)
         name = gui_pattern.value
-        poses = _make_pattern_poses(name, T, amount, deg)
+        # Anchor at the FIRST TARGET camera (its original pose+orientation) and
+        # generate the pattern as a relative-pose offset from it — don't transform
+        # the existing target cameras. Falls back to context[0] (identity) if the
+        # bundle has no target.
+        d = S["bundle"]
+        if "target_c2w" in d:
+            base = np.asarray(d["target_c2w"], dtype=np.float64)[0]
+        else:
+            base = np.eye(4, dtype=np.float64)
+        poses = _make_pattern_poses(name, T, amount, deg, base=base)
         _set_target(poses)
-        gui_status.value = f"pattern {name}: T={T} amt={amount:.3f} deg={deg:.0f}"
+        gui_status.value = f"pattern {name} @target0: T={T} amt={amount:.3f} deg={deg:.0f}"
         print("[viser]", gui_status.value)
 
     def load_target_pt(_=None):
