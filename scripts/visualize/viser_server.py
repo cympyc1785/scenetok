@@ -170,9 +170,9 @@ def main():
     ap.add_argument("--config", default=str(DEFAULT_CONFIG))
     # in-server model generation
     ap.add_argument("--no_model", action="store_true", help="skip model load (pure viz)")
-    ap.add_argument("--model_experiment", default="custom/scenetok_va-wan_shift8_dl3dv_finetuned_wide")
-    ap.add_argument("--model_ckpt", default=str(REPO / "checkpoints/va-wan_dl3dv_256x448.ckpt"))
-    ap.add_argument("--model_shape", default="256,448")
+    ap.add_argument("--model_experiment", default="scenetok_va-wan_shift4_dl3dv_finetuned")
+    ap.add_argument("--model_ckpt", default=str(REPO / "checkpoints/va-wan_dl3dv.ckpt"))
+    ap.add_argument("--model_shape", default="256,256")
     ap.add_argument("--eval_index", default=str(DEFAULT_EVAL_INDEX))
     ap.add_argument("--infer_steps", type=int, default=25)
     ap.add_argument("--cfg_scale", type=float, default=1.0)
@@ -384,7 +384,8 @@ def main():
                 sampled, _, _ = wrapper.generate_batch_with_scene(b, wrapper.sampler, repeat_factor=1)
             sampled = sampled.float().clamp(0, 1)
 
-            out_dir = Path(args.gen_out) / f"{scene_hash[:16]}_{time.strftime('%m%d_%H%M%S')}"
+            ckpt_name = Path(args.model_ckpt).stem
+            out_dir = Path(args.gen_out) / ckpt_name / f"{scene_hash[:16]}_{time.strftime('%m%d_%H%M%S')}"
             out_dir.mkdir(parents=True, exist_ok=True)
             save_image_video(images=sampled[0], indices=torch.arange(sampled.shape[1]),
                              output_dir=out_dir, name="generated", save_img=False,
