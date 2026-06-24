@@ -38,7 +38,7 @@ sys.path.insert(0, str(REPO))
 from src.misc.viser_frustum import start_server, add_view_frustums, _rotmat_to_wxyz, path_points_from_origins
 
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "viser_config.json"
-DEFAULT_EVAL_INDEX = REPO / "assets/evaluation_index/dl3dv_c16_37_standard.json"
+DEFAULT_EVAL_INDEX = REPO / "assets/evaluation_index/dl3dv_c16_37_caption_standard.json"
 
 # ckpt stem → (experiment, "H,W"). The compressor feat_rope size differs per
 # resolution (256x256 → [64,64], 256x448 → [112,64]), so the config MUST match
