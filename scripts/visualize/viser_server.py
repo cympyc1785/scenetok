@@ -40,6 +40,16 @@ from src.misc.viser_frustum import start_server, add_view_frustums, _rotmat_to_w
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "viser_config.json"
 DEFAULT_EVAL_INDEX = REPO / "assets/evaluation_index/dl3dv_c16_37_caption_standard.json"
 
+# ckpt stem → (experiment, "H,W"). The compressor feat_rope size differs per
+# resolution (256x256 → [64,64], 256x448 → [112,64]), so the config MUST match
+# the ckpt or load_state_dict raises a size mismatch (strict=False does NOT
+# silence size mismatches). Auto-paired from --model_ckpt when experiment/shape
+# are not given explicitly.
+CKPT_PRESETS = {
+    "va-wan_dl3dv": ("scenetok_va-wan_shift4_dl3dv_finetuned", "256,256"),
+    "va-wan_dl3dv_256x448": ("custom/scenetok_va-wan_shift8_dl3dv_finetuned_wide", "256,448"),
+}
+
 
 def save_gif(images, path, fps=12):
     """images: (T,3,H,W) float[0,1] tensor → animated gif."""
@@ -179,9 +189,11 @@ def main():
     ap.add_argument("--config", default=str(DEFAULT_CONFIG))
     # in-server model generation
     ap.add_argument("--no_model", action="store_true", help="skip model load (pure viz)")
-    ap.add_argument("--model_experiment", default="scenetok_va-wan_shift4_dl3dv_finetuned")
+    # experiment/shape default to None → auto-derived from the ckpt name (see
+    # CKPT_PRESETS) so swapping --model_ckpt alone uses the matching config.
+    ap.add_argument("--model_experiment", default=None)
     ap.add_argument("--model_ckpt", default=str(REPO / "checkpoints/va-wan_dl3dv.ckpt"))
-    ap.add_argument("--model_shape", default="256,256")
+    ap.add_argument("--model_shape", default=None)
     ap.add_argument("--eval_index", default=str(DEFAULT_EVAL_INDEX))
     ap.add_argument("--infer_steps", type=int, default=25)
     ap.add_argument("--cfg_scale", type=float, default=1.0)
@@ -190,6 +202,18 @@ def main():
     ap.add_argument("--gen_out", default=str(REPO / "results/viser_generate"))
     ap.add_argument("--fps", type=int, default=15)
     args = ap.parse_args()
+
+    # auto-pair experiment/shape from the ckpt name when not given explicitly
+    stem = Path(args.model_ckpt).stem
+    exp_d, shape_d = CKPT_PRESETS.get(stem, ("scenetok_va-wan_shift4_dl3dv_finetuned", "256,256"))
+    if args.model_experiment is None:
+        args.model_experiment = exp_d
+    if args.model_shape is None:
+        args.model_shape = shape_d
+    if stem not in CKPT_PRESETS:
+        print(f"[viser] WARN: unknown ckpt '{stem}', using experiment={args.model_experiment} "
+              f"shape={args.model_shape}; pass --model_experiment/--model_shape if it mismatches.")
+    print(f"[viser] model: {stem} → experiment={args.model_experiment} shape={args.model_shape}")
 
     server = start_server(host=args.host, port=args.port)
     print(f"[viser] server up → http://{args.host}:{args.port}")
