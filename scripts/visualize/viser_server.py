@@ -188,6 +188,14 @@ def main():
     gui_cfg = server.gui.add_text("config json", args.config)
     gui_status = server.gui.add_text("status", "idle")
     gui_reload = server.gui.add_button("Reload")
+    # ── preset target-camera patterns (before gizmo editing) ──
+    PATTERNS = ["move_forward", "move_back", "move_left", "move_right",
+                "rotate_up", "rotate_down", "rotate_left", "rotate_right"]
+    gui_pattern = server.gui.add_dropdown("pattern", PATTERNS, initial_value=PATTERNS[0])
+    gui_translate = server.gui.add_number("translate amount", 0.5, step=0.01)
+    gui_rotate = server.gui.add_number("rotate deg", 30.0, step=1.0)
+    gui_apply = server.gui.add_button("Apply pattern")
+    # ── manual gizmo editing ──
     gui_sel = server.gui.add_text("target idx (e.g. 0-5,10 / all)", "all")
     gui_select = server.gui.add_button("Select for edit")
     gui_save = server.gui.add_button("Save edited")
@@ -195,7 +203,8 @@ def main():
     gui_generate = server.gui.add_button("Generate video")
 
     S = {"current": [], "tgt_frustums": [], "tgt_path": None, "tgt_poses": None,
-         "tgt_orig": None, "gizmo": None, "bundle_path": None}
+         "tgt_orig": None, "gizmo": None, "bundle_path": None,
+         "tgt_handles": [], "bundle": None, "scale": 0.3}
     # model state (loaded once at startup)
     G = {"wrapper": None, "loader": None, "device": args.device, "precision": None,
          "cache": {}, "scanned": False}
@@ -245,16 +254,22 @@ def main():
             try: h.remove()
             except Exception: pass
         S["current"] = []; S["tgt_frustums"] = []; S["tgt_path"] = None
-        S["tgt_poses"] = None; S["tgt_orig"] = None
+        S["tgt_poses"] = None; S["tgt_orig"] = None; S["tgt_handles"] = []
         try:
             cfg = json.loads(Path(gui_cfg.value.strip()).read_text())
             S["bundle_path"] = cfg["data"]
             d = load_bundle(cfg["data"]); scale = float(cfg.get("scale", 0.3))
+            S["bundle"] = d; S["scale"] = scale
             ch = add_view_frustums(server, d["c2w"], intrinsics=d.get("intrinsics"),
                                    images=d.get("images"), scale=scale, prefix="context",
                                    color_start=(40,120,255), color_end=(255,80,40),
                                    path_color=(0,80,255), return_all=True)
             S["current"] += ch
+            # default translate amount = farthest pairwise distance among context cams
+            cpos = np.asarray(d["c2w"], dtype=np.float64)[:, :3, 3]
+            if len(cpos) >= 2:
+                dmat = np.linalg.norm(cpos[:, None] - cpos[None], axis=-1)
+                gui_translate.value = float(round(dmat.max(), 4))
             nt = 0
             if not cfg.get("no_target", False) and "target_c2w" in d:
                 tc = np.asarray(d["target_c2w"], dtype=np.float64)
@@ -263,7 +278,7 @@ def main():
                                        images=d.get("target_images"), scale=scale*0.6, prefix="target",
                                        color_start=(40,220,120), color_end=(120,40,220),
                                        path_color=(255,40,40), add_world_axes=False, return_all=True)
-                S["current"] += th
+                S["current"] += th; S["tgt_handles"] = th
                 S["tgt_frustums"] = th[:nt]                 # frustum handles come first
                 S["tgt_path"] = next((h for h in th if getattr(h, "_is_frustum_path", False)), None)
                 S["tgt_poses"] = tc.copy(); S["tgt_orig"] = tc.copy()
@@ -319,6 +334,65 @@ def main():
             w, p = _from44(S["tgt_poses"][i]); h.wxyz = w; h.position = p
         _refresh_path()
         gui_status.value = "target poses reset"
+
+    def _rotx(a):
+        c, s = np.cos(a), np.sin(a)
+        return np.array([[1, 0, 0], [0, c, -s], [0, s, c]], dtype=np.float64)
+
+    def _roty(a):
+        c, s = np.cos(a), np.sin(a)
+        return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]], dtype=np.float64)
+
+    def _make_pattern_poses(name, T, amount, deg):
+        """Trajectory starting at context[0] (identity in bundle frame), ramping
+        linearly to `amount` (translate) or `deg`° (rotate) over T frames.
+        OpenCV camera local axes: +X right, +Y down, +Z forward."""
+        th = np.radians(deg)
+        move = {"move_forward": (0, 0, 1), "move_back": (0, 0, -1),
+                "move_right": (1, 0, 0), "move_left": (-1, 0, 0)}
+        poses = []
+        for t in range(T):
+            f = (t / (T - 1)) if T > 1 else 1.0
+            M = np.eye(4)
+            if name in move:
+                M[:3, 3] = f * amount * np.array(move[name], dtype=np.float64)
+            else:
+                a = f * th
+                if name == "rotate_up":      M[:3, :3] = _rotx(a)
+                elif name == "rotate_down":  M[:3, :3] = _rotx(-a)
+                elif name == "rotate_right": M[:3, :3] = _roty(a)
+                else:                        M[:3, :3] = _roty(-a)   # rotate_left
+            poses.append(M)
+        return np.stack(poses)
+
+    def apply_pattern(_=None):
+        if S["bundle"] is None:
+            gui_status.value = "load a bundle first (Reload)"; return
+        _clear_gizmo()
+        T = S["tgt_orig"].shape[0] if S["tgt_orig"] is not None else 37
+        amount = float(gui_translate.value); deg = float(gui_rotate.value)
+        name = gui_pattern.value
+        poses = _make_pattern_poses(name, T, amount, deg)
+        # remove existing target frustums/path
+        for h in S["tgt_handles"]:
+            try: h.remove()
+            except Exception: pass
+            if h in S["current"]:
+                S["current"].remove(h)
+        d = S["bundle"]; scale = S["scale"]
+        K0 = np.asarray(d["target_intrinsics"])[0] if "target_intrinsics" in d else (
+            np.asarray(d["intrinsics"])[0] if "intrinsics" in d else None)
+        intr = np.tile(K0, (T, 1, 1)) if K0 is not None else None
+        th = add_view_frustums(server, poses, intrinsics=intr, scale=scale * 0.6,
+                               prefix="target", color_start=(40, 220, 120), color_end=(120, 40, 220),
+                               path_color=(255, 40, 40), add_world_axes=False,
+                               add_gui_color=False, return_all=True)
+        S["current"] += th; S["tgt_handles"] = th
+        S["tgt_frustums"] = th[:T]
+        S["tgt_path"] = next((h for h in th if getattr(h, "_is_frustum_path", False)), None)
+        S["tgt_poses"] = poses.copy(); S["tgt_orig"] = poses.copy()
+        gui_status.value = f"pattern {name}: T={T} amt={amount:.3f} deg={deg:.0f}"
+        print("[viser]", gui_status.value)
 
     def generate(_=None):
         if G["wrapper"] is None:
@@ -423,7 +497,7 @@ def main():
 
     gui_reload.on_click(reload); gui_select.on_click(select)
     gui_save.on_click(save); gui_reset.on_click(reset)
-    gui_generate.on_click(generate)
+    gui_apply.on_click(apply_pattern); gui_generate.on_click(generate)
     reload()
     print("[viser] panel: Reload / Select for edit / Save edited / Reset / Generate video. Ctrl-C to stop.")
     try:
