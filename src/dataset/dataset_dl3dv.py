@@ -244,6 +244,12 @@ class DatasetDL3DVCfg(DatasetCfgCommon):
     # as `sample["text"]` (the `prompt_scene_simple.concise` field).
     load_prompts: bool = False
     prompts_filename: str = "prompts_37.json"
+    # When True, always emit `sample["text"]=""` (overrides load_prompts). Used in
+    # the multi-dataset (DL3DV+DynamicVerse) merge so DL3DV samples carry the same
+    # `text` key as DynamicVerse (collation needs a consistent schema) while
+    # contributing only camera/scene grounding (no text guidance). Mirrors
+    # DynamicVerse's `force_empty_text`.
+    force_empty_text: bool = False
 
 class DatasetDL3DV(Dataset):
     cfg: DatasetDL3DVCfg
@@ -595,7 +601,9 @@ class DatasetDL3DV(Dataset):
                 sample["target"]["da3_w2c_first"] = W_tgt[0].contiguous()           # (4, 4)
                 sample["target"]["da3_intrinsics_first"] = K_tgt[0].contiguous()    # (3, 3)
 
-        if self.cfg.load_prompts:
+        if self.cfg.force_empty_text:
+            sample["text"] = ""
+        elif self.cfg.load_prompts:
             sample["text"] = self._lookup_prompt_for_target(
                 self.root / chunk_name,
                 sample["target"]["index"],

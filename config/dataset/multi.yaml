@@ -1,0 +1,84 @@
+# MultiDataset: DL3DV + DynamicVerse weighted mix for one training run.
+# Each sub-dataset keeps its own view_sampler + config; sub dicts are parsed
+# per-name in src/dataset/__init__._parse_sub_cfg (dacite from_dict).
+# Shapes/counts MUST match across subs so a mixed batch collates.
+name: multi
+weights: [0.5, 0.5]
+length: 100000
+datasets:
+  # ── DL3DV: static multi-view, camera/scene grounding. UNSCALED intrinsics
+  #    (scale_context_focal_by_256=false) to match DynamicVerse. text="" (no
+  #    text guidance, no dynamic). bounded sampler (random segment ctx+tgt).
+  - name: dl3dv
+    root: ./DATA/DL3DV/DL3DV-960
+    shape: [256, 448]
+    context_shape: [256, 448]
+    target_shape: [480, 832]
+    random_transform_extrinsics: false
+    precomputed_latents: {context: false, target: false}
+    baseline_epsilon: 1e-3
+    make_baseline: false
+    augment: true
+    cameras_are_circular: false
+    fps: 24
+    stage_override: null
+    scene_id: null
+    do_scale_and_pad: false
+    scale_focal_by_256: false
+    scale_context_focal_by_256: false
+    force_empty_text: true
+    view_sampler:
+      name: bounded
+      context_sampling: farthest_point
+      num_context_views: 12
+      num_target_views: 10
+      chunk_targets: false
+      offset: 1
+      temporal_downsample: 4
+      chunk_index_gap: 1
+      num_target_split: 1
+      min_distance_between_context_views: 64
+      max_distance_between_context_views: 96
+      initial_min_distance_between_context_views: 48
+      initial_max_distance_between_context_views: 64
+      context_gap_warm_up_steps: 30000
+      target_gap_warm_up_steps: 30000
+  # ── DynamicVerse: dynamic video (bg=inpaint_result → dynamic=video_input).
+  #    caption_window sampler + prompts. Native unscaled intrinsics.
+  - name: dynamicverse
+    root: ./WorldTraj/dynamicverse
+    shape: [256, 448]
+    context_shape: [256, 448]
+    target_shape: [480, 832]
+    precomputed_latents: {context: false, target: false}
+    augment: false
+    cameras_are_circular: false
+    fps: 10
+    excluded_subdatasets: [dynpose-100k, logs]
+    camera_file: cameras.json
+    video_name: inpaint_result.mp4
+    target_video_name: video_input.mp4
+    recon_target_video_name: null
+    prompt_file: prompts.json
+    prompt_key: prompt_scene
+    prompt_style: category_first
+    category_file: category/category.json
+    require_prompt: true
+    unseen_subdatasets: [DAVIS]
+    val_seen: true
+    evaluation_index_path: null
+    camera_rotation_is_world_to_camera: true
+    align_world_to_dl3dv: true
+    normalize_intrinsics: true
+    normalize_scene_scale: false
+    baseline_epsilon: 1e-3
+    make_baseline: false
+    view_sampler:
+      name: caption_window
+      context_sampling: farthest_point
+      num_context_views: 12
+      num_target_views: 10
+      chunk_targets: false
+      offset: 1
+      temporal_downsample: 4
+      prompts_filename: prompts.json

@@ -151,6 +151,33 @@ class DataModule(LightningDataModule):
         for i, (key, cfg) in enumerate(self.data_loader_cfg.val.items()):
             generator = self.get_generator(cfg)
             dataset_cfg = copy(self.dataset_cfg)
+
+            # MultiDataset: build one val loader per sub-dataset (each with its own
+            # eval index / val_seen), max_batches halved so total val cost ~= one
+            # dataset. Keys: "<subname>_<key>" (e.g. dl3dv_standard, dynamicverse_unseen).
+            if dataset_cfg.name == "multi":
+                from . import _parse_sub_cfg
+                half = max(cfg.max_batches // 2, 1) if cfg.max_batches > 0 else 0
+                for j, sub_raw in enumerate(dataset_cfg.datasets):
+                    sub_cfg = _parse_sub_cfg(sub_raw)
+                    if sub_cfg.name in {"dl3dv", "re10k"}:
+                        sub_cfg.val_seen = key != "unseen"
+                    elif sub_cfg.name == "dynamicverse":
+                        sub_cfg.val_seen = key != "unseen"
+                        sub_cfg.evaluation_index_path = Path(
+                            f"assets/evaluation_index/dynamicverse_{key}.json")
+                    ds = get_dataset(sub_cfg, "val", self.step_tracker, generator, force_shuffle=False)
+                    ds = self.dataset_shim(ds, "val")
+                    vlen = cfg.batch_size * half if half > 0 else len(ds)
+                    first = (i == 0 and j == 0)
+                    dataloaders[f"{sub_cfg.name}_{key}"] = DataLoader(
+                        ValidationWrapper(ds, vlen) if first else ds,
+                        cfg.batch_size, num_workers=cfg.num_workers, generator=generator,
+                        worker_init_fn=worker_init_fn, persistent_workers=self.get_persistent(cfg),
+                        prefetch_factor=cfg.prefetch_factor, pin_memory=cfg.pin_memory,
+                        shuffle=cfg.shuffle, collate_fn=safe_collate)
+                continue
+
             if dataset_cfg.name in {"dl3dv", "re10k"}:
                 dataset_cfg.val_seen = key != "unseen"
             elif dataset_cfg.name == "dynamicverse":
