@@ -84,6 +84,10 @@ class WanTI2V5BCfg:
     # with `use_text_cross_attn=False` (AC3D-paper-strict: text only in main
     # DiT, ctrl branch text-blind). Default False keeps the existing behaviour.
     controlnet_no_text_cross_attn: bool = False
+    # `controlnet_ac3d` mode는 기본적으로 ctrl block에서 text cross-attn을 뺀다
+    # (AC3D-paper-strict). True면 ac3d ctrl block에도 text cross-attn을 추가해
+    # text가 ctrl 분기에도 들어가게 한다. 기본 False = 기존 ac3d 동작(text 없음).
+    ac3d_use_text_cross_attn: bool = False
     num_target_split: int = 1
     input_shape: int | list[int] = 16
     noise_seed: int | None = None
@@ -294,6 +298,12 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
             )
         else:
             self.cnd_proj = nn.Linear(self.cond_dim, self.model.dim)
+        # `simple_wan_video_fn` 은 scene token 을 `dit.embed_scene_context(...)` 로 통과시킨다.
+        # cond_dim → model.dim 투사는 학습(`preprocess_scene_tokens`)·샘플링(`diffusion.py::step`)
+        # 의 `cnd_proj` 에서 _이미_ 수행되므로 여기 도달 시 scene_context 는 model.dim.
+        # 따라서 identity (다시 투사하면 이중 투사로 깨짐). 공식 DiffSynth WanModel 엔 이 메서드가
+        # 없어서 직접 부착한다.
+        self.model.embed_scene_context = lambda x: x
         self.null_tokens = nn.Parameter(torch.zeros(1, 1, self.model.dim))
         self.text_proj = None
         self.pose_embed = None
@@ -506,7 +516,7 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
                     has_image_input=ac3d_has_image_input,
                     camera_input_type="none",
                     scene_input_type=ac3d_scene_input,
-                    use_text_cross_attn=False,
+                    use_text_cross_attn=bool(cfg.ac3d_use_text_cross_attn),
                 )
                 for i in range(ac3d_n)
             ])
@@ -1579,7 +1589,7 @@ def simple_wan_video_fn(
                 ctrl_input = ctrl_input + ctrl_x
             ctrl_x = dit.ac3d_blocks[block_id](
                 ctrl_input,
-                None,  # text context — use_text_cross_attn=False라 무시됨
+                context,  # text context — use_text_cross_attn=True면 ctrl 분기도 사용, False면 무시됨
                 ac3d_scene,
                 t_mod,
                 None,

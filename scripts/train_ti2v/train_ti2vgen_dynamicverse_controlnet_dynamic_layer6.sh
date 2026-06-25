@@ -1,38 +1,35 @@
 #!/usr/bin/env bash
-# Variant of train_ti2vgen_dynamicverse_controlnet_dynamic.sh:
-# parallel controlnet + dynamic + LoRA off + **ctrl branch text cross-attn 제거**.
-# AC3D 논문의 "text는 main DiT만" 정신을 parallel controlnet 모드에도 적용.
+# === GPU 4 ===
+# train_ti2vgen_dynamicverse_controlnet_dynamic.sh 와 동일 세팅, ControlNet 분기 깊이만
+# ac3d_num_layers 2 → 6 으로 늘린 변종. run_name(exp_name) 에 _layer_6 접미사.
+# 이 머신 전용 override: dataset.root, val batch_size=4 x max_batches=8 (=32 scenes, 8 videos logged) + expandable alloc, OOM 회피.
 
 config=custom/scenetok_va-wan-ti2v_dynamicverse
 num_workers=4
 gpus=1
 num_nodes=1
-exp_name="va-wan-ti2v_dynamicverse_dynamic_controlnet_scene_camera_2_no_lora_no_text_ctrl"
+exp_name="va-wan-ti2v_dynamicverse_dynamic_controlnet_scene_camera_2_no_lora_layer_6"
 
-# ── Condition routing ─────────────────────────────────────────────────────
+data_root=/data1/cympyc1785/data/dynamicverse
+
 scene_input_type=controlnet
 camera_input_type=controlnet
 condition_latents_input_type=none
 
-# ── LoRA on main Wan DiT (off) ─────────────────────────────────────────────
 lora_enabled=false
 lora_rank=32
 lora_alpha=32
 lora_target_modules='q,k,v,o,ffn.0,ffn.2'
 resume_lora_ckpt=null
 
-# ── wandb ────────────────────────────────────────────────────────────────
 wandb_activated=true
-wandb_tags='[dynamicverse,wan-ti2v,controlnet,scene+camera,video_input,category,no_text_ctrl]'
+wandb_tags='[dynamicverse,wan-ti2v,controlnet,scene+camera,lora,video_input,category,layer_6]'
 
 export WANDB_API_KEY=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
 export DEBUG=1
-# 이 머신 전용 override: dataset.root, val batch_size=4 x max_batches=8 (=32 scenes, 8 videos logged) + expandable alloc, OOM 회피.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-data_root=/data1/cympyc1785/data/dynamicverse
-
-CUDA_VISIBLE_DEVICES=7 exec -a no_text_ctrl_scenetok_lets_go python -m src.main +experiment=${config} \
+CUDA_VISIBLE_DEVICES=4 exec -a dynamic_scenetok_lets_go python -m src.main +experiment=${config} \
   data_loader.train.num_workers=${num_workers} \
   mode=train \
   dataset.root=${data_root} \
@@ -48,7 +45,7 @@ CUDA_VISIBLE_DEVICES=7 exec -a no_text_ctrl_scenetok_lets_go python -m src.main 
   model.denoiser.scene_input_type=${scene_input_type} \
   model.denoiser.camera_input_type=${camera_input_type} \
   model.denoiser.condition_latents_input_type=${condition_latents_input_type} \
-  +model.denoiser.controlnet_no_text_cross_attn=true \
+  model.denoiser.ac3d_num_layers=6 \
   model.denoiser.lora.enabled=${lora_enabled} \
   model.denoiser.lora.rank=${lora_rank} \
   model.denoiser.lora.alpha=${lora_alpha} \
