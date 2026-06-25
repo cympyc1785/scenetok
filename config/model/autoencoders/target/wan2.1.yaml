@@ -1,0 +1,9 @@
+name: wan
+
+pretrained_from: checkpoints/Wan2.1_VAE.pth
+
+
+kwargs:
+  in_channels: 3
+  latent_channels: 16
+  scaling_factor: 1.0
