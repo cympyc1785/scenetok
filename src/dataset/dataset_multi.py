@@ -20,11 +20,20 @@ import torch
 from torch.utils.data import Dataset
 
 from .dtypes import Stage
+from .view_sampler import ViewSamplerCfg
 
 
 @dataclass
 class MultiDatasetCfg:
     name: Literal["multi"]
+    # `view_sampler` here is NOT used for sampling (each sub-dataset uses its own).
+    # It only exposes the SHARED temporal layout the wrapper reads
+    # (`dataset_cfg.view_sampler.num_target_views/offset/...`). Set it to match
+    # both subs (e.g. caption_window, num_target_views=10, offset=1).
+    view_sampler: ViewSamplerCfg
+    # Wrapper also reads these directly:
+    fps: int = 24
+    precomputed_latents: dict = field(default_factory=lambda: {"context": False, "target": False})
     # Raw sub-dataset config dicts (each has its own `name` + `view_sampler`).
     # Parsed per-name in `get_dataset` (avoids dacite union-in-list ambiguity).
     datasets: list[Any] = field(default_factory=list)

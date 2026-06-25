@@ -1,3 +1,6 @@
+defaults:
+  - view_sampler: caption_window
+
 # MultiDataset: DL3DV + DynamicVerse weighted mix for one training run.
 # Each sub-dataset keeps its own view_sampler + config; sub dicts are parsed
 # per-name in src/dataset/__init__._parse_sub_cfg (dacite from_dict).
@@ -5,6 +8,17 @@
 name: multi
 weights: [0.5, 0.5]
 length: 100000
+fps: 24
+precomputed_latents: {context: false, target: false}
+view_sampler:        # shared temporal layout the wrapper reads (NOT used for sampling)
+  name: caption_window
+  context_sampling: farthest_point
+  num_context_views: 12
+  num_target_views: 10
+  chunk_targets: false
+  offset: 1
+  temporal_downsample: 4
+  prompts_filename: prompts.json
 datasets:
   # ── DL3DV: static multi-view, camera/scene grounding. UNSCALED intrinsics
   #    (scale_context_focal_by_256=false) to match DynamicVerse. text="" (no
