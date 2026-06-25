@@ -119,6 +119,10 @@ class DataModule(LightningDataModule):
     def get_persistent(self, loader_cfg: DataLoaderStageCfg) -> bool | None:
         return None if loader_cfg.num_workers == 0 else loader_cfg.persistent_workers
 
+    def get_prefetch(self, loader_cfg: DataLoaderStageCfg) -> int | None:
+        # prefetch_factor is only valid with num_workers > 0; PyTorch raises otherwise.
+        return None if loader_cfg.num_workers == 0 else loader_cfg.prefetch_factor
+
     def get_generator(self, loader_cfg: DataLoaderStageCfg) -> torch.Generator | None:
         if loader_cfg.seed is None:
             return None
@@ -138,7 +142,7 @@ class DataModule(LightningDataModule):
             generator=generator,
             worker_init_fn=worker_init_fn,
             persistent_workers=self.get_persistent(self.data_loader_cfg.train),
-            prefetch_factor=self.data_loader_cfg.train.prefetch_factor,
+            prefetch_factor=self.get_prefetch(self.data_loader_cfg.train),
             pin_memory=self.data_loader_cfg.train.pin_memory,
             drop_last=True,
             collate_fn=safe_collate
@@ -172,7 +176,7 @@ class DataModule(LightningDataModule):
                 generator=generator,
                 worker_init_fn=worker_init_fn,
                 persistent_workers=self.get_persistent(cfg),
-                prefetch_factor=cfg.prefetch_factor,
+                prefetch_factor=self.get_prefetch(cfg),
                 pin_memory=cfg.pin_memory,
                 shuffle=cfg.shuffle,
                 collate_fn=safe_collate,
@@ -190,7 +194,7 @@ class DataModule(LightningDataModule):
             generator=generator,
             worker_init_fn=worker_init_fn,
             persistent_workers=self.get_persistent(self.data_loader_cfg.test),
-            prefetch_factor=self.data_loader_cfg.test.prefetch_factor,
+            prefetch_factor=self.get_prefetch(self.data_loader_cfg.test),
             pin_memory=self.data_loader_cfg.test.pin_memory,
             collate_fn=safe_collate,
         )

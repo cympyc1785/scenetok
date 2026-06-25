@@ -2,15 +2,16 @@ config=custom/scenetok_va-wan_shift8_dl3dv_finetuned_wide
 num_workers=4
 gpus=1
 num_nodes=1
-exp_name="scenetok_va-wan_dl3dv_256-480_finetune_small"
+exp_name="aika_scenetok_va-wan_dl3dv_256-480_finetune_small"
 
 
-export WANDB_API_KEY=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
+export WANDB_API_KEY=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
 export DEBUG=1
 
-CUDA_VISIBLE_DEVICES=0 python -m src.main +experiment=${config} \
+CUDA_VISIBLE_DEVICES=1 python -m src.main +experiment=${config} \
   data_loader.train.num_workers=${num_workers} \
   mode=train \
+  dataset.root=./DATA/DL3DV/DL3DV-960/DL3DV-10K \
   dataset.smallset=true \
   dataset.context_shape=[256,448] \
   dataset.target_shape=[480,832] \

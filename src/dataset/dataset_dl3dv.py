@@ -266,7 +266,8 @@ class DatasetDL3DV(Dataset):
         self.data_stage_override = cfg.stage_override or stage
         self.view_sampler = view_sampler
         self.to_tensor = tf.ToTensor()
-        self.root = cfg.root / "train"
+        self.root = cfg.root
+        # self.root = cfg.root / "train"
         # Collect chunks.
         self.chunks = []
         self.preprocess = rescale_and_pad if cfg.do_scale_and_pad else rescale_and_crop

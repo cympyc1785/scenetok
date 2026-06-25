@@ -14,7 +14,7 @@ defaults:
   - override /model/denoiser/camera/embedding: lvsm
 
 dataset:
-  root: ./DATA/DL3DV/DL3DV-960
+  root: ./DATA/DL3DV/DL3DV-960/DL3DV-10K
   smallset: false
   target_latent_type: wan
 
@@ -38,20 +38,20 @@ dataset:
 
 data_loader:
   train:
-    batch_size: 4
+    batch_size: 8
   val:
     standard:
       shuffle: false
-      batch_size: 8
-      max_batches: 4
+      batch_size: 4
+      max_batches: 8
       num_workers: 4
       seed: 0
       interval: 5000
       persistent_workers: false
     unseen:
       shuffle: false
-      batch_size: 8
-      max_batches: 4
+      batch_size: 4
+      max_batches: 8
       num_workers: 4
       seed: 0
       interval: 5000

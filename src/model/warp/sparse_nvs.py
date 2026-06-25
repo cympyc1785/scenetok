@@ -33,9 +33,15 @@ if "warp" not in sys.modules:
     _stub.init = lambda: None  # type: ignore[attr-defined]
     sys.modules["warp"] = _stub
 
-from src.model.GEN3C.cosmos_predict1.diffusion.inference.forward_warp_utils_pytorch import (
-    forward_warp,
-)
+# GEN3C(cosmos-predict1) is a vendored, gitignored dep only needed for depth-warp
+# (condition_latents_input_type=first_frame_depth*). Guard so the module imports
+# even when GEN3C is absent on this machine; only fails if the warp is invoked.
+try:
+    from src.model.GEN3C.cosmos_predict1.diffusion.inference.forward_warp_utils_pytorch import (
+        forward_warp,
+    )
+except ModuleNotFoundError:
+    forward_warp = None
 
 
 @torch.no_grad()
@@ -70,6 +76,11 @@ def multi_view_warp_to_target(
         mask:   (B, 1, H, W) — union mask (1 where any source contributed).
         (optional) per_view_warps, per_view_masks if `return_per_view=True`.
     """
+    if forward_warp is None:
+        raise ModuleNotFoundError(
+            "src.model.GEN3C (cosmos-predict1) is required for depth-warp "
+            "(condition_latents_input_type=first_frame_depth*); vendor it under src/model/GEN3C."
+        )
     B, V, _, H, W = context_images.shape
     assert context_depths.shape == (B, V, 1, H, W), context_depths.shape
     assert context_w2cs.shape == (B, V, 4, 4), context_w2cs.shape

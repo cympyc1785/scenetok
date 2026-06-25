@@ -80,14 +80,23 @@ class AutoencoderWan(nn.Module):
         return x
     
     def decode(
-        self, 
+        self,
         x: Float[Tensor, "batch view channel height width"]
     ) -> Float[Tensor, "batch _ _ height width"]:
-        
+
         b, v, c, h, w = x.shape
         scale = [self.scale[0].to(x.device), self.scale[1].to(x.device)]
         x = rearrange(x, "b v c h w -> b c v h w")
         model = self.model.model if self.uses_diffsynth_vae else self.model
-        x = model.decode(x, scale)
+        # Decode one sample at a time. The Wan VAE is a temporal-causal VAE, so all of
+        # a video's latent frames must decode together (cross-frame feat_cache → temporal
+        # consistency). The batch dim, however, is fully independent and `decode` resets
+        # its cache per call, so looping over batch is bit-identical to a batched decode
+        # while cutting peak decoder activation memory by ~batch_size — avoids the
+        # 480x832 validation-decode OOM. Single-sample (b==1) keeps the original path.
+        if b == 1:
+            x = model.decode(x, scale)
+        else:
+            x = torch.cat([model.decode(x[i:i + 1], scale) for i in range(b)], dim=0)
         x = rearrange(x, "b c v h w -> b v c h w")
         return x
