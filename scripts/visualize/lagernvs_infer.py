@@ -28,7 +28,9 @@ def main():
     ap = argparse.ArgumentParser(description="LagerNVS render of viser target cameras")
     ap.add_argument("--repo", required=True, help="submodules/lagernvs path (added to sys.path)")
     ap.add_argument("--payload", required=True, help=".pt payload from viser_server")
-    ap.add_argument("--output", required=True, help="output mp4 path")
+    ap.add_argument("--frames_out", required=True,
+                    help="output .pt of rendered frames (Vt,3,H,W float[0,1]); "
+                         "viser_server assembles the mp4/gif scenetok-style")
     ap.add_argument("--ckpt", required=True, help="general_512 model.pt path")
     ap.add_argument("--target_size", type=int, default=512)
     ap.add_argument("--mode", default="resize", choices=["resize", "square_crop"])
@@ -44,7 +46,6 @@ def main():
     from models.encoder_decoder import EncDec_VitB8
     from vggt.utils.load_fn import load_and_preprocess_images
     from vis import render_chunked, compute_plucker_coordinates
-    from eval.export import save_video
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = (torch.bfloat16
@@ -108,10 +109,12 @@ def main():
         with torch.amp.autocast(device_type="cuda", dtype=dtype):
             video_out = render_chunked(
                 model, (images, rays, cam_tokens), num_cond_views=num_cond)
-    out = Path(args.output)
+    # Return raw target-camera frames (Vt,3,H,W float[0,1]); viser_server saves
+    # the mp4/gif with the SAME save_image_video/save_gif pipeline as SceneTok.
+    out = Path(args.frames_out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    save_video(video_out[0], str(out))
-    print(f"[lagernvs-infer] saved {tuple(video_out.shape)} -> {out}")
+    torch.save(video_out[0].detach().cpu().float().clamp(0, 1), str(out))
+    print(f"[lagernvs-infer] saved frames {tuple(video_out.shape)} -> {out}")
 
 
 if __name__ == "__main__":

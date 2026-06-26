@@ -658,10 +658,10 @@ def main():
                         "target_c2w": tgt_c2w, "target_intrinsics_norm": tgt_K,
                         "scene": scene_hash}, payload)
 
-            out_mp4 = out_dir / "generated.mp4"
+            frames_pt = out_dir / "frames.pt"
             cmd = [args.lagernvs_python, str(REPO / "scripts/visualize/lagernvs_infer.py"),
                    "--repo", args.lagernvs_repo, "--payload", str(payload),
-                   "--output", str(out_mp4), "--ckpt", args.lagernvs_ckpt,
+                   "--frames_out", str(frames_pt), "--ckpt", args.lagernvs_ckpt,
                    "--target_size", str(args.lagernvs_size)]
             env = dict(os.environ)
             if args.lagernvs_gpu is not None:
@@ -670,14 +670,27 @@ def main():
                                capture_output=True, text=True)
             if r.stdout:
                 print(r.stdout[-3000:])
-            if r.returncode != 0 or not out_mp4.exists():
+            if r.returncode != 0 or not frames_pt.exists():
                 if r.stderr:
                     print("[viser-lagernvs] stderr:\n", r.stderr[-3000:])
                 gui_status.value = f"[LagerNVS] FAILED (rc={r.returncode}) — see console"; return
 
+            # Save the rendered target-camera frames as mp4 + gif with the SAME
+            # pipeline as the SceneTok generate path (save_image_video / save_gif).
+            from src.misc.image_io import save_image_video
+            frames = torch.load(frames_pt, map_location="cpu").float().clamp(0, 1)  # (Vt,3,H,W)
+            save_image_video(images=frames, indices=torch.arange(frames.shape[0]),
+                             output_dir=out_dir, name="generated", save_img=False,
+                             save_video=True, fps=args.fps)
+            try:
+                save_gif(frames, out_dir / "generated.gif", fps=args.fps)
+            except Exception as ge:
+                print("[viser-lagernvs] gif save failed:", ge)
+
             torch.save({"target_c2w_edited": tgt_c2w, "scene": scene_hash,
                         "source_bundle": str(S["bundle_path"])}, out_dir / "poses.pt")
-            gui_status.value = f"[LagerNVS] saved → {out_dir.name}/generated.mp4"
+            gui_status.value = (f"[LagerNVS] saved → {out_dir.name}/generated.mp4 "
+                                f"{tuple(frames.shape)}")
             print(f"[viser-lagernvs] saved → {out_dir}")
         except Exception as e:
             import traceback; traceback.print_exc()
