@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- `scripts/concat_model_compare.py` — SceneTok(위) vs LagerNVS(아래) **2×N 모델 비교 grid 영상(mp4 + gif)**. 폴더 suffix로 두 모델 렌더를 매칭(컬럼=combo 카메라 시퀀스), 공통 셀 256×448로 리사이즈(SceneTok 256×448 vs LagerNVS 288×512) 후 행별 hcat + 행간 vcat. 라벨 없음. 5종 combo → `results/viser_generate/_compare_scenetok_lagernvs/<name>.{mp4,gif}`.
 - `scripts/concat_lagernvs_videos.py` — LagerNVS per-camera-sequence 렌더들을 조합별 **side-by-side concat 비교 영상(mp4 + gif)** 으로 생성. 가로 hcat(라벨 없음, 모두 37f·288×512). COMBOS 5종(orig-back-back_lot / orig-forward-forward_lot / orig-rotate_left-rotate_right / move_forward-back-left-right / rot_up-down-left-right) → `results/viser_generate/lagernvs_general_512/_concat/<name>.{mp4,gif}`.
 
 ### Changed
