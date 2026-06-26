@@ -7,7 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
-- `scripts/concat_lagernvs_videos.py` — LagerNVS per-camera-sequence 렌더들을 조합별 **side-by-side concat 비교 영상(mp4 + gif)** 으로 생성. 클립별 라벨(yellow-on-black) 후 가로 hcat(모두 37f·288×512). COMBOS 5종(orig-back-back_lot / orig-forward-forward_lot / orig-rotate_left-rotate_right / move_forward-back-left-right / rot_up-down-left-right) → `results/viser_generate/lagernvs_general_512/_concat/<name>.{mp4,gif}`.
+- `scripts/concat_lagernvs_videos.py` — LagerNVS per-camera-sequence 렌더들을 조합별 **side-by-side concat 비교 영상(mp4 + gif)** 으로 생성. 가로 hcat(라벨 없음, 모두 37f·288×512). COMBOS 5종(orig-back-back_lot / orig-forward-forward_lot / orig-rotate_left-rotate_right / move_forward-back-left-right / rot_up-down-left-right) → `results/viser_generate/lagernvs_general_512/_concat/<name>.{mp4,gif}`.
 
 ### Changed
 - **viser LagerNVS를 상주 모델 서버로 전환** (`scripts/visualize/lagernvs_infer.py` + `viser_server.py`): 기존엔 "Generate (LagerNVS)" 누를 때마다 subprocess를 띄워 모델을 매번 재로드(~40s)했는데, 이제 SceneTok처럼 **서버 기동 시 LagerNVS general_512를 lagernvs env worker 프로세스에 1회 로드**해 상주시키고 stdin/stdout JSON 프로토콜(`READY`/`{"payload","frames_out"}`→`DONE\t...`/`ERR\t...`/`QUIT`)로 요청을 계속 처리. 반복 추론이 재로드 없이 ~4-5s. `lagernvs_infer.py`는 one-shot → 영구 서버 루프로 재작성(모든 진단은 stderr, stdout은 프로토콜 전용; viser는 READY/DONE/ERR로 시작하는 줄만 파싱해 라이브러리 print 무시). `viser_server`: `start_lagernvs_server`(Popen+READY 대기) 시작 시 호출, `generate_lagernvs`는 resident worker에 요청(threading.Lock 직렬화), 종료 시 QUIT. `--no_lagernvs`로 스킵, `--lagernvs_gpu`로 worker GPU 지정. smoke PASS: 1회 로드 후 2연속 요청 각 ~4.5s DONE (1,37,3,288,512).

@@ -1,6 +1,6 @@
 """Side-by-side concat of LagerNVS per-camera-sequence renders into comparison
-videos (+ GIFs). Each requested combo → one horizontal strip with a label per
-clip. Clips share frame count (37) and size (288x512), so a plain hcat works.
+videos (+ GIFs). Each requested combo → one horizontal strip (no labels). Clips
+share frame count (37) and size (288x512), so a plain hcat works.
 
 Output: results/viser_generate/lagernvs_general_512/_concat/<name>.{mp4,gif}
 """
@@ -8,7 +8,7 @@ from pathlib import Path
 
 import imageio.v3 as iio
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 
 ROOT = Path("results/viser_generate/lagernvs_general_512")
 OUT = ROOT / "_concat"
@@ -32,20 +32,6 @@ def load_clip(suffix):
     return iio.imread(p)  # (T, H, W, 3) uint8
 
 
-def label(frame, text):
-    img = Image.fromarray(frame)
-    d = ImageDraw.Draw(img)
-    try:
-        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 22)
-    except Exception:
-        font = ImageFont.load_default()
-    # readability: dark box behind text
-    tb = d.textbbox((0, 0), text, font=font)
-    d.rectangle([6, 6, 6 + (tb[2] - tb[0]) + 10, 6 + (tb[3] - tb[1]) + 10], fill=(0, 0, 0))
-    d.text((11, 9), text, fill=(255, 255, 0), font=font)
-    return np.asarray(img)
-
-
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
     for name, suffixes in COMBOS:
@@ -55,7 +41,7 @@ def main():
         # label each clip's frames, then hcat horizontally
         out_frames = []
         for t in range(T):
-            row = [label(clips[i][t], suffixes[i]) for i in range(len(clips))]
+            row = [clips[i][t] for i in range(len(clips))]
             out_frames.append(np.concatenate(row, axis=1))  # hcat along width
         out_frames = np.stack(out_frames)  # (T, H, W*n, 3)
         mp4 = OUT / f"{name}.mp4"
