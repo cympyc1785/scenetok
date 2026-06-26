@@ -353,7 +353,9 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
         if self.scene_input_type == "new_cross_attention":
             self.model.scene_time_projection = nn.Sequential(
                 nn.SiLU(), nn.Linear(self.model.dim, self.model.dim * 3))
-        if self.camera_input_type in ("cross_attention", "new_cross_attention"):
+        if self.camera_input_type == "cross_attention":
+            # `new_cross_attention` 카메라는 pose_embed가 이미 model.dim 토큰을
+            # 내므로 이 4096→dim Linear 불필요 (scene과 함께 새 cross-attn k,v로 concat).
             self.model.camera_embedding = nn.Sequential(
                 nn.Linear(self.text_embed_dim, self.model.dim),
                 nn.GELU(approximate="tanh"),
@@ -996,6 +998,10 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
             )
         if self.camera_input_type == "adaln":
             return pose_tokens
+        if self.camera_input_type == "new_cross_attention":
+            # 프레임당 1토큰: (B, V, dim, H, W) → spatial mean-pool → (B, V, dim).
+            # scene token과 함께 새 cross-attn의 k,v로 concat.
+            return pose_tokens.mean(dim=(3, 4))
         return rearrange(pose_tokens, "b v c h w -> b (v h w) c")
 
     def _get_camera_context(
@@ -1230,6 +1236,9 @@ def simple_wan_video_fn(
     adaln_camera_embedding = camera_context if camera_input_type == "adaln" else None
     recam_camera_embedding = camera_context if camera_input_type == "recam_attention" else None
     cross_attention_camera_context = camera_context if camera_input_type == "cross_attention" else None
+    # `new_cross_attention` camera: (B, V, dim) per-frame tokens → scene token과
+    # 함께 블록별 새 scene_cross_attn 의 k,v 로 concat (controlnet 없이 주입).
+    new_cross_attn_camera_context = camera_context if camera_input_type == "new_cross_attention" else None
     wan_control_camera_input = camera_context if camera_input_type == "wan_control" else None
     channel_concat_camera_input = camera_context if camera_input_type == "channel_concat" else None
     ac3d_camera_input = camera_context if camera_input_type in ("controlnet", "controlnet_feedback", "controlnet_ac3d", "controlnet_lightningdit") else None
@@ -1330,6 +1339,28 @@ def simple_wan_video_fn(
                 context = torch.cat([context, scene_context], dim=1)
         else:
             scene_latent_tokens = scene_context
+
+    # `new_cross_attention` camera: scene token k,v 뒤에 per-frame camera 토큰을
+    # sequence 축으로 concat → 블록별 새 scene_cross_attn 가 [scene ⊕ camera] 를
+    # 하나의 k,v 로 attend. (modality embedding 없이 단순 concat)
+    if new_cross_attn_camera_context is not None:
+        cam_ctx = new_cross_attn_camera_context.to(dtype=latents.dtype, device=latents.device)
+        if cross_attention_scene_context is None:
+            cross_attention_scene_context = cam_ctx
+        else:
+            if cross_attention_scene_context.shape[0] != cam_ctx.shape[0]:
+                if cross_attention_scene_context.shape[0] == 1:
+                    cross_attention_scene_context = cross_attention_scene_context.expand(
+                        cam_ctx.shape[0], -1, -1)
+                elif cam_ctx.shape[0] == 1:
+                    cam_ctx = cam_ctx.expand(cross_attention_scene_context.shape[0], -1, -1)
+                else:
+                    raise ValueError(
+                        "scene_context and camera_context batch sizes must match or be broadcastable: "
+                        f"scene={cross_attention_scene_context.shape[0]}, camera={cam_ctx.shape[0]}")
+            cross_attention_scene_context = torch.cat(
+                [cross_attention_scene_context, cam_ctx], dim=1)
+
     if context is None and cross_attention_scene_context is None:
         raise ValueError("simple_wan_video_fn requires `context` or `scene_context` for cross-attention.")
 
