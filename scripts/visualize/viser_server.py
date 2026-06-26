@@ -29,7 +29,7 @@ target_intrinsics/target_images; optional ref_world (4,4) for save round-trip.
 
 Usage:  CUDA_VISIBLE_DEVICES=3 python scripts/visualize/viser_server.py
 """
-import argparse, json, os, subprocess, sys, time
+import argparse, json, os, subprocess, sys, threading, time
 from pathlib import Path
 import numpy as np
 
@@ -98,6 +98,28 @@ def _parse_sel(text, n):
         elif tok:
             out.append(int(tok))
     return [i for i in out if 0 <= i < n]
+
+
+def start_lagernvs_server(args):
+    """Launch the persistent LagerNVS worker (lagernvs conda env) and block until
+    it prints READY (model loaded). Returns the Popen, or None on failure. The
+    worker stays resident so repeated generates reuse the loaded model; its stderr
+    is inherited to the console, stdout is the request/response protocol channel."""
+    cmd = [args.lagernvs_python, str(REPO / "scripts/visualize/lagernvs_infer.py"),
+           "--repo", args.lagernvs_repo, "--ckpt", args.lagernvs_ckpt,
+           "--target_size", str(args.lagernvs_size)]
+    env = dict(os.environ)
+    if args.lagernvs_gpu is not None:
+        env["CUDA_VISIBLE_DEVICES"] = str(args.lagernvs_gpu)
+    proc = subprocess.Popen(cmd, cwd=args.lagernvs_repo, env=env,
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=None, text=True, bufsize=1)
+    for line in proc.stdout:  # skip library prints until READY
+        if line.strip() == "READY":
+            return proc
+        if proc.poll() is not None:
+            break
+    return None
 
 
 def build_model(args):
@@ -211,6 +233,8 @@ def main():
     ap.add_argument("--lagernvs_size", type=int, default=512)
     ap.add_argument("--lagernvs_gpu", default=None,
                     help="CUDA_VISIBLE_DEVICES for the LagerNVS subprocess (default: inherit)")
+    ap.add_argument("--no_lagernvs", action="store_true",
+                    help="skip launching the resident LagerNVS worker")
     args = ap.parse_args()
 
     # auto-pair experiment/shape from the ckpt name when not given explicitly
@@ -255,7 +279,8 @@ def main():
          "tgt_gen": 0, "tgt_reset": None}
     # model state (loaded once at startup)
     G = {"wrapper": None, "loader": None, "device": args.device, "precision": None,
-         "cache": {}, "scanned": False}
+         "cache": {}, "scanned": False, "lagernvs_proc": None,
+         "lagernvs_lock": threading.Lock()}
 
     if not args.no_model:
         try:
@@ -267,6 +292,20 @@ def main():
             import traceback; traceback.print_exc()
             gui_status.value = f"model load FAILED: {e}"
             print("[viser] model load failed:", e)
+
+    # Load the LagerNVS model once at startup too (resident worker in lagernvs
+    # env), so "Generate (LagerNVS)" serves continuously without per-click reload.
+    if not args.no_lagernvs:
+        try:
+            print("[viser] starting LagerNVS worker (loading general_512)...")
+            G["lagernvs_proc"] = start_lagernvs_server(args)
+            if G["lagernvs_proc"] is None:
+                print("[viser] LagerNVS worker failed to reach READY (see stderr).")
+            else:
+                print("[viser] LagerNVS worker READY.")
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            print("[viser] LagerNVS worker start failed:", e)
 
     def _find_batch(scene_hash):
         """Return the dataset batch whose scene contains scene_hash (cached)."""
@@ -616,15 +655,17 @@ def main():
             gui_status.value = f"generate ERROR: {e}"; print("[viser-gen] error:", e)
 
     def generate_lagernvs(_=None):
-        """Render the current (edited) target cameras with LagerNVS general_512.
-
-        Runs in the separate `lagernvs` conda env as a subprocess (env mismatch):
-        writes context images + context/target c2w + target intrinsics to a
-        payload, calls scripts/visualize/lagernvs_infer.py with the lagernvs
-        python, reads the rendered mp4 back. Uses the bundle's RAW context images
-        (LagerNVS needs RGB, not VA latents)."""
+        """Render the current (edited) target cameras with the RESIDENT LagerNVS
+        general_512 worker (loaded once at startup in the lagernvs env). Writes a
+        payload (context RGB + context/target c2w + target intrinsics), sends one
+        JSON request to the worker over stdin, reads back the rendered frames, and
+        saves mp4/gif via the SceneTok pipeline. Uses the bundle's RAW context
+        images (LagerNVS needs RGB, not VA latents)."""
         if S["tgt_poses"] is None or S["bundle_path"] is None:
             gui_status.value = "no target poses to generate"; return
+        proc = G.get("lagernvs_proc")
+        if proc is None or proc.poll() is not None:
+            gui_status.value = "[LagerNVS] worker not running (--no_lagernvs?)"; return
         import torch
         from PIL import Image
         try:
@@ -632,7 +673,7 @@ def main():
             scene_hash = str(bundle.get("scene", Path(S["bundle_path"]).stem))
             if "images" not in bundle or bundle["images"] is None:
                 gui_status.value = "bundle has no context images (LagerNVS needs RGB)"; return
-            gui_status.value = f"[LagerNVS] generating {scene_hash[:12]}... (subprocess)"
+            gui_status.value = f"[LagerNVS] generating {scene_hash[:12]}... (resident worker)"
             print(f"[viser-lagernvs] scene={scene_hash}")
             out_dir = Path(args.gen_out) / "lagernvs_general_512" / \
                 f"{scene_hash[:16]}_{time.strftime('%m%d_%H%M%S')}"
@@ -659,21 +700,24 @@ def main():
                         "scene": scene_hash}, payload)
 
             frames_pt = out_dir / "frames.pt"
-            cmd = [args.lagernvs_python, str(REPO / "scripts/visualize/lagernvs_infer.py"),
-                   "--repo", args.lagernvs_repo, "--payload", str(payload),
-                   "--frames_out", str(frames_pt), "--ckpt", args.lagernvs_ckpt,
-                   "--target_size", str(args.lagernvs_size)]
-            env = dict(os.environ)
-            if args.lagernvs_gpu is not None:
-                env["CUDA_VISIBLE_DEVICES"] = str(args.lagernvs_gpu)
-            r = subprocess.run(cmd, cwd=args.lagernvs_repo, env=env,
-                               capture_output=True, text=True)
-            if r.stdout:
-                print(r.stdout[-3000:])
-            if r.returncode != 0 or not frames_pt.exists():
-                if r.stderr:
-                    print("[viser-lagernvs] stderr:\n", r.stderr[-3000:])
-                gui_status.value = f"[LagerNVS] FAILED (rc={r.returncode}) — see console"; return
+            # Send one request to the resident worker; read stdout until the
+            # protocol reply (skip any library prints on the channel).
+            req = json.dumps({"payload": str(payload), "frames_out": str(frames_pt)})
+            reply = None
+            with G["lagernvs_lock"]:
+                proc.stdin.write(req + "\n"); proc.stdin.flush()
+                for line in proc.stdout:
+                    line = line.strip()
+                    if line.startswith("DONE\t") or line.startswith("ERR\t"):
+                        reply = line; break
+                    if proc.poll() is not None:
+                        break
+            if reply is None:
+                gui_status.value = "[LagerNVS] worker died — see console"; return
+            if reply.startswith("ERR\t"):
+                gui_status.value = f"[LagerNVS] {reply}"; print("[viser-lagernvs]", reply); return
+            if not frames_pt.exists():
+                gui_status.value = "[LagerNVS] no frames output — see console"; return
 
             # Save the rendered target-camera frames as mp4 + gif with the SAME
             # pipeline as the SceneTok generate path (save_image_video / save_gif).
@@ -706,7 +750,15 @@ def main():
     try:
         while True: time.sleep(1.0)
     except KeyboardInterrupt:
-        print("\n[viser] stopping."); server.stop()
+        print("\n[viser] stopping.")
+        proc = G.get("lagernvs_proc")
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.stdin.write("QUIT\n"); proc.stdin.flush()
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+        server.stop()
 
 
 if __name__ == "__main__":
