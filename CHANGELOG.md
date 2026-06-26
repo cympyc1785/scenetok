@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- `scripts/ctx_order_lagernvs_compare.py` — context-view **순서 불변성**(original/reverse/shuffle) 테스트를 LagerNVS로 돌리고 SceneTok와 **2×4 grid** 비교(`[context|original|reverse|shuffle]`, 위=SceneTok 기존 렌더 재사용 / 아래=LagerNVS). target+context_c2w 고정, context **이미지 순서만** permute(cond rays=0이라 c2w 순서 무관, anchor/scale 동일). 결과: SceneTok orig↔reverse/shuffle |diff|≈5.7(거의 불변) vs LagerNVS≈47/20(순서 민감 — 첫 conditioning view를 reference로 쓰는 구조 탓). resident worker 1회 로드로 3순서 렌더. `results/ctx_order_compare_scenetok_lagernvs/<scene>/cmp_2x4.{mp4,gif}`.
 - `scripts/concat_model_compare.py` — SceneTok(위) vs LagerNVS(아래) **2×N 모델 비교 grid 영상(mp4 + gif)**. 폴더 suffix로 두 모델 렌더를 매칭(컬럼=combo 카메라 시퀀스), 공통 셀 256×448로 리사이즈(SceneTok 256×448 vs LagerNVS 288×512) 후 행별 hcat + 행간 vcat. 라벨 없음. 5종 combo → `results/viser_generate/_compare_scenetok_lagernvs/<name>.{mp4,gif}`.
 - `scripts/concat_lagernvs_videos.py` — LagerNVS per-camera-sequence 렌더들을 조합별 **side-by-side concat 비교 영상(mp4 + gif)** 으로 생성. 가로 hcat(라벨 없음, 모두 37f·288×512). COMBOS 5종(orig-back-back_lot / orig-forward-forward_lot / orig-rotate_left-rotate_right / move_forward-back-left-right / rot_up-down-left-right) → `results/viser_generate/lagernvs_general_512/_concat/<name>.{mp4,gif}`.
 
