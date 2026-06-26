@@ -29,11 +29,13 @@ target_intrinsics/target_images; optional ref_world (4,4) for save round-trip.
 
 Usage:  CUDA_VISIBLE_DEVICES=3 python scripts/visualize/viser_server.py
 """
-import argparse, json, sys, time
+import argparse, json, os, subprocess, sys, time
 from pathlib import Path
 import numpy as np
 
 REPO = Path(__file__).resolve().parents[2]
+LAGERNVS_REPO = REPO / "submodules/lagernvs"
+LAGERNVS_PY = "/NHNHOME/WORKSPACE/0226010013_A/anaconda3/envs/lagernvs/bin/python"
 sys.path.insert(0, str(REPO))
 from src.misc.viser_frustum import start_server, add_view_frustums, _rotmat_to_wxyz, path_points_from_origins
 
@@ -201,6 +203,14 @@ def main():
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--gen_out", default=str(REPO / "results/viser_generate"))
     ap.add_argument("--fps", type=int, default=15)
+    # ── LagerNVS (separate `lagernvs` conda env, run as subprocess) ──
+    ap.add_argument("--lagernvs_python", default=LAGERNVS_PY)
+    ap.add_argument("--lagernvs_repo", default=str(LAGERNVS_REPO))
+    ap.add_argument("--lagernvs_ckpt",
+                    default=str(LAGERNVS_REPO / "checkpoints/lagernvs_general_512/model.pt"))
+    ap.add_argument("--lagernvs_size", type=int, default=512)
+    ap.add_argument("--lagernvs_gpu", default=None,
+                    help="CUDA_VISIBLE_DEVICES for the LagerNVS subprocess (default: inherit)")
     args = ap.parse_args()
 
     # auto-pair experiment/shape from the ckpt name when not given explicitly
@@ -237,6 +247,7 @@ def main():
     gui_save = server.gui.add_button("Save edited")
     gui_reset = server.gui.add_button("Reset target")
     gui_generate = server.gui.add_button("Generate video")
+    gui_generate_lager = server.gui.add_button("Generate (LagerNVS)")
 
     S = {"current": [], "tgt_frustums": [], "tgt_path": None, "tgt_poses": None,
          "tgt_orig": None, "gizmo": None, "bundle_path": None,
@@ -604,10 +615,79 @@ def main():
             import traceback; traceback.print_exc()
             gui_status.value = f"generate ERROR: {e}"; print("[viser-gen] error:", e)
 
+    def generate_lagernvs(_=None):
+        """Render the current (edited) target cameras with LagerNVS general_512.
+
+        Runs in the separate `lagernvs` conda env as a subprocess (env mismatch):
+        writes context images + context/target c2w + target intrinsics to a
+        payload, calls scripts/visualize/lagernvs_infer.py with the lagernvs
+        python, reads the rendered mp4 back. Uses the bundle's RAW context images
+        (LagerNVS needs RGB, not VA latents)."""
+        if S["tgt_poses"] is None or S["bundle_path"] is None:
+            gui_status.value = "no target poses to generate"; return
+        import torch
+        from PIL import Image
+        try:
+            bundle = load_bundle(S["bundle_path"])
+            scene_hash = str(bundle.get("scene", Path(S["bundle_path"]).stem))
+            if "images" not in bundle or bundle["images"] is None:
+                gui_status.value = "bundle has no context images (LagerNVS needs RGB)"; return
+            gui_status.value = f"[LagerNVS] generating {scene_hash[:12]}... (subprocess)"
+            print(f"[viser-lagernvs] scene={scene_hash}")
+            out_dir = Path(args.gen_out) / "lagernvs_general_512" / \
+                f"{scene_hash[:16]}_{time.strftime('%m%d_%H%M%S')}"
+            img_dir = out_dir / "context_images"
+            img_dir.mkdir(parents=True, exist_ok=True)
+
+            imgs = np.asarray(bundle["images"])          # (Vc,3,H,W) uint8
+            img_paths = []
+            for i in range(imgs.shape[0]):
+                arr = imgs[i].transpose(1, 2, 0).astype("uint8")   # HWC RGB
+                p = img_dir / f"ctx_{i:03d}.png"
+                Image.fromarray(arr).save(p); img_paths.append(str(p))
+
+            tgt_c2w = torch.as_tensor(np.asarray(S["tgt_poses"]), dtype=torch.float32)
+            ctx_c2w = torch.as_tensor(np.asarray(bundle["c2w"]), dtype=torch.float32)
+            # GT target intrinsics (normalized), one K per DL3DV scene → repeat.
+            tk = bundle.get("target_intrinsics", bundle["intrinsics"])
+            tk0 = torch.as_tensor(np.asarray(tk), dtype=torch.float32)[0]
+            tgt_K = tk0.unsqueeze(0).repeat(tgt_c2w.shape[0], 1, 1)
+
+            payload = out_dir / "payload.pt"
+            torch.save({"context_image_paths": img_paths, "context_c2w": ctx_c2w,
+                        "target_c2w": tgt_c2w, "target_intrinsics_norm": tgt_K,
+                        "scene": scene_hash}, payload)
+
+            out_mp4 = out_dir / "generated.mp4"
+            cmd = [args.lagernvs_python, str(REPO / "scripts/visualize/lagernvs_infer.py"),
+                   "--repo", args.lagernvs_repo, "--payload", str(payload),
+                   "--output", str(out_mp4), "--ckpt", args.lagernvs_ckpt,
+                   "--target_size", str(args.lagernvs_size)]
+            env = dict(os.environ)
+            if args.lagernvs_gpu is not None:
+                env["CUDA_VISIBLE_DEVICES"] = str(args.lagernvs_gpu)
+            r = subprocess.run(cmd, cwd=args.lagernvs_repo, env=env,
+                               capture_output=True, text=True)
+            if r.stdout:
+                print(r.stdout[-3000:])
+            if r.returncode != 0 or not out_mp4.exists():
+                if r.stderr:
+                    print("[viser-lagernvs] stderr:\n", r.stderr[-3000:])
+                gui_status.value = f"[LagerNVS] FAILED (rc={r.returncode}) — see console"; return
+
+            torch.save({"target_c2w_edited": tgt_c2w, "scene": scene_hash,
+                        "source_bundle": str(S["bundle_path"])}, out_dir / "poses.pt")
+            gui_status.value = f"[LagerNVS] saved → {out_dir.name}/generated.mp4"
+            print(f"[viser-lagernvs] saved → {out_dir}")
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            gui_status.value = f"[LagerNVS] ERROR: {e}"; print("[viser-lagernvs] error:", e)
+
     gui_reload.on_click(reload); gui_select.on_click(select)
     gui_save.on_click(save); gui_reset.on_click(reset)
     gui_apply.on_click(apply_pattern); gui_loadpt.on_click(load_target_pt)
     gui_generate.on_click(generate)
+    gui_generate_lager.on_click(generate_lagernvs)
     reload()
     print("[viser] panel: Reload / Select for edit / Save edited / Reset / Generate video. Ctrl-C to stop.")
     try:
