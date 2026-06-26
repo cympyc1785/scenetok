@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from lightning import LightningDataModule
 from torch import Generator, nn
-from torch.utils.data import DataLoader, Dataset, IterableDataset
+from torch.utils.data import DataLoader, Dataset, IterableDataset, Subset
 
 from ..misc.step_tracker import StepTracker
 from . import DatasetCfg, get_dataset
@@ -152,12 +152,18 @@ class DataModule(LightningDataModule):
             generator = self.get_generator(cfg)
             dataset_cfg = copy(self.dataset_cfg)
 
-            # MultiDataset: build one val loader per sub-dataset (each with its own
-            # eval index / val_seen), max_batches halved so total val cost ~= one
-            # dataset. Keys: "<subname>_<key>" (e.g. dl3dv_standard, dynamicverse_unseen).
+            # MultiDataset: one loader per (val key × sub-dataset), each a fixed
+            # `per_sub`-scene subset. DL3DV (16-ctx c16 eval index) and DynamicVerse
+            # (12-ctx) have different context counts → can't share a batch, so they
+            # stay separate HOMOGENEOUS loaders. They are merged at LOG time:
+            # `validation_loader_names` (diffusion_wrapper) maps every sub of a key
+            # to ONE panel name → "standard"/"unseen" panels each accumulate
+            # per_sub·n_subs scenes (e.g. 4 DL3DV + 4 DynamicVerse = 8).
+            # Insertion order (standard×subs then unseen×subs) MUST match that
+            # mapping. Keys: "<subname>_<key>" (unique dict keys).
             if dataset_cfg.name == "multi":
                 from . import _parse_sub_cfg
-                half = max(cfg.max_batches // 2, 1) if cfg.max_batches > 0 else 0
+                per_sub = 4
                 for j, sub_raw in enumerate(dataset_cfg.datasets):
                     sub_cfg = _parse_sub_cfg(sub_raw)
                     if sub_cfg.name in {"dl3dv", "re10k"}:
@@ -168,14 +174,15 @@ class DataModule(LightningDataModule):
                             f"assets/evaluation_index/dynamicverse_{key}.json")
                     ds = get_dataset(sub_cfg, "val", self.step_tracker, generator, force_shuffle=False)
                     ds = self.dataset_shim(ds, "val")
-                    vlen = cfg.batch_size * half if half > 0 else len(ds)
+                    n = min(per_sub, len(ds))
+                    ds = Subset(ds, list(range(n)))
                     first = (i == 0 and j == 0)
                     dataloaders[f"{sub_cfg.name}_{key}"] = DataLoader(
-                        ValidationWrapper(ds, vlen) if first else ds,
-                        cfg.batch_size, num_workers=cfg.num_workers, generator=generator,
+                        ValidationWrapper(ds, n) if first else ds,
+                        per_sub, num_workers=cfg.num_workers, generator=generator,
                         worker_init_fn=worker_init_fn, persistent_workers=self.get_persistent(cfg),
                         prefetch_factor=cfg.prefetch_factor, pin_memory=cfg.pin_memory,
-                        shuffle=cfg.shuffle, collate_fn=safe_collate)
+                        shuffle=False, collate_fn=safe_collate)
                 continue
 
             if dataset_cfg.name in {"dl3dv", "re10k"}:

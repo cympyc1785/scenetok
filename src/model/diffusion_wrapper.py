@@ -408,6 +408,17 @@ class DiffusionWrapper(LightningModule):
         self.frozen_scene_query = False
         self.test_step_outputs = []
         self.validation_loader_names = {0: "standard", 1: "unseen"}
+        if getattr(self.dataset_cfg, "name", None) == "multi":
+            # multi val builds one loader per (val_key × sub-dataset), in order
+            # standard×subs then unseen×subs (see data_module.val_dataloader). Map
+            # ALL subs of a key to ONE panel name so DL3DV + DynamicVerse log and
+            # metric together under "standard"/"unseen" (e.g. 4 DL3DV + 4 DV = 8).
+            n_subs = len(self.dataset_cfg.datasets)
+            self.validation_loader_names = {
+                ki * n_subs + j: name
+                for ki, name in enumerate(["standard", "unseen"])
+                for j in range(n_subs)
+            }
         self.predicted = {name: [] for name in self.validation_loader_names.values()}
         self.generated = {name: [] for name in self.validation_loader_names.values()}
         # Video/context logging accumulates up to `val_vis_num` samples across
@@ -1314,14 +1325,17 @@ class DiffusionWrapper(LightningModule):
                 n = self.val_vis_num
                 sampled = torch.cat(buf["sampled"])[:n].to(self.device, non_blocking=True)
                 target = torch.cat(buf["target"])[:n].to(self.device, non_blocking=True)
-                context = torch.cat(buf["context"])[:n].to(self.device, non_blocking=True)
                 scenes = buf["scene"][:n]
+                # Context view-count can differ across sub-datasets sharing one
+                # panel (multi: DL3DV 16 ctx vs DynamicVerse 12) → keep per-sample,
+                # don't cat into one tensor. (Single-dataset behaviour unchanged.)
+                context_list = [c for chunk in buf["context"] for c in chunk][:n]
                 log_tensor_as_video(self.logger, sampled, f"{loader_name}/Sampled Video", fps=8, step=val_step, caption=scenes)
                 log_tensor_as_video(self.logger, target, f"{loader_name}/Original Video", fps=8, step=val_step, caption=scenes)
                 vis_list = []
-                v_c = context.shape[1]
-                for j in range(context.shape[0]):
-                    context_vis = add_label(hcat(*[context[j, i, ...] for i in range(v_c)]), "Context Views")
+                for j, ctx in enumerate(context_list):
+                    ctx = ctx.to(self.device, non_blocking=True)
+                    context_vis = add_label(hcat(*[ctx[i, ...] for i in range(ctx.shape[0])]), "Context Views")
                     vis = add_label(context_vis, scenes[j])
                     vis_list.append(prep_image(vis))
                 self.logger.log_image(f"{loader_name}/Context ({self.sampler.cfg.name})", vis_list, step=val_step, caption=scenes)
