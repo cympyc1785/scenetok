@@ -95,7 +95,17 @@ def main():
 
         target_rays = compute_plucker_coordinates(
             tgt_c2w.unsqueeze(0), tgt_fxfycxcy, (H, W))
-        cond_rays = torch.zeros(1, num_cond, 6, H, W)
+        # cond rays: zeros = UNPOSED (default). If `posed` + context intrinsics are
+        # given, build real context Plücker rays (general_512 supports posed too).
+        ctx_K = pl.get("context_intrinsics_norm", None)
+        if pl.get("posed", False) and ctx_K is not None:
+            ctx_K = ctx_K.float()
+            cfx = ctx_K[:, 0, 0] * W; cfy = ctx_K[:, 1, 1] * H
+            ccx = ctx_K[:, 0, 2] * W; ccy = ctx_K[:, 1, 2] * H
+            ctx_fxfycxcy = torch.stack([cfx, cfy, ccx, ccy], dim=-1).unsqueeze(0)
+            cond_rays = compute_plucker_coordinates(ctx_c2w.unsqueeze(0), ctx_fxfycxcy, (H, W))
+        else:
+            cond_rays = torch.zeros(1, num_cond, 6, H, W)
         rays = torch.cat([cond_rays, target_rays], dim=1).to(device)
         cam_tokens = cam_tokens.to(device)
 
