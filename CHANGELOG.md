@@ -7,6 +7,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- `scripts/concat_single_vs_multi.py` + `assets/evaluation_index/dynamicverse_unseen_8.json` — dynamicverse unseen 8 scene에서 single(dynamicverse) vs multi 모델 비교 영상 [inpaint|GT|single|multi] 4-way concat(per-scene mp4/gif + 전체 grid). inpaint는 inpaint_result.mp4의 target 프레임, GT/single/multi는 fast_infer 출력.
+- `scripts/fast_infer_t2v.py` `--max_scenes`(기본 1, 하위호환) 추가 — eval index의 여러 scene 처리(기존 `break # single batch only`를 조건부로).
 - `scripts/compute_val_metrics_from_videos.py` — 저장된 val 영상(Sampled=생성/Original=GT)에서 metric 재계산 후 wandb re-log. scalar는 학습 중 드롭됐지만 영상은 파일로 남아 복구. FVD/FID는 set 단위, PSNR/SSIM/LPIPS는 PSNR cost matrix+Hungarian으로 scene 페어링(파일명 hash라 순서 소실) 후 계산. `Metric` 클래스+submodules.fvd 재사용. `relog/<panel>/<metric>` val_step 축으로 WANDB_API_KEY 계정에 기록.
 - `scripts/relog_multi_val_to_wandb.py` — 학습 resume로 갈라진 multi val 로깅을 원래 wandb run에 복구. 로컬 media/videos를 val 단위(Sampled/Original×standard/unseen, kind별 wstep 그룹→index 페어링)로 모아, run resume 후 `relog/*` 패널(전용 `val_step` x축)로 val 1~11 재기록(_step 충돌 회피, 비파괴).
 - `scripts/run_effecterase_dynamicverse.sh` — DynamicVerse subdataset들에 EffectErase remove 배치 실행(subdataset별 infer_dataset.py, effecterase env, 기존 출력 skip) → 각 scene에 `inpaint_result_effecterase.mp4`(832×480,49f). GPU 분할 병렬용(`GPU=N bash ... MOSE MVS-Synth ...`). 남은 2080 scene(DAVIS 76 외) 처리.

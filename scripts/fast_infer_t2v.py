@@ -78,6 +78,9 @@ def parse_args():
     p.add_argument("--num_context_views", type=int, default=None)
     p.add_argument("--num_target_views", type=int, default=None)
     p.add_argument("--output_dir", default=None)
+    p.add_argument("--max_scenes", type=int, default=1,
+                   help="How many scenes (batches) from the eval index to process. "
+                        "Default 1 = single scene (backward compat).")
     p.add_argument("--device", default="cuda")
     return p.parse_args()
 
@@ -545,7 +548,8 @@ def main():
                             fps=fps,
                         )
                     print(f"  saved: {out_subdir}/{wrapper.sampler.cfg.name}.mp4")
-            break  # single batch only
+            if batch_idx + 1 >= args.max_scenes:
+                break  # default 1 = single scene (backward compat); set --max_scenes N for more
 
     print(f"[fast_infer] Done. Output: {output_dir}")
 
