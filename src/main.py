@@ -111,6 +111,7 @@ def train(cfg_dict: DictConfig):
             mode=cfg_dict.wandb.mode,
             name=f"{output_dir.parent.name} ({output_dir.name})",
             id=f"{output_dir.parent.name}_{output_dir.name}",
+            resume="allow",  # resume 시 같은 wandb run을 이어감(_step 연속) → run 분리/충돌 방지
             tags=cfg_dict.wandb.get("tags", None),
             log_model=False,
             save_dir=output_dir,

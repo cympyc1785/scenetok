@@ -1098,7 +1098,11 @@ class DiffusionWrapper(LightningModule):
             return None
 
         step = self.step_tracker.get_step()
-        val_step = (step+1) // self.val_check_interval
+        # Log val at the GLOBAL training step (monotonic with train metrics).
+        # Previously this was the small val counter ((step+1)//interval), which
+        # collided with wandb's already-advanced _step → val scalars/videos got
+        # dropped from the dashboard. Using the global step keeps them.
+        val_step = step
         loader_name = self.validation_loader_names.get(dataloader_idx or 0, f"val_{dataloader_idx}")
         self.predicted.setdefault(loader_name, [])
         self.generated.setdefault(loader_name, [])
@@ -1229,7 +1233,11 @@ class DiffusionWrapper(LightningModule):
         # if step == 0:
         #     return
 
-        val_step = (step+1) // self.val_check_interval
+        # Log val at the GLOBAL training step (monotonic with train metrics).
+        # Previously this was the small val counter ((step+1)//interval), which
+        # collided with wandb's already-advanced _step → val scalars/videos got
+        # dropped from the dashboard. Using the global step keeps them.
+        val_step = step
 
         for loader_name in self.predicted.keys():
             if len(self.predicted[loader_name]) == 0 or len(self.generated[loader_name]) == 0:
