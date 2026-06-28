@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- `scripts/compute_val_metrics_from_videos.py` — 저장된 val 영상(Sampled=생성/Original=GT)에서 metric 재계산 후 wandb re-log. scalar는 학습 중 드롭됐지만 영상은 파일로 남아 복구. FVD/FID는 set 단위, PSNR/SSIM/LPIPS는 PSNR cost matrix+Hungarian으로 scene 페어링(파일명 hash라 순서 소실) 후 계산. `Metric` 클래스+submodules.fvd 재사용. `relog/<panel>/<metric>` val_step 축으로 WANDB_API_KEY 계정에 기록.
 - `scripts/relog_multi_val_to_wandb.py` — 학습 resume로 갈라진 multi val 로깅을 원래 wandb run에 복구. 로컬 media/videos를 val 단위(Sampled/Original×standard/unseen, kind별 wstep 그룹→index 페어링)로 모아, run resume 후 `relog/*` 패널(전용 `val_step` x축)로 val 1~11 재기록(_step 충돌 회피, 비파괴).
 - `scripts/run_effecterase_dynamicverse.sh` — DynamicVerse subdataset들에 EffectErase remove 배치 실행(subdataset별 infer_dataset.py, effecterase env, 기존 출력 skip) → 각 scene에 `inpaint_result_effecterase.mp4`(832×480,49f). GPU 분할 병렬용(`GPU=N bash ... MOSE MVS-Synth ...`). 남은 2080 scene(DAVIS 76 외) 처리.
 - `scripts/ctx_order_compare_reanchored.py` — context-order 불변성 **RE-ANCHORED** 버전: 순서 바꿀 때 target을 새 첫 view 기준으로 재정의(같은 world viewpoint)해 reference-frame mismatch 제거 → 순수 set-invariance 격리. SceneTok은 preprocess 전 permute(index=0=새 첫 view), LagerNVS는 context_c2w를 이미지와 함께 permute(worker first_inv 재anchor). 결과: LagerNVS orig↔reverse 47→**23**, orig↔shuffle 19→**4.2**(거의 불변) — 기존 reverse 깨짐은 대부분 reference-frame artifact였음 확인. SceneTok ~17(거의 불변 유지). `results/ctx_order_compare_reanchored/<scene>/`.
