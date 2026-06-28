@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- `scripts/train_ti2v/train_ti2vgen_dynamicverse_controlnet_dynamic_effecterase.sh` — baseline(va-wan-ti2v_dynamicverse_dynamic_controlnet_scene_camera_2_no_lora)와 동일 세팅에서 context input video만 `inpaint_result.mp4`→`inpaint_result_effecterase.mp4`(EffectErase 배경)로 교체 + max_steps=50000 + run_name `_effecterase`. effecterase 미생성 scene은 dataset이 자동 drop(train pool 2080→1980). WANDB는 env(VCAI_Vid 키). smoke 1-step PASS.
 - `scripts/concat_single_vs_multi.py` + `assets/evaluation_index/dynamicverse_unseen_8.json` — dynamicverse unseen 8 scene에서 single(dynamicverse) vs multi 모델 비교 영상 [inpaint|GT|single|multi] 4-way concat(per-scene mp4/gif + 전체 grid). inpaint는 inpaint_result.mp4의 target 프레임, GT/single/multi는 fast_infer 출력.
 - `scripts/fast_infer_t2v.py` `--max_scenes`(기본 1, 하위호환) 추가 — eval index의 여러 scene 처리(기존 `break # single batch only`를 조건부로).
 - `scripts/compute_val_metrics_from_videos.py` — 저장된 val 영상(Sampled=생성/Original=GT)에서 metric 재계산 후 wandb re-log. scalar는 학습 중 드롭됐지만 영상은 파일로 남아 복구. FVD/FID는 set 단위, PSNR/SSIM/LPIPS는 PSNR cost matrix+Hungarian으로 scene 페어링(파일명 hash라 순서 소실) 후 계산. `Metric` 클래스+submodules.fvd 재사용. `relog/<panel>/<metric>` val_step 축으로 WANDB_API_KEY 계정에 기록.
