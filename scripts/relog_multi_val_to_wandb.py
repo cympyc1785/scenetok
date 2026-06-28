@@ -14,14 +14,17 @@ import re
 from pathlib import Path
 
 REPO = Path(".").resolve()
-WBROOT = REPO / "exp/va-wan-ti2v_multi_dynamic_controlnet_scene_camera_no_lora/wandb"
-# (run dir, list of val occurrences are ordered by wstep). Old run = val 1.., new appends.
-RUN_DIRS = [
+# Configurable via env so the same scripts re-log other runs (e.g. newca):
+#   RELOG_EXP=<exp_name>  RELOG_RUN_DIRS=<dir1,dir2>  RELOG_WANDB_ID=<id>
+import os
+_EXP = os.environ.get("RELOG_EXP", "va-wan-ti2v_multi_dynamic_controlnet_scene_camera_no_lora")
+WBROOT = REPO / f"exp/{_EXP}/wandb"
+RUN_DIRS = os.environ.get("RELOG_RUN_DIRS", ",".join([
     "run-20260625_164402-exp_va-wan-ti2v_multi_dynamic_controlnet_scene_camera_no_lora",  # val 1-4
     "run-20260626_142428-exp_va-wan-ti2v_multi_dynamic_controlnet_scene_camera_no_lora",  # val 5-11
-]
-PANELS = ["standard", "unseen"]
-WANDB_ID = "exp_va-wan-ti2v_multi_dynamic_controlnet_scene_camera_no_lora"
+])).split(",")
+PANELS = os.environ.get("RELOG_PANELS", "standard,unseen").split(",")
+WANDB_ID = os.environ.get("RELOG_WANDB_ID", "exp_va-wan-ti2v_multi_dynamic_controlnet_scene_camera_no_lora")
 WANDB_PROJECT = "scenetok"
 
 
