@@ -1097,12 +1097,12 @@ class DiffusionWrapper(LightningModule):
         if batch is None:
             return None
 
+        # val_step = global step // val_check_interval → clean validation counter
+        # (0,1,2,...), exactly as the ORIGINAL SceneTok release code does.
+        # ⚠️ MEMO: keep this `(step+1)//self.val_check_interval` form. Do NOT
+        # change it to the raw step (`val_step = step`) — that was a wrong detour.
         step = self.step_tracker.get_step()
-        # Log val at the GLOBAL training step (monotonic with train metrics).
-        # Previously this was the small val counter ((step+1)//interval), which
-        # collided with wandb's already-advanced _step → val scalars/videos got
-        # dropped from the dashboard. Using the global step keeps them.
-        val_step = step
+        val_step = (step + 1) // self.val_check_interval
         loader_name = self.validation_loader_names.get(dataloader_idx or 0, f"val_{dataloader_idx}")
         self.predicted.setdefault(loader_name, [])
         self.generated.setdefault(loader_name, [])
@@ -1229,15 +1229,15 @@ class DiffusionWrapper(LightningModule):
         return None
 
     def on_validation_end(self):
-        step = self.step_tracker.get_step()
         # if step == 0:
         #     return
 
-        # Log val at the GLOBAL training step (monotonic with train metrics).
-        # Previously this was the small val counter ((step+1)//interval), which
-        # collided with wandb's already-advanced _step → val scalars/videos got
-        # dropped from the dashboard. Using the global step keeps them.
-        val_step = step
+        # val_step = global step // val_check_interval → clean validation counter
+        # (0,1,2,...), exactly as the ORIGINAL SceneTok release code does.
+        # ⚠️ MEMO: keep this `(step+1)//self.val_check_interval` form. Do NOT
+        # change it to the raw step (`val_step = step`) — that was a wrong detour.
+        step = self.step_tracker.get_step()
+        val_step = (step + 1) // self.val_check_interval
 
         for loader_name in self.predicted.keys():
             if len(self.predicted[loader_name]) == 0 or len(self.generated[loader_name]) == 0:
