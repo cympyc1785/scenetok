@@ -41,4 +41,8 @@ class ValidationWrapper(Dataset):
 
         # random_index = torch.randint(0, dataset_length, tuple())
 
-        return self.dataset[index]
+        # Wrap so a requested length (batch_size*max_batches) larger than the
+        # available scenes cycles instead of IndexError — happens when dataset
+        # filtering drops scenes (e.g. effecterase: some scenes lack the input
+        # video so the eval set shrinks below batch_size*max_batches).
+        return self.dataset[index % dataset_length]
