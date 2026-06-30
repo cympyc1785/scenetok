@@ -152,37 +152,32 @@ class DataModule(LightningDataModule):
             generator = self.get_generator(cfg)
             dataset_cfg = copy(self.dataset_cfg)
 
-            # MultiDataset: one loader per (val key × sub-dataset), each a fixed
-            # `per_sub`-scene subset. DL3DV (16-ctx c16 eval index) and DynamicVerse
-            # (12-ctx) have different context counts → can't share a batch, so they
-            # stay separate HOMOGENEOUS loaders. They are merged at LOG time:
-            # `validation_loader_names` (diffusion_wrapper) maps every sub of a key
-            # to ONE panel name → "standard"/"unseen" panels each accumulate
-            # per_sub·n_subs scenes (e.g. 4 DL3DV + 4 DynamicVerse = 8).
-            # Insertion order (standard×subs then unseen×subs) MUST match that
-            # mapping. Keys: "<subname>_<key>" (unique dict keys).
+            # MultiDataset: validate on the DYNAMIC sub (DynamicVerse) ONLY, so the
+            # panels match the single-dataset dynamicverse validation exactly and
+            # multi runs stay directly comparable. DL3DV (recon) is excluded from
+            # validation. Keys = "standard"/"unseen" (same as single dataset),
+            # each = full batch_size × max_batches (e.g. 8×4 = 32 dynamicverse / DAVIS).
             if dataset_cfg.name == "multi":
                 from . import _parse_sub_cfg
-                per_sub = 4
-                for j, sub_raw in enumerate(dataset_cfg.datasets):
-                    sub_cfg = _parse_sub_cfg(sub_raw)
-                    if sub_cfg.name in {"dl3dv", "re10k"}:
-                        sub_cfg.val_seen = key != "unseen"
-                    elif sub_cfg.name == "dynamicverse":
-                        sub_cfg.val_seen = key != "unseen"
-                        sub_cfg.evaluation_index_path = Path(
-                            f"assets/evaluation_index/dynamicverse_{key}.json")
-                    ds = get_dataset(sub_cfg, "val", self.step_tracker, generator, force_shuffle=False)
-                    ds = self.dataset_shim(ds, "val")
-                    n = min(per_sub, len(ds))
-                    ds = Subset(ds, list(range(n)))
-                    first = (i == 0 and j == 0)
-                    dataloaders[f"{sub_cfg.name}_{key}"] = DataLoader(
-                        ValidationWrapper(ds, n) if first else ds,
-                        per_sub, num_workers=cfg.num_workers, generator=generator,
-                        worker_init_fn=worker_init_fn, persistent_workers=self.get_persistent(cfg),
-                        prefetch_factor=cfg.prefetch_factor, pin_memory=cfg.pin_memory,
-                        shuffle=False, collate_fn=safe_collate)
+                sub_cfg = None
+                for sub_raw in dataset_cfg.datasets:
+                    c = _parse_sub_cfg(sub_raw)
+                    if c.name == "dynamicverse":
+                        sub_cfg = c
+                        break
+                assert sub_cfg is not None, "multi validation expects a dynamicverse sub-dataset"
+                sub_cfg.val_seen = key != "unseen"
+                sub_cfg.evaluation_index_path = Path(
+                    f"assets/evaluation_index/dynamicverse_{key}.json")
+                dataset = get_dataset(sub_cfg, "val", self.step_tracker, generator, force_shuffle=False)
+                dataset = self.dataset_shim(dataset, "val")
+                validation_length = cfg.batch_size * cfg.max_batches if cfg.max_batches > 0 else len(dataset)
+                dataloaders[key] = DataLoader(
+                    ValidationWrapper(dataset, validation_length) if i == 0 else dataset,
+                    cfg.batch_size, num_workers=cfg.num_workers, generator=generator,
+                    worker_init_fn=worker_init_fn, persistent_workers=self.get_persistent(cfg),
+                    prefetch_factor=cfg.prefetch_factor, pin_memory=cfg.pin_memory,
+                    shuffle=cfg.shuffle, collate_fn=safe_collate)
                 continue
 
             if dataset_cfg.name in {"dl3dv", "re10k"}:

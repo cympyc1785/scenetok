@@ -343,7 +343,8 @@ class LitDiT(nn.Module):
         wo_shift=False,
         use_checkpoint=False,
         frequency_embedding_size: int=256,
-        causal_attention: bool=False
+        causal_attention: bool=False,
+        rope_pt_input_size=None,
     ):
         super().__init__()
         print("(LitDiT) Number of target splits: ", num_split)
@@ -365,6 +366,15 @@ class LitDiT(nn.Module):
             input_hw = tuple(input_size)
         self.causal_attention=causal_attention
         self.input_hw = input_hw
+        # RoPE training grid (for position interpolation at non-native resolution).
+        # Defaults to input_hw → no interpolation (positions 0..N-1, original).
+        if rope_pt_input_size is None:
+            base_hw = input_hw
+        elif isinstance(rope_pt_input_size, int):
+            base_hw = (rope_pt_input_size, rope_pt_input_size)
+        else:
+            base_hw = tuple(rope_pt_input_size)
+        self.rope_base_hw = base_hw
         self.rope_dim = hidden_size // num_heads
         self.rope_sizes = None
         self.x_embedder = PatchEmbed(input_hw, patch_size, in_channels, hidden_size, bias=True)
@@ -378,9 +388,13 @@ class LitDiT(nn.Module):
         if self.use_rope:
             half_head_dim = hidden_size // num_heads // 2
             hw_seq_len = (input_hw[0] // patch_size, input_hw[1] // patch_size)
+            base_seq_len = (base_hw[0] // patch_size, base_hw[1] // patch_size)
+            # pt_seq_len = trained grid, ft_seq_len = actual grid → interpolation
+            # (identical to original when base_hw == input_hw).
             self.feat_rope = VisionRotaryEmbeddingFast(
                 dim=half_head_dim,
-                pt_seq_len=hw_seq_len,
+                pt_seq_len=base_seq_len,
+                ft_seq_len=hw_seq_len,
             )
         elif self.use_rope_3d:
             self.feat_rope = self.build_3d_rope(
@@ -388,7 +402,12 @@ class LitDiT(nn.Module):
                     num_views // num_split,
                     input_hw[0] // patch_size,
                     input_hw[1] // patch_size,
-                )
+                ),
+                base_sizes=(
+                    num_views // num_split,
+                    base_hw[0] // patch_size,
+                    base_hw[1] // patch_size,
+                ),
             )
         else:
             self.feat_rope = None
@@ -408,9 +427,10 @@ class LitDiT(nn.Module):
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels, use_rmsnorm=use_rmsnorm)
         self.initialize_weights()
 
-    def build_3d_rope(self, sizes):
+    def build_3d_rope(self, sizes, base_sizes=None):
         self.rope_sizes = tuple(sizes)
-        return RotaryEmbedding3D(self.rope_dim, sizes=self.rope_sizes)
+        base = tuple(base_sizes) if base_sizes is not None else None
+        return RotaryEmbedding3D(self.rope_dim, sizes=self.rope_sizes, base_sizes=base)
 
     def ensure_3d_rope(self, num_views: int, height: int, width: int, device: torch.device) -> None:
         if not self.use_rope_3d:

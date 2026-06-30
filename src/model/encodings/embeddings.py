@@ -164,22 +164,30 @@ class RotaryEmbeddingND(nn.Module):
         sizes: Tuple[int, ...],
         theta: float = 10000.0,
         flatten: bool = True,
+        base_sizes: Optional[Tuple[int, ...]] = None,
     ):
         """
         Args:
             dims: the number of dimensions for each axis.
             sizes: the maximum length for each axis.
+            base_sizes: per-axis TRAINING grid length. When given and != sizes,
+                positions are INTERPOLATED into [0, base_len) instead of
+                extrapolated to [0, seq_len) — lets a model trained at one grid
+                run at a larger grid (resolution generalization). None → original
+                behaviour (positions 0..seq_len-1).
         """
         super().__init__()
         self.n_dims = len(dims)
         self.dims = dims
         self.theta = theta
         self.flatten = flatten
+        if base_sizes is None:
+            base_sizes = sizes
 
         Colon = slice(None)
         all_freqs = []
-        for i, (dim, seq_len) in enumerate(zip(dims, sizes)):
-            freqs = self.get_freqs(dim, seq_len)
+        for i, (dim, seq_len, base_len) in enumerate(zip(dims, sizes, base_sizes)):
+            freqs = self.get_freqs(dim, seq_len, base_len)
             all_axis = [None] * len(dims)
             all_axis[i] = Colon
             new_axis_slice = (Ellipsis, *all_axis, Colon)
@@ -189,11 +197,15 @@ class RotaryEmbeddingND(nn.Module):
             all_freqs = rearrange(all_freqs, "... d -> (...) d")
         self.register_buffer("freqs", all_freqs, persistent=False)
 
-    def get_freqs(self, dim: int, seq_len: int) -> torch.Tensor:
+    def get_freqs(self, dim: int, seq_len: int, base_len: Optional[int] = None) -> torch.Tensor:
         freqs = 1.0 / (
             self.theta ** (torch.arange(0, dim, 2)[: (dim // 2)] / dim)
         )
-        pos = torch.arange(seq_len, dtype=freqs.dtype)
+        # Interpolate positions into the trained range [0, base_len) when
+        # base_len != seq_len; identical to arange(seq_len) when base_len == seq_len.
+        if base_len is None:
+            base_len = seq_len
+        pos = torch.arange(seq_len, dtype=freqs.dtype) / float(seq_len) * float(base_len)
         freqs = einsum("..., f -> ... f", pos, freqs)
         freqs = repeat(freqs, "... n -> ... (n r)", r=2)
         return freqs
@@ -263,6 +275,7 @@ class RotaryEmbedding3D(RotaryEmbeddingND):
         sizes: Tuple[int, int, int],
         theta: float = 10000.0,
         flatten: bool = True,
+        base_sizes: Optional[Tuple[int, int, int]] = None,
     ):
         assert dim % 2 == 0, "RotaryEmbedding3D requires even dim"
         dim //= 2
@@ -277,7 +290,7 @@ class RotaryEmbedding3D(RotaryEmbeddingND):
             case 2:
                 dims = (dim // 3, dim // 3 + 1, dim // 3 + 1)
 
-        super().__init__(tuple(d * 2 for d in dims), sizes, theta, flatten)
+        super().__init__(tuple(d * 2 for d in dims), sizes, theta, flatten, base_sizes=base_sizes)
 
 
 class RandomEmbeddingDropout(nn.Module):

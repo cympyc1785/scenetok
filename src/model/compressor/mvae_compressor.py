@@ -51,6 +51,10 @@ class MVAECompressorCfg:
     camera: CameraCfg
     kwargs: AggregatorKwargsCfg
     input_shape: Union[Tuple[int], list[int]]= (8, 8)
+    # RoPE training grid for position interpolation at non-native resolution.
+    # None → no interpolation (feat_rope built at input_shape grid, original).
+    # Set to the TRAINED input_shape (e.g. [16,16]) when running at a larger one.
+    rope_pt_input_shape: Union[Tuple[int], list[int], None] = None
     token_dim: int=32
     num_scene_tokens: int=256
     use_ray_map: bool=True
@@ -166,18 +170,32 @@ class MVAECompressor(Compressor[MVAECompressorCfg]):
         print("(Compressor) Using scene token channels: ", cfg.token_dim if cfg.reproject_out else None)
         print("(Compressor) Using 3D RoPE: ", cfg.kwargs.use_rope_3d)
         print("(Compressor) Using 2D RoPE: ", cfg.kwargs.use_rope_2d)
+        # RoPE training grid (for position interpolation at non-native res).
+        # None → use input_shape (no interpolation, original behaviour).
+        _pt_shape = getattr(cfg, "rope_pt_input_shape", None) or cfg.input_shape
         if cfg.kwargs.use_rope_3d:
             full_head_dim = cfg.kwargs.hidden_size // cfg.kwargs.num_heads
-            self.feat_rope = RotaryEmbedding3D(full_head_dim, sizes=(num_views, cfg.input_shape[0] // cfg.kwargs.patch_size, cfg.input_shape[1] // cfg.kwargs.patch_size))
+            self.feat_rope = RotaryEmbedding3D(
+                full_head_dim,
+                sizes=(num_views, cfg.input_shape[0] // cfg.kwargs.patch_size, cfg.input_shape[1] // cfg.kwargs.patch_size),
+                base_sizes=(num_views, _pt_shape[0] // cfg.kwargs.patch_size, _pt_shape[1] // cfg.kwargs.patch_size),
+            )
         elif cfg.kwargs.use_rope_2d:
             half_head_dim = cfg.kwargs.hidden_size // cfg.kwargs.num_heads // 2
             hw_seq_len = (
                 cfg.input_shape[0] // cfg.kwargs.patch_size,
                 cfg.input_shape[1] // cfg.kwargs.patch_size,
             )
+            base_seq_len = (
+                _pt_shape[0] // cfg.kwargs.patch_size,
+                _pt_shape[1] // cfg.kwargs.patch_size,
+            )
+            # pt_seq_len = trained grid, ft_seq_len = actual grid → interpolation
+            # (identical to original when _pt_shape == input_shape).
             self.feat_rope = VisionRotaryEmbeddingFast(
                 dim=half_head_dim,
-                pt_seq_len=hw_seq_len,
+                pt_seq_len=base_seq_len,
+                ft_seq_len=hw_seq_len,
             )
         else:
             self.feat_rope = None

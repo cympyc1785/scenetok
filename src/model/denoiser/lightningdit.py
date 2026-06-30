@@ -55,6 +55,10 @@ class LightningDiTCfg:
     num_target_split: int=1
     camera_conditioning: Literal["add", "adaLN"] = "adaLN"
     input_shape: Union[int, Tuple[int], list[int]]= 16
+    # RoPE training grid for position interpolation at non-native resolution.
+    # None → no interpolation (RoPE built at input_shape grid, original). Set to
+    # the TRAINED input_shape (e.g. [8,8]) when running at a larger input_shape.
+    rope_pt_input_shape: Union[int, Tuple[int], list[int], None] = None
     gradient_checkpointing: bool=False
     pretrained_from: str | Path | None = None
     ckpt_path: str | Path | None = None
@@ -103,7 +107,8 @@ class LightningDiT(Denoiser[LightningDiTCfg]):
             frequency_embedding_size=cfg.kwargs.frequency_embedding_size,
             num_views=num_views,
             num_split=num_split,
-            causal_attention=cfg.causal_attention
+            causal_attention=cfg.causal_attention,
+            rope_pt_input_size=cfg.rope_pt_input_shape,
         )
         
         if self.pretrained_from is not None:
