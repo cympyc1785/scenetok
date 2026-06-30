@@ -1305,7 +1305,14 @@ def simple_wan_video_fn(
     scene_latent_tokens = None
     if scene_context is not None and scene_input_type != "none":
         scene_context = scene_context.to(dtype=latents.dtype, device=latents.device)
-        scene_context = dit.embed_scene_context(scene_context)
+        # `embed_scene_context` was never defined on WanModel — scene tokens arrive
+        # already projected to `model.dim` by the wrapper's `cnd_proj` (see
+        # diffusion_wrapper.preprocess_scene_tokens), and the per-block
+        # `scene_cross_attn = CrossAttention(model.dim)` expects model.dim KV. So
+        # this is an identity step; only apply a projection if a model actually
+        # defines one (guard keeps every scene_input_type path runnable).
+        if hasattr(dit, "embed_scene_context"):
+            scene_context = dit.embed_scene_context(scene_context)
         if scene_input_type == "new_cross_attention":
             cross_attention_scene_context = scene_context
         elif scene_input_type == "controlnet":

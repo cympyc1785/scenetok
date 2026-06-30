@@ -1,0 +1,58 @@
+defaults:
+  - view_sampler: bounded
+
+name: scene_decoupled
+root: null  # set to ./DATA/Scene-Decoupled-Video-dataset
+
+# Wan VAE temporal downsample (4); short 81-frame clips → no 4N+1 chunk packing.
+view_sampler:
+  temporal_downsample: 4
+  chunk_targets: false
+
+shape: [256, 256]
+# Context (scene compressor) vs target (denoiser) spatial layouts; null → shape.
+context_shape: null
+target_shape: null
+precomputed_latents:
+  context: false
+  target: false
+
+augment: false
+cameras_are_circular: false
+fps: 15
+
+# ── Decoupled context/target sourcing ────────────────────────────────────────
+# context (scene tokens) = wohuman background; target (generated) = whuman subject.
+# Same scene_id + same trajectory; cameras are byte-identical across categories.
+decoupled_context: true
+context_category: wohuman
+target_category: whuman
+
+# ── Camera (Unreal CineCamera) ───────────────────────────────────────────────
+# 24 mm lens, 36 mm filmback → normalized intrinsics (principal point centered).
+focal_mm: 24.0
+sensor_width_mm: 36.0
+# Unreal cam axes (x-fwd,y-right,z-up, LH, cm) → OpenCV (x-right,y-down,z-fwd) +
+# right-handed world + per-scene scene-radius normalization. Flags mirror
+# dataset_dynamicverse's validated, tunable camera handling.
+convert_unreal_to_opencv: true
+flip_world_handedness: true
+normalize_scene_scale: true
+
+# ── Text ─────────────────────────────────────────────────────────────────────
+# text/whuman/<scene_id>/action.json. `caption_action_only` keeps text to the
+# foreground motion (scene comes from tokens); `caption` is full scene+action.
+prompt_file: action.json
+prompt_key: caption_action_only
+require_prompt: true
+force_empty_text: false
+
+# ── Split ────────────────────────────────────────────────────────────────────
+# Last `num_val_scenes` scene_ids (sorted) held out for validation; val_seen
+# routes the tail (first half = standard, second half = unseen).
+num_val_scenes: 64
+val_seen: true
+max_frames: 81
+
+baseline_epsilon: 1e-3
+make_baseline: false

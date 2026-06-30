@@ -13,6 +13,7 @@ from .dataset_re10k import DatasetRE10k, DatasetRE10kCfg
 from .dataset_latent import DatasetLatent, DatasetLatentCfg
 from .dataset_davis import DatasetDAVIS, DatasetDAVISCfg
 from .dataset_dynamicverse import DatasetDynamicverse, DatasetDynamicverseCfg
+from .dataset_scene_decoupled import DatasetSceneDecoupled, DatasetSceneDecoupledCfg
 from .dataset_multi import MultiDataset, MultiDatasetCfg
 
 
@@ -23,6 +24,7 @@ DATASETS: dict[str, Dataset] = {
     "latent": DatasetLatent,
     "davis": DatasetDAVIS,
     "dynamicverse": DatasetDynamicverse,
+    "scene_decoupled": DatasetSceneDecoupled,
 }
 
 # name → typed cfg dataclass, for manually parsing MultiDataset sub-configs
@@ -33,6 +35,7 @@ DATASET_CFG_BY_NAME = {
     "latent": DatasetLatentCfg,
     "davis": DatasetDAVISCfg,
     "dynamicverse": DatasetDynamicverseCfg,
+    "scene_decoupled": DatasetSceneDecoupledCfg,
 }
 
 
@@ -42,6 +45,7 @@ DatasetCfg = (
     | DatasetRE10kCfg
     | DatasetDAVISCfg
     | DatasetDynamicverseCfg
+    | DatasetSceneDecoupledCfg
     | MultiDatasetCfg
 )
 
