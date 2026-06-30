@@ -126,6 +126,8 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--fps", type=int, default=15)
+    ap.add_argument("--num_target_views", type=int, default=None,
+                    help="override view_sampler.num_target_views (va-vdc needs 8; va-wan leaves None)")
     ap.add_argument("--only", default=None, help="comma-sep substring filter of subdir names")
     ap.add_argument("--skip_existing", action="store_true",
                     help="skip subdirs whose out generated.mp4 already exists")
@@ -158,6 +160,17 @@ def main():
     wrapper, loader, device, precision = build_model(margs)
     if hasattr(wrapper, "sampler") and hasattr(wrapper.sampler, "log_vis"):
         wrapper.sampler.log_vis = lambda *a, **kw: None
+    # Some experiments (e.g. va-vdc video models) leave view_sampler.num_target_views
+    # unset (=0) in the config → the autoregressive sampler's `concurrency` is 0 and
+    # `clean_targets >= concurrency` errors. Allow overriding it (va-vdc uses 8).
+    if args.num_target_views:
+        try:
+            from omegaconf import OmegaConf
+            OmegaConf.set_struct(wrapper.dataset_cfg.view_sampler, False)
+        except Exception:
+            pass
+        wrapper.dataset_cfg.view_sampler.num_target_views = args.num_target_views
+        print(f"[regen] set view_sampler.num_target_views = {args.num_target_views}")
     cache = build_scene_cache(loader)
     print(f"[regen] scene cache: {len(cache)} scenes")
 
