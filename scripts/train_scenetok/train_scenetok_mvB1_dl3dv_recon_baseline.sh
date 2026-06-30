@@ -1,8 +1,8 @@
-config=custom/lagernvs_va-wan_dl3dv_recon
+config=custom/scenetok_mvB1_va-wan_dl3dv_recon_baseline
 num_workers=8
 gpus=1
 num_nodes=1
-exp_name="lagernvs_va-wan_dl3dv_recon_stage_a"
+exp_name="scenetok_mvB1_va-wan_dl3dv_recon_baseline"
 
 
 # WANDB_API_KEY 는 커밋 파일에 하드코딩 금지 — 실행 전 env 에 키 export.
@@ -10,7 +10,7 @@ exp_name="lagernvs_va-wan_dl3dv_recon_stage_a"
 : "${WANDB_API_KEY:?set WANDB_API_KEY in env before running}"
 export DEBUG=1
 
-CUDA_VISIBLE_DEVICES=3 python -m src.main +experiment=${config} \
+CUDA_VISIBLE_DEVICES=1 python -m src.main +experiment=${config} \
   data_loader.train.num_workers=${num_workers} \
   mode=train \
   trainer.devices=${gpus} \
