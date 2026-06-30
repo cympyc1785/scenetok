@@ -138,12 +138,14 @@ def build_model(args):
 
     shape = [int(x) for x in args.model_shape.split(",")]
 
+    extra_overrides = list(getattr(args, "extra_overrides", None) or [])
+
     def _compose(eval_sampler: bool):
         with initialize_config_dir(config_dir=str(REPO / "config"), version_base=None):
             cfg_dict = compose(
                 config_name="main",
                 overrides=[f"+experiment={args.model_experiment}", "dataset=dl3dv",
-                           "mode=test", "wandb.activated=false"],
+                           "mode=test", "wandb.activated=false"] + extra_overrides,
             )
         OmegaConf.set_struct(cfg_dict, False)
         for key in ("context_root", "target_root", "map_dict"):
@@ -190,6 +192,20 @@ def build_model(args):
         mode="test")
     state = torch.load(Path(args.model_ckpt), map_location="cpu", weights_only=False)
     sd = state["state_dict"] if "state_dict" in state else state
+    # Drop resolution-dependent DETERMINISTIC positional buffers (RoPE freqs /
+    # pos_embed) whose shape mismatches the current model — they are recomputed
+    # at __init__ for the configured grid, so the ckpt copy is not needed. Without
+    # this, running a ckpt at a non-native resolution dies on a size-mismatch
+    # (load_state_dict(strict=False) does NOT silence size mismatches).
+    model_sd = wrapper.state_dict()
+    _dropped = [k for k, v in sd.items()
+                if k in model_sd and tuple(v.shape) != tuple(model_sd[k].shape)
+                and any(t in k for t in ("feat_rope", "freqs", "rope", "pos_embed"))]
+    for k in _dropped:
+        del sd[k]
+    if _dropped:
+        print(f"[viser-model] dropped {len(_dropped)} res-dependent pos buffers "
+              f"(recomputed at __init__): e.g. {_dropped[:3]}")
     missing, unexpected = wrapper.load_state_dict(sd, strict=False)
     print(f"[viser-model] state_dict: missing={len(missing)} unexpected={len(unexpected)}")
     wrapper.eval().to(args.device)

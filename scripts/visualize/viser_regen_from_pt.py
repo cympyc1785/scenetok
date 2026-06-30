@@ -128,6 +128,10 @@ def main():
     ap.add_argument("--fps", type=int, default=15)
     ap.add_argument("--num_target_views", type=int, default=None,
                     help="override view_sampler.num_target_views (va-vdc needs 8; va-wan leaves None)")
+    ap.add_argument("--override", action="append", default=[],
+                    help="extra hydra override(s) passed to build_model compose, e.g. "
+                         "--override model.compressor.input_shape=[32,32] (repeatable). "
+                         "Needed to run a ckpt at a non-native resolution.")
     ap.add_argument("--only", default=None, help="comma-sep substring filter of subdir names")
     ap.add_argument("--skip_existing", action="store_true",
                     help="skip subdirs whose out generated.mp4 already exists")
@@ -155,7 +159,7 @@ def main():
         model_experiment=args.model_experiment, model_ckpt=args.model_ckpt,
         model_shape=args.model_shape, eval_index=args.eval_index,
         infer_steps=args.infer_steps, cfg_scale=args.cfg_scale, seed=args.seed,
-        device=args.device,
+        device=args.device, extra_overrides=args.override,
     )
     wrapper, loader, device, precision = build_model(margs)
     if hasattr(wrapper, "sampler") and hasattr(wrapper.sampler, "log_vis"):
