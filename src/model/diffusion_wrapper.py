@@ -233,6 +233,10 @@ def derive_shape_dependent_fields(dataset_cfg: DatasetCfg, model_cfg: ModelCfg) 
     compressor_cfg = getattr(model_cfg, "compressor", None)
     if compressor_cfg is None:
         return
+    # LagerNVS consumes raw RGB through its own frozen VGGT encoder and has no
+    # latent `input_shape` / camera / patch grid to derive — skip cleanly.
+    if not hasattr(compressor_cfg, "input_shape"):
+        return
     context_latent = get_context_latent_shape(dataset_cfg, model_cfg)
     if context_latent is None:
         return
@@ -356,8 +360,15 @@ class DiffusionWrapper(LightningModule):
             cond_dim = self.compressor.output_dim
             num_scene_tokens = self.compressor.num_scene_tokens
         else:
-            cond_dim = 64   
+            cond_dim = 64
             num_scene_tokens = 256
+
+        # LagerNVS consumes RAW RGB context (its own frozen VGGT encoder); SceneTok
+        # compressors consume VA/Wan latents. Toggle which view the compressor gets.
+        self.compressor_raw_rgb = (
+            model_cfg.compressor is not None
+            and getattr(model_cfg.compressor, "name", None) == "lagernvs_compressor"
+        )
         
         temporal_downsample = 1
         if getattr(model_cfg.autoencoders, "target") is not None:
@@ -636,18 +647,30 @@ class DiffusionWrapper(LightningModule):
 
 
 
-    @torch.no_grad()
-    def generate_batch_with_scene(self, batch, sampler: Sampler, repeat_factor: int=1):
-        
-        context_latents = get_latents(
+    def _compressor_context_view(self, batch):
+        """View tensor handed to the compressor.
+
+        LagerNVS encodes raw RGB context (its frozen VGGT); SceneTok compressors
+        operate on VA/Wan context latents. Raw frames live under
+        `batch["context"]["latent"]` in [0,1] (the dataset key is historically named
+        "latent" even when un-precomputed).
+        """
+        if self.compressor_raw_rgb:
+            return batch["context"]["latent"]
+        return get_latents(
             autoencoder=self.autoencoder,
-            inputs=batch["context"], 
+            inputs=batch["context"],
             view_type="context",
             precomputed_latents=self.dataset_cfg.precomputed_latents,
             autoencoder_name=getattr(self.model_cfg.autoencoders, "context").name,
             scaling_factor=getattr(self.model_cfg.autoencoders, "context").kwargs.scaling_factor,
             chunk_targets=getattr(self.dataset_cfg.view_sampler, "chunk_targets", True),
         )
+
+    @torch.no_grad()
+    def generate_batch_with_scene(self, batch, sampler: Sampler, repeat_factor: int=1):
+
+        context_latents = self._compressor_context_view(batch)
 
         target = repeat_batch(batch["target"], repeat_factor)
         device = context_latents.device
@@ -872,17 +895,10 @@ class DiffusionWrapper(LightningModule):
         token_mask = None
         if conditional_tokens and self.model_cfg.compressor is not None:
             # Get latents if input is rgb otherwise scale latents by the scaling_factor
-            # In case of VA-VAE, scale and shift by the predefined latent statistics
-            context_latents = get_latents(
-                autoencoder=self.autoencoder,
-                inputs=batch["context"], 
-                view_type="context",
-                precomputed_latents=self.dataset_cfg.precomputed_latents,
-                autoencoder_name=getattr(self.model_cfg.autoencoders, "context").name,
-                scaling_factor=getattr(self.model_cfg.autoencoders, "context").kwargs.scaling_factor,
-                chunk_targets=getattr(self.dataset_cfg.view_sampler, "chunk_targets", True),
-            )
-            
+            # In case of VA-VAE, scale and shift by the predefined latent statistics.
+            # LagerNVS bypasses VA encoding and consumes raw RGB context directly.
+            context_latents = self._compressor_context_view(batch)
+
             b, v_c, *_ = context_latents.shape
             # Experimental: masking context views until min context views
             if self.model_cfg.mask_context and np.random.choice([True, False], p=[0.4, 0.6]):
@@ -1437,7 +1453,9 @@ class DiffusionWrapper(LightningModule):
 
     def on_train_batch_start(self, batch, batch_idx):
         step = self.global_step
-        if step >= self.model_cfg.compressor.freeze_after and self.model_cfg.compressor.freeze_after != -1 and not self.frozen_compressor:
+        # `freeze_after` is an MVAE-only scheduling knob; LagerNVS (always frozen) lacks it.
+        freeze_after = getattr(self.model_cfg.compressor, "freeze_after", -1)
+        if step >= freeze_after and freeze_after != -1 and not self.frozen_compressor:
             print(f"[INFO] Freezing Compressor after {step} steps!")
             freeze(self.compressor)
             self.frozen_compressor = True

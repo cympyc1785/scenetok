@@ -33,9 +33,15 @@ if "warp" not in sys.modules:
     _stub.init = lambda: None  # type: ignore[attr-defined]
     sys.modules["warp"] = _stub
 
-from src.model.GEN3C.cosmos_predict1.diffusion.inference.forward_warp_utils_pytorch import (
-    forward_warp,
-)
+# GEN3C is a vendored, gitignored dependency that may be absent in checkouts that
+# don't exercise the GEN3C warping path (e.g. SceneTok/LagerNVS recon). Import it
+# lazily so this module — and `src.main`, which pulls it in transitively via
+# t2v_wrapper — loads regardless; only `multi_view_warp_to_target` needs it.
+def _import_forward_warp():
+    from src.model.GEN3C.cosmos_predict1.diffusion.inference.forward_warp_utils_pytorch import (
+        forward_warp,
+    )
+    return forward_warp
 
 
 @torch.no_grad()
@@ -117,6 +123,7 @@ def multi_view_warp_to_target(
     flat_tgt_w2cs = target_w2c_b1.reshape(B * V, 4, 4)
     flat_tgt_intrs = target_intr_b1.reshape(B * V, 3, 3)
 
+    forward_warp = _import_forward_warp()
     warped, mask, *_ = forward_warp(
         frame1=flat_imgs,
         mask1=None,

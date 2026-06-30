@@ -1,0 +1,13 @@
+# LagerNVS reconstructor as a frozen scene encoder (Stage A, dense-direct).
+# No camera/kwargs subgroups: the frozen VGGT reconstructor builds its own
+# scale-only camera token and produces dense rec_tokens fed straight to the
+# denoiser's scene cross-attention (cnd_proj handles cond_dim 768 -> inner).
+name: lagernvs_compressor
+ckpt_path: /data1/cympyc1785/lagernvs/checkpoints/lagernvs_general_512/model.pt
+token_dim: 768
+# nominal count = num_context_views * patches_per_view (16 * 777 @ 256x448);
+# cross-attention handles the actual KV length, this only sizes the null tokens.
+num_scene_tokens: 12432
+scene_token_projection: simple
+img_norm: zero_one
+load_strict: false
