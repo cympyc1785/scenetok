@@ -48,6 +48,10 @@ class WanTI2VLoRACfg:
     alpha: int | None = None
     target_modules: str = "q,k,v,o,ffn.0,ffn.2"
     checkpoint: str | Path | None = None
+    # By default LoRA is skipped when scene_input_type=="new_cross_attention"
+    # (that path uses trainable scene_cross_attn as the adapter). Set True to ALSO
+    # inject LoRA there — e.g. camchannel + self-attn-only LoRA probe (Condition B).
+    allow_with_new_ca: bool = False
 
 
 @dataclass
@@ -706,7 +710,8 @@ class WanTI2V5BDenoiser(Denoiser[WanTI2V5BCfg]):
             clean=cfg.clean,
         )
 
-        if cfg.lora.enabled and cfg.scene_input_type != "new_cross_attention":
+        if cfg.lora.enabled and (cfg.scene_input_type != "new_cross_attention"
+                                 or cfg.lora.allow_with_new_ca):
             self._enable_lora(cfg.lora)
         if cfg.ckpt_path is not None:
             self.load_weights(cfg.ckpt_path, strict=cfg.load_strict)
