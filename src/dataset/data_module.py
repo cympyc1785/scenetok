@@ -182,6 +182,10 @@ class DataModule(LightningDataModule):
 
             if dataset_cfg.name in {"dl3dv", "re10k"}:
                 dataset_cfg.val_seen = key != "unseen"
+            elif dataset_cfg.name == "scene_decoupled":
+                # Held-out tail split (num_val_scenes): val.standard = first half,
+                # val.unseen = second half. No evaluation index (deterministic tail).
+                dataset_cfg.val_seen = key != "unseen"
             elif dataset_cfg.name == "dynamicverse":
                 # Route train + val.standard to the "seen" pool (all subdatasets
                 # except `unseen_subdatasets`); val.unseen pulls from the held-out
