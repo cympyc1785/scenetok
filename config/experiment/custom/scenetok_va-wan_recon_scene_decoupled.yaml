@@ -33,8 +33,12 @@ dataset:
   decoupled_context: false
   target_category: wohuman
 
-  # va-wan_dl3dv compressor 는 DL3DV KNOWN_BUG(context focal ≈×15/×8.4)로 학습됨.
-  # 미적용 시 context intrinsic 이 ~18× OOD → recon PSNR 10.8dB. 적용 시 17.7dB.
+  # ⚠️ recon 전용. va-wan_dl3dv 의 COMPRESSOR+DECODER 둘 다 DL3DV KNOWN_BUG(context
+  # focal ≈×15/×8.4)로 학습돼, 이 roundtrip 을 in-distribution 으로 보려면 켜야 함
+  # (off=10.8dB, on=17.7dB). ★ controlnet 학습(scene_decoupled/dynamicverse)에는
+  # 적용하지 말 것 — dynamicverse 는 이 flag OFF(normalized fx≈0.93)로 학습해 정상
+  # 동작하며, controlnet 은 frozen compressor 의 OOD 토큰에 적응 학습됨. 학습 config
+  # 와 recon eval 을 일부러 다르게 둔 것(recon 은 DL3DV decoder 를 쓰기 때문).
   scale_context_focal_by_256: true
 
   view_sampler:
