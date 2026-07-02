@@ -97,6 +97,11 @@ checkpointing:
   resume: false
   every_n_train_steps: null # Set to null to only save at the end of training for SLURM Job Arrays. Set to an int value to save checkpoints every n steps.
   save_top_k: 1
+  # Fixed checkpoint filename (no {epoch}/{step}) so each save OVERWRITES the same
+  # file → prevents accumulation across resumes (a fresh ModelCheckpoint per resume
+  # otherwise leaves old `epoch=N-step=M.ckpt` files undeleted). With save_last=True
+  # the dir keeps exactly: <filename>.ckpt + last.ckpt.
+  filename: checkpoint
   dirpath: null
 
 train:

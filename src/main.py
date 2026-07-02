@@ -137,6 +137,7 @@ def train(cfg_dict: DictConfig):
         callbacks.append(
             ModelCheckpoint(
                 checkpoint_dir,
+                filename=getattr(cfg.checkpointing, "filename", None),
                 every_n_train_steps=cfg.checkpointing.every_n_train_steps,
                 save_top_k=cfg.checkpointing.save_top_k,
                 save_last=True,
