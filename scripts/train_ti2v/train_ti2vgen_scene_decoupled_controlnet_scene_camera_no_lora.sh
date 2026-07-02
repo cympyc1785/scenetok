@@ -17,7 +17,9 @@ config=custom/scenetok_va-wan-ti2v_scene_decoupled
 num_workers=4
 gpus=1
 num_nodes=1
-exp_name="va-wan-ti2v_scene_decoupled_controlnet_scene_camera_no_lora"
+# compressor를 unscaled-trained ckpt로 교체 (scene_decoupled normalized intrinsic in-distribution). exp_name += _unscaledcomp.
+compressor_ckpt=checkpoints/va-wan_dl3dv_256-480_unscaled_intrins.ckpt
+exp_name="va-wan-ti2v_scene_decoupled_controlnet_scene_camera_no_lora_unscaledcomp"
 
 # ── Condition routing ─────────────────────────────────────────────────────
 scene_input_type=controlnet
@@ -55,6 +57,7 @@ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-2} exec -a scdec_ctrl_scenetok_lets
   model.denoiser.scene_input_type=${scene_input_type} \
   model.denoiser.camera_input_type=${camera_input_type} \
   model.denoiser.condition_latents_input_type=${condition_latents_input_type} \
+  model.compressor.ckpt_path=${compressor_ckpt} \
   model.denoiser.ac3d_num_layers=${ac3d_num_layers} \
   model.denoiser.lora.enabled=${lora_enabled} \
   model.denoiser.lora.rank=${lora_rank} \

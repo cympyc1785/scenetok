@@ -1,0 +1,119 @@
+# @package _global_
+#
+# SceneTok recon 을 Scene-Decoupled wohuman 에 돌려보는 config — 단, **scale OFF 로
+# 학습된** unscaled-intrinsic 체크포인트(`va-wan_dl3dv_256-480_unscaled_intrins.ckpt`,
+# context 256×448 / target 480×832, step50000) 사용. 이 compressor 는 정규화된
+# intrinsic(fx≈0.67)이 IN-DISTRIBUTION 이므로 `scale_context_focal_by_256=false`.
+# scaled ckpt(va-wan_dl3dv_256x448) 대비 "scaling 없이도 recon 잘 되는가" 확인용.
+# mode=test → wrapper.test_step(preprocess_batch index=v_c//2) 로 predicted/gt/context 저장.
+
+defaults:
+  - override /dataset: scene_decoupled
+  - override /dataset/view_sampler: bounded
+  - override /model/scheduler: rf
+  - override /model/denoiser: lightningdit_L_1
+  - override /model/autoencoders/context: va
+  - override /model/autoencoders/target: wan
+  - override /model/compressor: mv_B1
+  - override /model/compressor/camera: ray
+  - override /model/compressor/camera/embedding: lvsm
+  - override /model/denoiser/camera: ray
+  - override /model/denoiser/camera/embedding: lvsm
+
+dataset:
+  root: ./DATA/Scene-Decoupled-Video-dataset
+  context_shape: [256, 448]
+  target_shape: [480, 832]
+
+  # RECON: context/target 모두 wohuman.
+  decoupled_context: false
+  target_category: wohuman
+
+  # unscaled ckpt 이므로 절대 켜지 말 것 (정규화 intrinsic 이 in-distribution).
+  scale_context_focal_by_256: false
+
+  view_sampler:
+    num_context_views: 16
+    num_target_views: 10
+    min_distance_between_context_views: 8
+    max_distance_between_context_views: 40
+    initial_min_distance_between_context_views: 8
+    initial_max_distance_between_context_views: 40
+    chunk_targets: false
+    offset: 1
+    temporal_downsample: 4
+
+val:
+  video_length: 34
+  window_shift: 5
+
+sampler:
+  clean_targets: 5
+
+freeze:
+  denoiser: true
+  compressor: true
+
+model:
+  text_encoder: null
+
+  scheduler:
+    sampling_type: random_uniform
+    num_inference_steps: 25
+    kwargs:
+      weighting: shifted
+      timestep_shift: 8
+
+  denoiser:
+    ckpt_path: checkpoints/va-wan_dl3dv_256-480_unscaled_intrins.ckpt
+    load_strict: false
+    input_shape: [30, 52]
+    gradient_checkpointing: true
+    num_target_split: 1
+    camera:
+      input_shape: [240, 416]
+      embedding:
+        patch_size: 8
+        in_channels: 24
+    kwargs:
+      use_rope_3d: true
+      in_channels: 48
+
+  compressor:
+    ckpt_path: checkpoints/va-wan_dl3dv_256-480_unscaled_intrins.ckpt
+    load_strict: false
+    kl_weights: [1e-10, 1e-10]
+    input_shape: [16, 28]
+    num_scene_tokens: 1024
+    causal_self_atten: false
+    gradient_checkpointing: true
+    token_dim: 64
+    init_large: true
+    camera_conditioning: adaLN
+    scene_token_projection: kl
+    mask_context: false
+    camera:
+      input_shape: [128, 224]
+      embedding:
+        patch_size: 16
+    kwargs:
+      use_rope_2d: true
+      use_rope_3d: false
+      patch_size: 2
+
+trainer:
+  precision: bf16-mixed
+  limit_test_batches: 6
+
+optimizer:
+  name: AdamW
+  lr: 1.0e-5
+  scale_lr: false
+  milestones: [2000]
+  scheduler:
+    - name: LinearLR
+      frequency: 1
+      interval: step
+      kwargs:
+        start_factor: 5.e-4
+        total_iters: 2000

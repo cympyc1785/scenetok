@@ -15,7 +15,11 @@ config=custom/scenetok_va-wan-ti2v_dynamicverse
 num_workers=4
 gpus=1
 num_nodes=1
-exp_name="va-wan-ti2v_dynamicverse_dynamic_controlnet_scene_camera_2_no_lora_effecterase_v2"
+# compressor: scaled-trained va-wan_dl3dv_256x448 → unscaled-trained ckpt로 교체.
+# dynamicverse는 normalized intrinsic(scale off)을 먹이는데 기존 scaled compressor엔
+# OOD였음 → unscaled compressor는 in-distribution. exp_name += _unscaledcomp (새 wandb run).
+compressor_ckpt=checkpoints/va-wan_dl3dv_256-480_unscaled_intrins.ckpt
+exp_name="va-wan-ti2v_dynamicverse_dynamic_controlnet_scene_camera_2_no_lora_effecterase_v2_unscaledcomp"
 
 scene_input_type=controlnet
 camera_input_type=controlnet
@@ -47,6 +51,7 @@ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} exec -a effecterase_scenetok_let
   model.denoiser.scene_input_type=${scene_input_type} \
   model.denoiser.camera_input_type=${camera_input_type} \
   model.denoiser.condition_latents_input_type=${condition_latents_input_type} \
+  model.compressor.ckpt_path=${compressor_ckpt} \
   model.denoiser.lora.enabled=${lora_enabled} \
   model.denoiser.lora.rank=${lora_rank} \
   model.denoiser.lora.alpha=${lora_alpha} \
