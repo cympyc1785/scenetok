@@ -123,6 +123,12 @@ class DatasetDynamicverseCfg(DatasetCfgCommon):
     # normalized 가정 (center_crop이 `*= w_in/w_out` 로 fx 업데이트하는데, 이는
     # normalized 일 때만 유효).
     normalize_intrinsics: bool = True
+    # va-wan_dl3dv(256x448) compressor 호환용(KNOWN_BUG, dataset_dl3dv와 동일 factor):
+    # 그 compressor 는 context focal 이 ×3840/256(fx)·×2160/256(fy)≈×15/×8.4 부풀려진
+    # DL3DV intrinsic 으로 학습됨. dynamicverse 는 normalized fx≈0.93 을 주므로 그
+    # compressor 엔 OOD. True 면 CONTEXT intrinsic 에만 같은 factor 적용해 in-distribution.
+    # 기본 False = 기존 동작 불변(현재 학습은 unscaled compressor ckpt 사용).
+    scale_context_focal_by_256: bool = False
     # Option B (scene-radius normalization): subtract camera centroid, divide by max
     # camera distance from centroid → 모든 cam origin이 unit sphere 안에. subdataset
     # 별 scale 편차(spring 0.001 ~ MVS-Synth 5)를 균질화. DL3DV pre-normalized 데이터와
@@ -377,6 +383,11 @@ class DatasetDynamicverse(Dataset):
         target_extrinsics = extrinsics.clone()
         context_intrinsics = intrinsics.clone()
         target_intrinsics = intrinsics.clone()
+
+        # va-wan_dl3dv compressor 호환: CONTEXT focal 만 DL3DV 학습 스케일로 (dataset_dl3dv:537 동일).
+        if getattr(self.cfg, "scale_context_focal_by_256", False):
+            context_intrinsics[..., 0, 0] *= 3840 / 256
+            context_intrinsics[..., 1, 1] *= 2160 / 256
 
         # For stage in {val, test} with an eval index loaded, use its fixed
         # context/target indices (DL3DV pattern). Otherwise call the view
