@@ -99,6 +99,13 @@ class DatasetSceneDecoupledCfg(DatasetCfgCommon):
     # Per-view-type shape overrides (fall back to `shape` when None).
     context_shape: list[int] | None = None
     target_shape: list[int] | None = None
+    # va-wan_dl3dv compressor 호환용(KNOWN_BUG, dataset_dl3dv와 동일 factor): 이
+    # 체크포인트의 compressor 는 context focal 이 3840/256(fx)·2160/256(fy) 만큼
+    # 부풀려진(≈×15/×8.4) DL3DV intrinsic 으로 학습됨. scene_decoupled 의 올바르게
+    # 정규화된 intrinsic(fx≈0.67)을 그대로 주면 context camera ray 스케일이 ~18×
+    # OOD → scene token 저하. True 면 CONTEXT intrinsic 에만 같은 factor 적용해
+    # 학습 분포에 맞춤. 기본 False = 기존 동작 불변.
+    scale_context_focal_by_256: bool = False
 
 
 # OpenCV-cam basis vectors expressed in Unreal-cam coords (columns):
@@ -247,6 +254,11 @@ class DatasetSceneDecoupled(Dataset):
         target_extrinsics = extrinsics.clone()
         context_intrinsics = intrinsics.clone()
         target_intrinsics = intrinsics.clone()
+
+        # va-wan_dl3dv compressor 호환: CONTEXT focal 만 DL3DV 학습 스케일로 (dataset_dl3dv:537 동일).
+        if self.cfg.scale_context_focal_by_256:
+            context_intrinsics[..., 0, 0] *= 3840 / 256
+            context_intrinsics[..., 1, 1] *= 2160 / 256
 
         view_indices, _ = self.view_sampler.sample(
             num_views=num_views,

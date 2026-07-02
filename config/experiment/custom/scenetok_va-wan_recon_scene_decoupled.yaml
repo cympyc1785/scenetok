@@ -33,6 +33,10 @@ dataset:
   decoupled_context: false
   target_category: wohuman
 
+  # va-wan_dl3dv compressor 는 DL3DV KNOWN_BUG(context focal ≈×15/×8.4)로 학습됨.
+  # 미적용 시 context intrinsic 이 ~18× OOD → recon PSNR 10.8dB. 적용 시 17.7dB.
+  scale_context_focal_by_256: true
+
   view_sampler:
     num_context_views: 16
     num_target_views: 10
