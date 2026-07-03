@@ -223,14 +223,22 @@ class SceneGenEngine:
         from src.model.diffusion import get_latents
         from src.model.sampler.full_sequence import FullSequenceSampler, FullSequenceSamplerCfg
         b = self.batch
+        # Conditioning views = num_cond UNIFORM(diverse) views over the target
+        # sequence (generalizes the notebook's [0,-1,-1]; num_cond=1 → frame 0).
+        # ⚠️ SceneGen was trained/evaluated with max_cond_number=3 ("a few images");
+        # num_cond>3 is out-of-distribution.
+        tgt = b["target"]; T_all = tgt["extrinsics"].shape[1]
+        nc = max(1, int(num_cond))
+        cond_idx = torch.linspace(0, T_all - 1, nc, device=tgt["extrinsics"].device).long()
+        cond = {k: tgt[k][:, cond_idx] for k in ("extrinsics", "intrinsics", "latent", "index")}
         cond_latents = get_latents(
-            autoencoder=self.autoencoders, inputs=b["cond"], view_type="context",
+            autoencoder=self.autoencoders, inputs=cond, view_type="context",
             precomputed_latents=self.dataset_cfg.precomputed_latents,
             autoencoder_name=self.autoencoders_cfg.context.name,
             scaling_factor=self.autoencoders_cfg.context.kwargs.scaling_factor,
         )
         anchor_pose = CameraInputs(intrinsics=b["context"]["intrinsics"], extrinsics=b["context"]["extrinsics"])
-        cond_pose = CameraInputs(intrinsics=b["cond"]["intrinsics"], extrinsics=b["cond"]["extrinsics"])
+        cond_pose = CameraInputs(intrinsics=cond["intrinsics"], extrinsics=cond["extrinsics"])
         device = cond_latents.device
         scene_sampler = FullSequenceSampler(FullSequenceSamplerCfg(name="full_sequence"))
         scene_sampler.set_scheduling_matrix(
@@ -240,8 +248,9 @@ class SceneGenEngine:
         scene_sampler.shift_scheduling_matrix(shift)
 
         x_t = torch.randn((1, self.num_scene_tokens, self.compressor.output_dim), device=device)
-        cond_mask = torch.zeros((1, self.dataset_cfg.view_sampler.max_cond_number), device=device, dtype=torch.bool)
-        cond_mask[:, :num_cond] = True
+        # cond_mask width = nc (all conditioning views attended). Bypasses the
+        # eval sampler's max_cond_number cap so num_cond>3 can be probed (OOD).
+        cond_mask = torch.ones((1, nc), device=device, dtype=torch.bool)
         with torch.no_grad():
             for m in range(scene_sampler.global_steps):
                 ts, _ = scene_sampler(m); ts_next, _ = scene_sampler(m + 1)
