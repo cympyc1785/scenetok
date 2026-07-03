@@ -284,10 +284,14 @@ class SceneGenEngine:
         c = self.autoencoders_cfg.target.kwargs.latent_channels
         h, w = self.denoiser_cfg.input_shape
         x_t = torch.randn((1, num, c, h, w), device=dev, dtype=self.tokens.dtype) * self.scheduler.init_noise_sigma
+        # clean_targets MUST match the canonical scenegen inference (notebook /
+        # infer_scenegen render() → sampler_cfg.clean_targets, =4 for re10k). 0 was
+        # wrong and degraded the sampling schedule ("무너짐").
         self.sampler.set_scheduling_matrix(
             horizon=num, steps=self.scheduler_cfg.num_inference_steps,
             concurrency=self.dataset_cfg.view_sampler.num_target_views, device=dev,
-            dtype=self.tokens.dtype, cond_mask_indices=None, clean_targets=0)
+            dtype=self.tokens.dtype, cond_mask_indices=None,
+            clean_targets=self.sampler_cfg.clean_targets)
         self.sampler.shift_scheduling_matrix(shift=self.scheduler_cfg.kwargs.timestep_shift or 1)
         cond_state = self.denoiser.cnd_proj(self.tokens)
         for m in range(self.sampler.global_steps):

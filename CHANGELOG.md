@@ -37,6 +37,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `scripts/concat_lagernvs_videos.py` — LagerNVS per-camera-sequence 렌더들을 조합별 **side-by-side concat 비교 영상(mp4 + gif)** 으로 생성. 가로 hcat(라벨 없음, 모두 37f·288×512). COMBOS 5종(orig-back-back_lot / orig-forward-forward_lot / orig-rotate_left-rotate_right / move_forward-back-left-right / rot_up-down-left-right) → `results/viser_generate/lagernvs_general_512/_concat/<name>.{mp4,gif}`.
 
 ### Fixed
+- **SceneGen viser 렌더러 `clean_targets` canonical 값으로 수정** (`viser_server_scenegen.py`) — render() 의 `set_scheduling_matrix(clean_targets=0)` 하드코딩이 canonical(notebook/infer_scenegen = `sampler_cfg.clean_targets`=4, full_sequence.yaml)과 달라 sampling schedule이 어긋나 출력이 무너졌음. `self.sampler_cfg.clean_targets` 사용으로 수정. README/notebook 세팅과 대조 결과 나머지(num_cond 1 / scene 150·shift12 / renderer 25·shift1 / cfg 1.0 / ctx12·tgt8 / re10k_c1_192 / cond·context 구성)는 전부 일치.
 - **checkpoint 누적 방지 fix가 실제로는 무동작이던 것 수정** — `CheckpointingCfg`(src/config.py) 에 `filename` 필드가 없어 `config/main.yaml`의 `filename: checkpoint`가 dacite 타입 변환에서 드롭 → `main.py`의 `getattr(cfg.checkpointing, "filename", None)`이 항상 None → ModelCheckpoint가 계속 `epoch=N-step=M.ckpt`로 저장(이전 커밋 b0bcd8e가 inert). `CheckpointingCfg.filename: Optional[str] = None` 추가로 실제 적용(검증: `cfg.checkpointing.filename == 'checkpoint'`). 이제 저장이 `checkpoint.ckpt`(+last.ckpt) 고정 → resume 누적/디스크 full crash 재발 방지. ⚠️ 현재 돌아가는 4개 학습은 이미 로드된 config라 재시작/resume 전까지는 미반영.
 
 ### Changed
