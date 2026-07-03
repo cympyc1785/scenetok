@@ -93,9 +93,11 @@ def run_lagernvs(payload_path, frames_out, gpu, target_size=512):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--scene", required=True)
-    ap.add_argument("--num_cond", type=int, default=5)
+    ap.add_argument("--scene", default=None)
+    ap.add_argument("--num_cond", type=int, default=5, help="context views for LagerNVS")
     ap.add_argument("--scenegen_mp4", required=True)
+    ap.add_argument("--poses_pt", default=None,
+                    help="viser poses.pt → use its target_c2w_rel(edited) as target trajectory")
     ap.add_argument("--re10k_root", default=DEFAULT_RE10K_ROOT)
     ap.add_argument("--eval_index", default="./assets/evaluation_index/re10k_c1_192.json")
     ap.add_argument("--gpu", default=None, help="CUDA_VISIBLE_DEVICES for LagerNVS worker")
@@ -104,10 +106,23 @@ def main():
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
-    imgs, ext, K = load_scene_batch(args.scene, args.re10k_root, args.eval_index)
-    T = ext.shape[0]
-    cond_idx = torch.linspace(0, T - 1, max(1, args.num_cond)).long()
-    print(f"[sg-vs-lager] scene={args.scene} T={T} num_cond={args.num_cond} cond_idx={cond_idx.tolist()}")
+    # target trajectory: from viser poses.pt (edited) if given, else the GT trajectory.
+    tgt_c2w = None; scene = args.scene
+    if args.poses_pt:
+        pp = torch.load(args.poses_pt, map_location="cpu", weights_only=False)
+        traj = pp.get("target_c2w_rel", pp.get("target_c2w_edited", pp.get("target_c2w")))
+        tgt_c2w = torch.as_tensor(np.asarray(traj), dtype=torch.float32)   # (Vt,4,4) rel ctx0
+        scene = pp.get("scene", scene)
+    assert scene is not None, "need --scene or a poses.pt with 'scene'"
+
+    imgs, ext, K = load_scene_batch(scene, args.re10k_root, args.eval_index)  # context imgs + K
+    if tgt_c2w is None:
+        tgt_c2w = ext
+    Vt = tgt_c2w.shape[0]
+    Kt = K[0].unsqueeze(0).repeat(Vt, 1, 1) if K.shape[0] != Vt else K       # normalized K per target
+    cond_idx = torch.linspace(0, ext.shape[0] - 1, max(1, args.num_cond)).long()
+    print(f"[sg-vs-lager] scene={scene} target_frames={Vt} (poses_pt={bool(args.poses_pt)}) "
+          f"num_cond={args.num_cond} cond_idx={cond_idx.tolist()}")
 
     # absolute paths: the LagerNVS worker runs with cwd=lagernvs repo, so payload /
     # context image / frames paths must be absolute.
@@ -122,9 +137,9 @@ def main():
     payload = work / "payload.pt"
     torch.save({"context_image_paths": ctx_paths,
                 "context_c2w": ext[cond_idx],              # (Vc,4,4) rel ctx0
-                "target_c2w": ext,                          # (T,4,4) rel ctx0 (same traj as SceneGen)
-                "target_intrinsics_norm": K,                # (T,3,3) normalized
-                "scene": args.scene}, payload)
+                "target_c2w": tgt_c2w,                      # (Vt,4,4) rel ctx0 (poses.pt edited or GT)
+                "target_intrinsics_norm": Kt,               # (Vt,3,3) normalized
+                "scene": scene}, payload)
     frames_out = work / "frames.pt"
     print(f"[sg-vs-lager] running LagerNVS general_512 @ {args.target_size}...")
     print("  ", run_lagernvs(payload, frames_out, args.gpu, args.target_size))
