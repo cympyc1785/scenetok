@@ -17,6 +17,12 @@ class CheckpointingCfg:
     save_top_k: int = 1
     every_n_train_steps: int | None = None
     dirpath: Optional[Path] = None
+    # Fixed ModelCheckpoint filename (no {epoch}/{step}) → each save overwrites the
+    # same file, preventing epoch=N-step=M.ckpt accumulation across resumes (the
+    # disk-full crash cause). config/main.yaml sets this to "checkpoint"; without
+    # the dataclass field, dacite dropped it and main.py's getattr fell back to
+    # None → default epoch=step naming (fix b0bcd8e was inert).
+    filename: Optional[str] = None
 
 
 @dataclass
