@@ -486,7 +486,26 @@ def run_viser(engine, args):
             except Exception as ge: print("gif fail", ge)
             torch.save({"target_c2w_rel": torch.tensor(S["tgt_poses"], dtype=torch.float32),
                         "scene": gui_scene.value.strip()}, out / "poses.pt")
-            gui_status.value = f"saved → {out.name}/generated.mp4 {tuple(frames.shape)}"
+            # Capture the viser 3D scene from each connected client's viewpoint.
+            shots = 0
+            try:
+                clients = server.get_clients()
+                from PIL import Image
+                for cid, cl in clients.items():
+                    try:
+                        asp = float(getattr(cl.camera, "aspect", 0) or 0)
+                        h = 900; wpx = int(round(h * asp)) if asp > 0 else 1600
+                        img = cl.get_render(height=h, width=wpx, transport_format="png")
+                        nm = "viser_screenshot.png" if len(clients) == 1 else f"viser_screenshot_client{cid}.png"
+                        Image.fromarray(img).save(out / nm); shots += 1
+                    except Exception as ce:
+                        print(f"[scenegen-viser] screenshot client {cid} failed: {ce}")
+                if not clients:
+                    print("[scenegen-viser] no connected client → no screenshot")
+            except Exception as se:
+                print("[scenegen-viser] screenshot error:", se)
+            gui_status.value = (f"saved → {out.name}/generated.mp4 {tuple(frames.shape)}"
+                                f"{f' + {shots} screenshot' if shots else ''}")
             print("[scenegen-viser]", gui_status.value)
         except Exception as e:
             import traceback; traceback.print_exc(); gui_status.value = f"render ERROR: {e}"

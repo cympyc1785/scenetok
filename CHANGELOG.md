@@ -37,6 +37,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `scripts/concat_model_compare.py` — SceneTok(위) vs LagerNVS(아래) **2×N 모델 비교 grid 영상(mp4 + gif)**. 폴더 suffix로 두 모델 렌더를 매칭(컬럼=combo 카메라 시퀀스), 공통 셀 256×448로 리사이즈(SceneTok 256×448 vs LagerNVS 288×512) 후 행별 hcat + 행간 vcat. 라벨 없음. 5종 combo → `results/viser_generate/_compare_scenetok_lagernvs/<name>.{mp4,gif}`.
 - `scripts/concat_lagernvs_videos.py` — LagerNVS per-camera-sequence 렌더들을 조합별 **side-by-side concat 비교 영상(mp4 + gif)** 으로 생성. 가로 hcat(라벨 없음, 모두 37f·288×512). COMBOS 5종(orig-back-back_lot / orig-forward-forward_lot / orig-rotate_left-rotate_right / move_forward-back-left-right / rot_up-down-left-right) → `results/viser_generate/lagernvs_general_512/_concat/<name>.{mp4,gif}`.
 
+### Added
+- **SceneGen viser: Render 시 viser 3D 화면 스크린샷 저장 복원** (`viser_server_scenegen.py`) — dl3dv viser_server와 동일하게 render() 끝에 연결된 각 client의 `get_render`로 3D 뷰를 캡쳐해 출력 폴더에 `viser_screenshot.png`(다중 client면 `_client{id}`) 저장. 생성 mp4/gif/poses.pt와 함께.
+
 ### Changed
 - **SceneGen viser: 조건뷰(cond)를 `num_cond`개 균등-다양 뷰로 일반화** (`viser_server_scenegen.py`) — 기존 `[0,-1,-1]`(첫+끝 2종) 하드코딩 → target 시퀀스에서 `linspace`로 num_cond개 뽑아 전부 cond_mask=True로 attend. num_cond=1은 프레임0(노트북과 동일). ⚠️ 모델은 `max_cond_number=3`("a few images")로 학습돼 num_cond>3은 OOD(cond_mask 폭을 num_cond로 잡아 mechanically는 실행되나 학습 분포 밖). num_cond 5/3 비교 렌더 지원.
 
