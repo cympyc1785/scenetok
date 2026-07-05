@@ -76,6 +76,10 @@ class RecoWanVace1_3BCfg:
     lightningdit_in_channels: int = 48     # va-wan_dl3dv LightningDiT는 Wan2.2 48ch
     # ReCo VACE latent (Wan2.1) 채널 — ldt 출력(48ch)을 이리로 매핑.
     reco_latent_channels: int = 16
+    # ldt2reco_proj 초기화. "zero"(기존 동작, ControlNet zero-conv warm-up: 초기 ref≈0).
+    # "identity"는 ldt가 이미 ReCo와 같은 latent space(Wan2.1 16ch)일 때만 유효 — pretrained
+    # LightningDiT 출력을 그대로 ref slot에 흘려 scene-aware 시작점을 확보 (in==out ch 필요).
+    ldt2reco_init: Literal["zero", "identity"] = "zero"
     # ── 내부 보유 background VAE (Wan2.2 48ch) — ldt branch 입력 인코딩용 ──────
     bg_vae_ckpt_path: str | Path = "checkpoints/Wan2.2_VAE.pth"
     bg_latent_channels: int = 48
@@ -161,8 +165,21 @@ class RecoWanVace1_3BDenoiser(Denoiser[RecoWanVace1_3BCfg]):
         self.ldt2reco_proj = nn.Conv3d(
             cfg.lightningdit_in_channels, cfg.reco_latent_channels, kernel_size=1
         ).to(device=ref_param.device, dtype=ref_param.dtype)
-        nn.init.zeros_(self.ldt2reco_proj.weight)
         nn.init.zeros_(self.ldt2reco_proj.bias)
+        if cfg.ldt2reco_init == "identity":
+            if cfg.lightningdit_in_channels != cfg.reco_latent_channels:
+                raise ValueError(
+                    "ldt2reco_init='identity'는 lightningdit_in_channels == reco_latent_channels "
+                    f"일 때만 가능 (got {cfg.lightningdit_in_channels} != {cfg.reco_latent_channels})."
+                )
+            with torch.no_grad():
+                w = torch.zeros_like(self.ldt2reco_proj.weight)   # (out,in,1,1,1)
+                for i in range(cfg.reco_latent_channels):
+                    w[i, i, 0, 0, 0] = 1.0
+                self.ldt2reco_proj.weight.copy_(w)
+            print(cyan("(ReCo) ldt2reco_proj = identity init (pretrained ldt → ref slot 직접 주입)"))
+        else:
+            nn.init.zeros_(self.ldt2reco_proj.weight)
 
         # logging / loss용 stash
         self._last_ldt_pred = None     # LightningDiT 출력 latent (logging)

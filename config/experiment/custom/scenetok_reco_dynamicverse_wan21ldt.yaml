@@ -1,0 +1,130 @@
+# @package _global_
+#
+# ReCo (Wan2.1 VACE 1.3B) + LightningDiT ctrl branch — **Wan2.1 16ch ldt** 변형.
+#
+# `scenetok_reco_dynamicverse.yaml`와 동일하되, ctrl branch(LightningDiT)를 Wan2.1 VAE
+# latent(16ch)에 맞춰 학습한 ckpt(va-wan2.1_dl3dv_256x448_50k)로 교체한다.
+#   - 기존: ldt=Wan2.2 48ch → ldt2reco_proj(48→16, zero-init OOD bridge) → ReCo ref(Wan2.1 16ch)
+#   - 변경: ldt=Wan2.1 16ch → ldt2reco_proj(16→16, identity) → ReCo ref(Wan2.1 16ch)
+# 즉 ldt 출력과 ReCo ref slot이 동일 latent space → OOD 채널 브릿지 제거 + pretrained ldt
+# 출력을 identity로 그대로 ref slot에 주입해 scene-aware 시작점 확보.
+# background VAE도 Wan2.1 16ch(=main과 동일)로 통일.
+
+defaults:
+  - override /dataset: dynamicverse
+  - override /dataset/view_sampler: caption_window
+  - override /model/scheduler: rf
+  - override /model/denoiser: reco_wan_vace_1_3b
+  - override /model/autoencoders/context: va
+  - override /model/autoencoders/target: wan16
+  - override /model/compressor: mv_B1
+  - override /model/compressor/camera: ray
+  - override /model/compressor/camera/embedding: lvsm
+
+dataset:
+  root: ./WorldTraj/dynamicverse
+  context_shape: [256, 448]
+  target_shape: [480, 832]
+
+  view_sampler:
+    num_context_views: 12
+    num_target_views: 10
+    prompts_filename: prompts.json
+
+data_loader:
+  train:
+    batch_size: 1
+  val:
+    standard:
+      shuffle: false
+      batch_size: 1
+      max_batches: 4
+      num_workers: 2
+      seed: 0
+      interval: 5000
+      persistent_workers: false
+    unseen:
+      shuffle: false
+      batch_size: 1
+      max_batches: 4
+      num_workers: 2
+      seed: 0
+      interval: 5000
+      persistent_workers: false
+
+val:
+  video_length: 37
+  window_shift: 5
+
+sampler:
+  clean_targets: 5
+
+freeze:
+  denoiser: false
+  compressor: true
+  autoencoder: true
+
+model:
+  text_encoder: null
+
+  denoiser:
+    # ── Wan2.1 16ch LightningDiT ctrl branch (OOD 48→16 브릿지 제거) ──
+    lightningdit_ckpt_path: checkpoints/va-wan2.1_dl3dv_256x448_50k_weights.ckpt
+    lightningdit_in_channels: 16
+    reco_latent_channels: 16
+    ldt2reco_init: identity
+    # background VAE도 Wan2.1 16ch(=main ReCo latent과 동일 VAE)로 통일.
+    bg_vae_ckpt_path: src/model/ReCo/checkpoints/Wan2.1-VACE-1.3B/Wan2.1_VAE.pth
+    bg_latent_channels: 16
+    bg_scaling_factor: 1.0
+
+  scheduler:
+    sampling_type: random_uniform
+    num_inference_steps: 50
+    kwargs:
+      weighting: shifted
+      timestep_shift: 8
+
+  compressor:
+    # ldt와 동일 joint-trained ckpt에서 compressor를 로드 → scene tokens이 새 ldt의
+    # in-distribution 입력이 되도록 (compressor+denoiser 둘 다 이 ckpt에 포함).
+    ckpt_path: checkpoints/va-wan2.1_dl3dv_256x448_50k_weights.ckpt
+    load_strict: false
+    kl_weights: [0.0, 0.0]
+    input_shape: [16, 28]
+    num_scene_tokens: 1024
+    causal_self_atten: false
+    gradient_checkpointing: false
+    token_dim: 64
+    init_large: true
+    camera_conditioning: adaLN
+    scene_token_projection: kl
+    mask_context: false
+    camera:
+      input_shape: [128, 224]
+      embedding:
+        patch_size: 16
+    kwargs:
+      use_rope_2d: true
+      use_rope_3d: false
+
+trainer:
+  max_steps: 5_000_001
+  val_check_interval: 5000
+  task_steps: null
+  accumulate_grad_batches: 1
+  gradient_clip_val: 0.1
+  precision: bf16-mixed
+
+optimizer:
+  name: AdamW
+  lr: 1.0e-4
+  scale_lr: false
+  milestones: [2000]
+  scheduler:
+    - name: LinearLR
+      frequency: 1
+      interval: step
+      kwargs:
+        start_factor: 5.e-4
+        total_iters: 2000
