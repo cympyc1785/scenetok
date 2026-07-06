@@ -31,9 +31,17 @@ RUNS = {
     "effecterase": REPO / "exp/va-wan-ti2v_dynamicverse_dynamic_controlnet_scene_camera_2_no_lora_effecterase_v2_unscaledcomp/wandb/run-20260702_232628-exp_va-wan-ti2v_dynamicverse_dynamic_controlnet_scene_camera_2_no_lora_effecterase_v2_unscaledcomp/files/media",
 }
 # GT + context anchor run, and the two model columns to compare.
+# mode(선택): `ablation`(기본) = controlnet vs effecterase(inpaint quality),
+#            `camchannel` = controlnet vs camchannel(self-attn).
+import sys
+MODE = sys.argv[1] if len(sys.argv) > 1 else "ablation"
 ANCHOR = "controlnet"
-MODEL_KEYS = ["controlnet", "effecterase"]
-OUT = REPO / "results/cmp_ctrl_inpaint_ablation_val"
+if MODE == "camchannel":
+    MODEL_KEYS = ["controlnet", "camchannel"]
+    OUT = REPO / "results/cmp_ctrl_vs_camchannel_val"
+else:
+    MODEL_KEYS = ["controlnet", "effecterase"]
+    OUT = REPO / "results/cmp_ctrl_inpaint_ablation_val"
 FPS = 8
 CELL_H, CELL_W = 240, 416   # half of 480x832 (matches reference gif)
 COLS = ["context", "GT"] + MODEL_KEYS
@@ -111,6 +119,17 @@ def signature_strip(frames, k=48):
     return np.stack(accs).mean(0)
 
 
+def bg_sig_rgb(frames, k=64):
+    """RGB **median**-frame signature → removes the moving foreground object so the
+    comparison is on the static background (robust for context↔GT scene pairing;
+    grayscale-mean collapses water/crowd scenes together)."""
+    stack = []
+    for f in frames:
+        im = Image.fromarray(f).convert("RGB").resize((k, k))
+        stack.append(np.asarray(im, dtype=np.float32))
+    return np.median(np.stack(stack), axis=0).reshape(-1)
+
+
 def pair_to_gt(gt_sigs, cand_sigs):
     """Hungarian: assign each candidate to a GT index (min L2)."""
     C = np.zeros((len(gt_sigs), len(cand_sigs)), dtype=np.float64)
@@ -156,10 +175,13 @@ def build_split(split):
             per_scene[gt_hashes[gi]][run] = vids[si]
 
     # --- context strip from the anchor run -> GT by content ---
+    # Use RGB median-frame (background) signatures so water/crowd scenes (e.g.
+    # boat vs classic-car) don't get swapped by grayscale-mean collapse.
+    gt_bg = [bg_sig_rgb([v[i] for i in np.linspace(0, len(v) - 1, 8).astype(int)]) for v in gt_vids]
     ctx = latest_full(RUNS[ANCHOR], split, "Context (full_sequence)", "png", "images")
     strips = [read_context_strip(p) for _, p in ctx]
-    csigs = [signature_strip(s) for s in strips]
-    mc = pair_to_gt(gt_sigs, csigs)
+    csigs = [bg_sig_rgb(s) for s in strips]
+    mc = pair_to_gt(gt_bg, csigs)
     for gi, ci in mc.items():
         per_scene[gt_hashes[gi]]["context"] = strips[ci]
 
