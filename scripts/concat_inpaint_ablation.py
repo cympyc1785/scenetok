@@ -46,10 +46,31 @@ COLS = (["GT", "inpaint_result", "inpaint_result_effecterase"] if INPAINT_ONLY e
         ["GT", "inpaint_result", "controlnet(2)", "inpaint_result_effecterase", "effecterase_v2"])
 
 
+# Model input shapes (dataset crop_shim): context(input)=256x448, target=480x832.
+CTX_SHAPE, TGT_SHAPE = (256, 448), (480, 832)
+
+
 def resize(f):
     if f.shape[:2] == (CELL_H, CELL_W):
         return f
     return np.asarray(Image.fromarray(f).convert("RGB").resize((CELL_W, CELL_H), Image.BILINEAR))
+
+
+def resize_crop(f, shape):
+    """Reproduce dataset `rescale_and_crop`: scale-to-fill (LANCZOS) + center crop,
+    so the frame matches exactly what the model ingests at `shape`."""
+    H, W = shape
+    h, w = f.shape[:2]
+    sf = max(H / h, W / w)
+    nh, nw = round(h * sf), round(w * sf)
+    a = np.asarray(Image.fromarray(f).convert("RGB").resize((nw, nh), Image.LANCZOS))
+    r, c = (nh - H) // 2, (nw - W) // 2
+    return a[r:r + H, c:c + W]
+
+
+def disp(f, shape):
+    """Model-input form (resize+crop at `shape`) then fit the display cell."""
+    return resize(resize_crop(f, shape))
 
 
 def sig(v, k=48):
@@ -155,19 +176,22 @@ def main():
         rows = []
         for sc in scenes:
             g, a, b = gt[sc], inp[sc], inpE[sc]
+            # GT = target form(480x832); inpaint 2종 = context input form(256x448).
             if INPAINT_ONLY:
                 T = min(len(g), len(a), len(b))
-                frames = [np.concatenate([resize(g[t]), resize(a[t]), resize(b[t])], axis=1)
-                          for t in range(T)]
+                frames = [np.concatenate(
+                    [disp(g[t], TGT_SHAPE), disp(a[t], CTX_SHAPE), disp(b[t], CTX_SHAPE)], axis=1)
+                    for t in range(T)]
             else:
                 md = mbs[sc]
                 if "controlnet" not in md or "effecterase" not in md:
                     print(f"[{split}] skip {sc}: missing model output")
                     continue
-                cn, ce = md["controlnet"], md["effecterase"]
+                cn, ce = md["controlnet"], md["effecterase"]  # wandb outputs: already target form
                 T = min(len(g), len(a), len(b), len(cn), len(ce))
                 frames = [np.concatenate(
-                    [resize(g[t]), resize(a[t]), resize(cn[t]), resize(b[t]), resize(ce[t])], axis=1)
+                    [disp(g[t], TGT_SHAPE), disp(a[t], CTX_SHAPE), resize(cn[t]),
+                     disp(b[t], CTX_SHAPE), resize(ce[t])], axis=1)
                     for t in range(T)]
             arr = np.stack(frames)
             name = f"{split}_{sc}"
