@@ -637,8 +637,9 @@ class DiffusionWrapper(LightningModule):
 
 
     @torch.no_grad()
-    def generate_batch_with_scene(self, batch, sampler: Sampler, repeat_factor: int=1):
-        
+    def generate_batch_with_scene(self, batch, sampler: Sampler, repeat_factor: int=1,
+                                  ti2v_first_frame: bool=False):
+
         context_latents = get_latents(
             autoencoder=self.autoencoder,
             inputs=batch["context"], 
@@ -693,7 +694,22 @@ class DiffusionWrapper(LightningModule):
         else:
             h, w = input_shape
         x_t = torch.randn((b, num, c, h, w), device=device, dtype=dtype)
-        x_t *= self.scheduler.init_noise_sigma 
+        x_t *= self.scheduler.init_noise_sigma
+
+        # TI2V: GT target 첫 프레임 latent을 sample()의 first_frame_latents로 넘겨
+        # 매 denoising step마다 frame0을 GT로 강제 교체 (image conditioning).
+        first_frame_latents = None
+        if ti2v_first_frame:
+            tgt_lat = get_latents(
+                autoencoder=self.autoencoder, inputs=batch["target"], view_type="target",
+                precomputed_latents=self.dataset_cfg.precomputed_latents,
+                autoencoder_name=getattr(self.model_cfg.autoencoders, "target").name,
+                scaling_factor=getattr(self.model_cfg.autoencoders, "target").kwargs.scaling_factor,
+                chunk_targets=getattr(self.dataset_cfg.view_sampler, "chunk_targets", True),
+            )
+            tgt_lat = repeat(tgt_lat[:, 0:1], "b ... -> (b n) ...", n=repeat_factor)
+            first_frame_latents = tgt_lat.to(device=device, dtype=dtype)
+            print(f"(TI2V) first_frame_latents from GT target: {tuple(first_frame_latents.shape)}")
         
         context_camera = CameraInputs(
             intrinsics=batch["context"]["intrinsics"],
@@ -760,6 +776,7 @@ class DiffusionWrapper(LightningModule):
             chunk_index_gap=self.dataset_cfg.view_sampler.chunk_index_gap,
             offset=self.dataset_cfg.view_sampler.offset,
             chunk_targets=getattr(self.dataset_cfg.view_sampler, "chunk_targets", True),
+            first_frame_latents=first_frame_latents,
         ), scene_tokens
 
     @staticmethod

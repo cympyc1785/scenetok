@@ -78,6 +78,8 @@ def parse_args():
     p.add_argument("--num_context_views", type=int, default=None)
     p.add_argument("--num_target_views", type=int, default=None)
     p.add_argument("--output_dir", default=None)
+    p.add_argument("--ti2v_first_frame", action="store_true",
+                   help="TI2V: GT target 첫 프레임 VAE latent을 매 denoising step frame0에 강제 주입.")
     p.add_argument("--max_scenes", type=int, default=1,
                    help="How many scenes (batches) from the eval index to process. "
                         "Default 1 = single scene (backward compat).")
@@ -345,6 +347,7 @@ def main():
                     ):
                         s, u, _ = wrapper.generate_batch_with_scene(
                             batch, wrapper.sampler, repeat_factor=args.repeat_factor,
+                            ti2v_first_frame=args.ti2v_first_frame,
                         )
                     return s, u
 

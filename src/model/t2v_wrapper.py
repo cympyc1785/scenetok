@@ -258,7 +258,8 @@ class T2VWrapper(DiffusionWrapper):
         return CameraInputs(intrinsics=intrinsics, extrinsics=extrinsics), temporal_downsample, num
 
     @torch.no_grad()
-    def generate_batch_with_scene(self, batch, sampler: Sampler, repeat_factor: int = 1):
+    def generate_batch_with_scene(self, batch, sampler: Sampler, repeat_factor: int = 1,
+                                  ti2v_first_frame: bool = False):
         if os.environ.get("FORCE_FP32"):
             self.denoiser.model.to(torch.float32)
             if getattr(self.denoiser, "text_encoder", None) is not None:
@@ -331,7 +332,8 @@ class T2VWrapper(DiffusionWrapper):
             x_t = injected
         first_frame_latents = None
         first_frame_mask_latent = None
-        if self.should_replace_first_frame_latent():
+        # ti2v_first_frame: 학습 시 first-frame conditioning 안 한 모델도 추론 시 강제 주입.
+        if self.should_replace_first_frame_latent() or ti2v_first_frame:
             first_frame_latents, first_frame_mask_latent = self.get_first_frame_latents(
                 batch,
                 device=device,
