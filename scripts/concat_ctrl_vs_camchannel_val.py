@@ -28,11 +28,15 @@ REPO = Path(".").resolve()
 RUNS = {
     "controlnet": REPO / "exp/va-wan-ti2v_dynamicverse_dynamic_controlnet_scene_camera_2_no_lora/wandb/run-20260611_201055-exp_va-wan-ti2v_dynamicverse_dynamic_controlnet_scene_camera_2_no_lora/files/media",
     "camchannel": REPO / "exp/va-wan-ti2v_dynamicverse_dynamic_newca_scene_camchannel_selfattnlora_unscaledcomp/wandb/run-20260702_232628-exp_va-wan-ti2v_dynamicverse_dynamic_newca_scene_camchannel_selfattnlora_unscaledcomp/files/media",
+    "effecterase": REPO / "exp/va-wan-ti2v_dynamicverse_dynamic_controlnet_scene_camera_2_no_lora_effecterase_v2_unscaledcomp/wandb/run-20260702_232628-exp_va-wan-ti2v_dynamicverse_dynamic_controlnet_scene_camera_2_no_lora_effecterase_v2_unscaledcomp/files/media",
 }
-OUT = REPO / "results/cmp_ctrl_vs_camchannel_val"
+# GT + context anchor run, and the two model columns to compare.
+ANCHOR = "controlnet"
+MODEL_KEYS = ["controlnet", "effecterase"]
+OUT = REPO / "results/cmp_ctrl_inpaint_ablation_val"
 FPS = 8
 CELL_H, CELL_W = 240, 416   # half of 480x832 (matches reference gif)
-COLS = ["context", "GT", "controlnet", "camchannel"]
+COLS = ["context", "GT"] + MODEL_KEYS
 
 
 def latest_full(base, split, prefix, ext, sub):
@@ -132,8 +136,8 @@ def label(frame, text):
 
 
 def build_split(split):
-    # --- GT anchor from camchannel run (scene-stable hashes) ---
-    gt_files = latest_full(RUNS["camchannel"], split, "Original Video", "mp4", "videos")
+    # --- GT anchor from the anchor run (scene-stable hashes) ---
+    gt_files = latest_full(RUNS[ANCHOR], split, "Original Video", "mp4", "videos")
     gt_files = sorted(gt_files)  # by hash, deterministic
     gt_hashes = [h for h, _ in gt_files]
     gt_vids = [read_video(p) for _, p in gt_files]
@@ -141,8 +145,8 @@ def build_split(split):
 
     per_scene = {h: {"GT": v} for h, v in zip(gt_hashes, gt_vids)}
 
-    # --- each run's Sampled -> GT by content ---
-    for run in ("controlnet", "camchannel"):
+    # --- each model run's Sampled -> GT by content ---
+    for run in MODEL_KEYS:
         samp = latest_full(RUNS[run], split, "Sampled Video", "mp4", "videos")
         vids = [read_video(p) for _, p in samp]
         sigs = [signature_video(v) for v in vids]
@@ -151,8 +155,8 @@ def build_split(split):
         for gi, si in m.items():
             per_scene[gt_hashes[gi]][run] = vids[si]
 
-    # --- context strip from camchannel run -> GT by content ---
-    ctx = latest_full(RUNS["camchannel"], split, "Context (full_sequence)", "png", "images")
+    # --- context strip from the anchor run -> GT by content ---
+    ctx = latest_full(RUNS[ANCHOR], split, "Context (full_sequence)", "png", "images")
     strips = [read_context_strip(p) for _, p in ctx]
     csigs = [signature_strip(s) for s in strips]
     mc = pair_to_gt(gt_sigs, csigs)
@@ -171,22 +175,19 @@ def main():
         rows = []
         for i, h in enumerate(gt_hashes):
             d = per_scene[h]
-            if not all(k in d for k in ("GT", "controlnet", "camchannel", "context")):
-                print(f"[{split}] skip {h}: missing {[k for k in COLS if k not in d]}")
+            need = ["GT", "context"] + MODEL_KEYS
+            if not all(k in d for k in need):
+                print(f"[{split}] skip {h}: missing {[k for k in need if k not in d]}")
                 continue
-            gt, cn, cc, ctx = d["GT"], d["controlnet"], d["camchannel"], d["context"]
-            T = min(len(gt), len(cn), len(cc))
+            gt, ctx = d["GT"], d["context"]
+            models = [d[k] for k in MODEL_KEYS]
+            T = min([len(gt)] + [len(m) for m in models])
             nctx = len(ctx)
             ctx_cells = [resize(f) for f in ctx]  # each context view resized to a cell
             frames = []
             for t in range(T):
                 ci = min(nctx - 1, int(t / T * nctx))  # slideshow synced to clip length
-                cells = [
-                    ctx_cells[ci],
-                    resize(gt[t]),
-                    resize(cn[t]),
-                    resize(cc[t]),
-                ]
+                cells = [ctx_cells[ci], resize(gt[t])] + [resize(m[t]) for m in models]
                 frames.append(np.concatenate(cells, axis=1))
             arr = np.stack(frames)
             name = f"{split}_{i}_{h[:8]}"
