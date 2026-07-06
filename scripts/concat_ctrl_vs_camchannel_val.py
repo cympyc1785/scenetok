@@ -29,17 +29,24 @@ RUNS = {
     "controlnet": REPO / "exp/va-wan-ti2v_dynamicverse_dynamic_controlnet_scene_camera_2_no_lora/wandb/run-20260611_201055-exp_va-wan-ti2v_dynamicverse_dynamic_controlnet_scene_camera_2_no_lora/files/media",
     "camchannel": REPO / "exp/va-wan-ti2v_dynamicverse_dynamic_newca_scene_camchannel_selfattnlora_unscaledcomp/wandb/run-20260702_232628-exp_va-wan-ti2v_dynamicverse_dynamic_newca_scene_camchannel_selfattnlora_unscaledcomp/files/media",
     "effecterase": REPO / "exp/va-wan-ti2v_dynamicverse_dynamic_controlnet_scene_camera_2_no_lora_effecterase_v2_unscaledcomp/wandb/run-20260702_232628-exp_va-wan-ti2v_dynamicverse_dynamic_controlnet_scene_camera_2_no_lora_effecterase_v2_unscaledcomp/files/media",
+    "decoupled": REPO / "exp/va-wan-ti2v_scene_decoupled_controlnet_scene_camera_no_lora_unscaledcomp/wandb/run-20260702_232638-exp_va-wan-ti2v_scene_decoupled_controlnet_scene_camera_no_lora_unscaledcomp/files/media",
 }
 # GT + context anchor run, and the two model columns to compare.
 # mode(선택): `ablation`(기본) = controlnet vs effecterase(inpaint quality),
 #            `camchannel` = controlnet vs camchannel(self-attn).
 import sys
 MODE = sys.argv[1] if len(sys.argv) > 1 else "ablation"
-ANCHOR = "controlnet"
 if MODE == "camchannel":
+    ANCHOR = "controlnet"
     MODEL_KEYS = ["controlnet", "camchannel"]
     OUT = REPO / "results/cmp_ctrl_vs_camchannel_val"
+elif MODE == "decoupled":
+    # scene-decoupled: context=wohuman(input), GT("Original")=whuman, model=controlnet output.
+    ANCHOR = "decoupled"
+    MODEL_KEYS = ["decoupled"]
+    OUT = REPO / "results/cmp_scene_decoupled_val"
 else:
+    ANCHOR = "controlnet"
     MODEL_KEYS = ["controlnet", "effecterase"]
     OUT = REPO / "results/cmp_ctrl_inpaint_ablation_val"
 FPS = 8
