@@ -17,6 +17,7 @@ import glob
 import json
 import os
 import re
+import sys
 from collections import defaultdict
 from pathlib import Path
 
@@ -35,10 +36,14 @@ INDEX = {
     "unseen": REPO / "assets/evaluation_index/dynamicverse_unseen_8.json",
     "standard": REPO / "assets/evaluation_index/dynamicverse_standard.json",
 }
-OUT = REPO / "results/cmp_inpaint_ablation"
+# mode: "full"(기본) = 5-col (모델 출력 포함) / "inpaint_only" = 3-col (inpaint 품질만)
+MODE = sys.argv[1] if len(sys.argv) > 1 else "full"
+INPAINT_ONLY = MODE == "inpaint_only"
+OUT = REPO / ("results/cmp_inpaint_quality" if INPAINT_ONLY else "results/cmp_inpaint_ablation")
 FPS = 8
 CELL_H, CELL_W = 240, 416
-COLS = ["GT", "inpaint_result", "controlnet(2)", "inpaint_result_effecterase", "effecterase_v2"]
+COLS = (["GT", "inpaint_result", "inpaint_result_effecterase"] if INPAINT_ONLY else
+        ["GT", "inpaint_result", "controlnet(2)", "inpaint_result_effecterase", "effecterase_v2"])
 
 
 def resize(f):
@@ -89,11 +94,21 @@ def load_at(path, tgt_idx):
     return v[idx]
 
 
+def _restrict_scenes(split):
+    """inpaint_only: reuse the exact scenes from the 5-col ablation output (val-8)."""
+    prev = REPO / "results/cmp_inpaint_ablation" / split
+    names = {p.stem[len(split) + 1:] for p in prev.glob(f"{split}_*.mp4")}
+    return names
+
+
 def build(split):
     idx = json.load(open(INDEX[split]))
+    keep = _restrict_scenes(split) if INPAINT_ONLY else None
     # dataset-side per scene: GT / inpaint / inpaint_effecterase at target indices
     scenes, gt, inp, inpE, gsig = [], {}, {}, {}, {}
     for sc, meta in idx.items():
+        if keep is not None and sc not in keep:
+            continue
         d = scene_dir(sc, split)
         if d is None:
             continue
@@ -107,6 +122,9 @@ def build(split):
             continue
         scenes.append(sc)
         gt[sc], inp[sc], inpE[sc], gsig[sc] = g, a, b, sig(g)
+
+    if INPAINT_ONLY:
+        return scenes, gt, inp, inpE, None
 
     # wandb GT (Original) -> identify which dataset scene each is
     wb_gt = latest_full(RUNS["controlnet"], split, "Original")
@@ -136,17 +154,21 @@ def main():
         scenes, gt, inp, inpE, mbs = build(split)
         rows = []
         for sc in scenes:
-            md = mbs[sc]
-            if "controlnet" not in md or "effecterase" not in md:
-                print(f"[{split}] skip {sc}: missing model output")
-                continue
             g, a, b = gt[sc], inp[sc], inpE[sc]
-            cn, ce = md["controlnet"], md["effecterase"]
-            T = min(len(g), len(a), len(b), len(cn), len(ce))
-            frames = []
-            for t in range(T):
-                cells = [resize(g[t]), resize(a[t]), resize(cn[t]), resize(b[t]), resize(ce[t])]
-                frames.append(np.concatenate(cells, axis=1))
+            if INPAINT_ONLY:
+                T = min(len(g), len(a), len(b))
+                frames = [np.concatenate([resize(g[t]), resize(a[t]), resize(b[t])], axis=1)
+                          for t in range(T)]
+            else:
+                md = mbs[sc]
+                if "controlnet" not in md or "effecterase" not in md:
+                    print(f"[{split}] skip {sc}: missing model output")
+                    continue
+                cn, ce = md["controlnet"], md["effecterase"]
+                T = min(len(g), len(a), len(b), len(cn), len(ce))
+                frames = [np.concatenate(
+                    [resize(g[t]), resize(a[t]), resize(cn[t]), resize(b[t]), resize(ce[t])], axis=1)
+                    for t in range(T)]
             arr = np.stack(frames)
             name = f"{split}_{sc}"
             iio.imwrite(odir / f"{name}.mp4", arr, fps=FPS, codec="libx264")
