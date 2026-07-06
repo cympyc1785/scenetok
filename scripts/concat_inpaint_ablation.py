@@ -31,19 +31,24 @@ DV = REPO / "WorldTraj/dynamicverse"
 RUNS = {
     "controlnet": REPO / "exp/va-wan-ti2v_dynamicverse_dynamic_controlnet_scene_camera_2_no_lora/wandb/run-20260611_201055-exp_va-wan-ti2v_dynamicverse_dynamic_controlnet_scene_camera_2_no_lora/files/media",
     "effecterase": REPO / "exp/va-wan-ti2v_dynamicverse_dynamic_controlnet_scene_camera_2_no_lora_effecterase_v2_unscaledcomp/wandb/run-20260702_232628-exp_va-wan-ti2v_dynamicverse_dynamic_controlnet_scene_camera_2_no_lora_effecterase_v2_unscaledcomp/files/media",
+    "camchannel": REPO / "exp/va-wan-ti2v_dynamicverse_dynamic_newca_scene_camchannel_selfattnlora_unscaledcomp/wandb/run-20260702_232628-exp_va-wan-ti2v_dynamicverse_dynamic_newca_scene_camchannel_selfattnlora_unscaledcomp/files/media",
 }
 INDEX = {
     "unseen": REPO / "assets/evaluation_index/dynamicverse_unseen_8.json",
     "standard": REPO / "assets/evaluation_index/dynamicverse_standard.json",
 }
-# mode: "full"(기본) = 5-col (모델 출력 포함) / "inpaint_only" = 3-col (inpaint 품질만)
+# mode: "full"(기본) = 5-col inpaint ablation / "inpaint_only" = 3-col / "camchannel" =
+#       [inpaint_result(input) | GT | controlnet | camchannel] (공통 inpaint 입력).
 MODE = sys.argv[1] if len(sys.argv) > 1 else "full"
 INPAINT_ONLY = MODE == "inpaint_only"
-OUT = REPO / ("results/cmp_inpaint_quality" if INPAINT_ONLY else "results/cmp_inpaint_ablation")
+CAMCHANNEL = MODE == "camchannel"
+# 모델 출력 열로 쓸 wandb run 들
+MODEL_RUNS = ["controlnet", "camchannel"] if CAMCHANNEL else ["controlnet", "effecterase"]
+OUT = REPO / ("results/cmp_inpaint_quality" if INPAINT_ONLY else
+              "results/cmp_ctrl_vs_camchannel_val" if CAMCHANNEL else
+              "results/cmp_inpaint_ablation")
 FPS = 8
 CELL_H, CELL_W = 240, 416
-COLS = (["GT", "inpaint_result", "inpaint_result_effecterase"] if INPAINT_ONLY else
-        ["GT", "inpaint_result", "controlnet(2)", "inpaint_result_effecterase", "effecterase_v2"])
 
 
 # Model input shapes (dataset crop_shim): context(input)=256x448, target=480x832.
@@ -156,7 +161,7 @@ def build(split):
 
     # each model's Sampled -> wandb GT hash (content), then -> scene
     model_by_scene = {sc: {} for sc in scenes}
-    for run in ("controlnet", "effecterase"):
+    for run in MODEL_RUNS:
         samp = latest_full(RUNS[run], split, "Sampled")
         svids = [iio.imread(p) for _, p in samp]
         ssig = [sig(v) for v in svids]
@@ -181,6 +186,17 @@ def main():
                 T = min(len(g), len(a), len(b))
                 frames = [np.concatenate(
                     [disp(g[t], TGT_SHAPE), disp(a[t], CTX_SHAPE), disp(b[t], CTX_SHAPE)], axis=1)
+                    for t in range(T)]
+            elif CAMCHANNEL:
+                # [inpaint_result(input,256x448) | GT | controlnet | camchannel] — 공통 inpaint 입력.
+                md = mbs[sc]
+                if "controlnet" not in md or "camchannel" not in md:
+                    print(f"[{split}] skip {sc}: missing model output")
+                    continue
+                cn, cc = md["controlnet"], md["camchannel"]
+                T = min(len(g), len(a), len(cn), len(cc))
+                frames = [np.concatenate(
+                    [disp(a[t], CTX_SHAPE), disp(g[t], TGT_SHAPE), resize(cn[t]), resize(cc[t])], axis=1)
                     for t in range(T)]
             else:
                 md = mbs[sc]
