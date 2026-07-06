@@ -182,10 +182,10 @@ def main():
             for t in range(T):
                 ci = min(nctx - 1, int(t / T * nctx))  # slideshow synced to clip length
                 cells = [
-                    label(ctx_cells[ci], f"context {ci + 1}/{nctx}"),
-                    label(resize(gt[t]), "GT"),
-                    label(resize(cn[t]), "controlnet(2)"),
-                    label(resize(cc[t]), "camchannel"),
+                    ctx_cells[ci],
+                    resize(gt[t]),
+                    resize(cn[t]),
+                    resize(cc[t]),
                 ]
                 frames.append(np.concatenate(cells, axis=1))
             arr = np.stack(frames)
