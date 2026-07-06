@@ -55,10 +55,37 @@ def read_video(p):
 
 
 def read_context_strip(p):
+    """Split the horizontal context strip (frames separated by ~8px white cols)
+    into a list of individual context frames."""
     a = iio.imread(p)
     if a.ndim == 3 and a.shape[2] == 4:
         a = a[..., :3]
-    return a  # (H, N*W, 3)
+    W = a.shape[1]
+    col = a.mean(axis=(0, 2))
+    white = col > 245
+    # separator column groups
+    seps, i = [], 0
+    while i < W:
+        if white[i]:
+            j = i
+            while j < W and white[j]:
+                j += 1
+            seps.append((i, j))
+            i = j
+        else:
+            i += 1
+    # frame boundaries = between separators (and strip edges)
+    cuts = [0]
+    for s0, s1 in seps:
+        cuts.append(s0)
+        cuts.append(s1)
+    cuts.append(W)
+    frames = []
+    for k in range(0, len(cuts) - 1, 2):
+        a0, a1 = cuts[k], cuts[k + 1]
+        if a1 - a0 > 8:  # skip separator-only slivers
+            frames.append(a[:, a0:a1])
+    return frames  # list of (H,Wf,3)
 
 
 def signature_video(v, k=48):
@@ -71,9 +98,13 @@ def signature_video(v, k=48):
     return np.stack(frs).mean(0)
 
 
-def signature_strip(a, k=48):
-    im = Image.fromarray(a).convert("L").resize((k, k))
-    return np.asarray(im, dtype=np.float32)
+def signature_strip(frames, k=48):
+    """Mean grayscale signature over the context frames (for content pairing)."""
+    accs = []
+    for f in frames:
+        im = Image.fromarray(f).convert("L").resize((k, k))
+        accs.append(np.asarray(im, dtype=np.float32))
+    return np.stack(accs).mean(0)
 
 
 def pair_to_gt(gt_sigs, cand_sigs):
@@ -145,11 +176,13 @@ def main():
                 continue
             gt, cn, cc, ctx = d["GT"], d["controlnet"], d["camchannel"], d["context"]
             T = min(len(gt), len(cn), len(cc))
-            ctx_cell = resize(ctx)  # static strip squished into a cell
+            nctx = len(ctx)
+            ctx_cells = [resize(f) for f in ctx]  # each context view resized to a cell
             frames = []
             for t in range(T):
+                ci = min(nctx - 1, int(t / T * nctx))  # slideshow synced to clip length
                 cells = [
-                    label(ctx_cell, "context"),
+                    label(ctx_cells[ci], f"context {ci + 1}/{nctx}"),
                     label(resize(gt[t]), "GT"),
                     label(resize(cn[t]), "controlnet(2)"),
                     label(resize(cc[t]), "camchannel"),
