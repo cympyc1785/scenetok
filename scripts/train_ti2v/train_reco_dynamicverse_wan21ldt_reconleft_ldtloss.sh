@@ -22,6 +22,7 @@ CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-3} exec -a reco_reconleft_ldtloss p
   dataset.recon_target_video_name=inpaint_result.mp4 \
   dataset.prompt_style=category_first \
   ++model.denoiser.ldt_input_type=recon_left \
+  ++model.denoiser.ldt_x0_ref=true \
   ++model.denoiser.ldt_loss_weight=1.0 \
   trainer.devices=${gpus} \
   trainer.num_nodes=${num_nodes} \

@@ -103,6 +103,11 @@ class RecoWanVace1_3BCfg:
     ldt_input_type: Literal["teacher_bg", "recon_left"] = "teacher_bg"
     # >0이면 ldt 출력(ref_latent)을 clean recon latent(x0)로 직접 supervise (ablation).
     ldt_loss_weight: float = 0.0
+    # True면 ldt 출력(rectified-flow velocity)을 x0로 변환해 VACE ref로 사용:
+    #   x_t=(1-t)x0+t·ε, v=ε-x0 → x0 = x_t - t·v. (기본 False=기존 velocity-as-ref 동작)
+    #   ldt 입력(bg)=x_t, t_raw=(rescaled_t+1)/num_train_timesteps.
+    ldt_x0_ref: bool = False
+    num_train_timesteps: int = 1000
     # True면 ReCo(DiT/VACE LoRA) freeze → LightningDiT ctrl branch + ldt2reco_proj만 학습.
     # recon-우선 phase: freeze_reco=true + dynamic_loss_weight=0 으로 ldt만 recon에 fit.
     freeze_reco: bool = False
@@ -410,10 +415,19 @@ class RecoWanVace1_3BDenoiser(Denoiser[RecoWanVace1_3BCfg]):
         ldt_pred, _ = self.ldt_branch._forward(
             inputs=ctrl_inputs, temporal_downsample=temporal_downsample, chunk_targets=chunk_targets,
         )
-        ldt_pred = rearrange(ldt_pred, "b v c h w -> b c v h w")     # (B,48,F,H,W)
-        self._last_ldt_pred = ldt_pred                               # logging용
+        ldt_pred = rearrange(ldt_pred, "b v c h w -> b c v h w")     # (B,C,F,H,W) = rectified-flow velocity
 
-        # 2) 48→16 projector (zero-init) → ReCo VACE source slot
+        # 1.5) velocity(flow) → x0 변환 (VACE는 clean latent을 ref로 기대).
+        #   x_t=(1-t)x0+t·ε, v=ε-x0 → x0 = x_t - t·v. x_t = ldt 입력(bg, ldt grid).
+        if self.cfg.ldt_x0_ref:
+            bg_xt = rearrange(bg, "b v c h w -> b c v h w")          # x_t (ldt grid)
+            t_raw = ((timestep.float() + 1.0) / float(self.cfg.num_train_timesteps)).clamp(0.0, 1.0)
+            t_b = (rearrange(t_raw, "b v -> b 1 v 1 1") if t_raw.ndim == 2
+                   else t_raw.reshape(-1, 1, 1, 1, 1))
+            ldt_pred = bg_xt - t_b.to(ldt_pred.dtype) * ldt_pred     # 이제 x0 (clean 배경 추정)
+        self._last_ldt_pred = ldt_pred                               # logging용 (x0면 배경이 보임)
+
+        # 2) projector → ReCo VACE source slot
         ref_latent = self.ldt2reco_proj(ldt_pred)                    # (B,16,F,H_ld,W_ld)
         # ldt(Wan2.2 VAE /16) grid ≠ ReCo(Wan2.1 VAE /8) grid → ReCo half-width 해상도로 resize.
         H_r, Wd_r = latents.shape[-2], latents.shape[-1]
