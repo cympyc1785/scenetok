@@ -161,6 +161,39 @@ def label(frame, text):
     return np.asarray(img)
 
 
+import json
+
+DECOUPLED_ROOT = REPO / "DATA/Scene-Decoupled-Video-dataset"
+
+
+def load_caption_map(anchor_base):
+    """{video-file hash -> caption(scene_id_traj)} from the run's wandb-summary.json
+    (Original Video panels of both splits). Hash = the 20-char id in the filename."""
+    summ = anchor_base.parent / "wandb-summary.json"
+    out = {}
+    if not summ.exists():
+        return out
+    d = json.load(open(summ))
+    for k, v in d.items():
+        if "Original Video" in k and isinstance(v, dict):
+            for vid in v.get("videos", []):
+                m = re.search(r"_(\d+)_([0-9a-f]+)\.mp4$", vid.get("path", ""))
+                if m and vid.get("caption"):
+                    out[m.group(2)] = vid["caption"]
+    return out
+
+
+def decoupled_text(caption):
+    """caption '<scene_id>_<NN>' -> (scene_id, traj, caption_action_only text)."""
+    scene_id, traj = caption.rsplit("_", 1)
+    p = DECOUPLED_ROOT / "text" / "whuman" / scene_id / "action.json"
+    text = None
+    if p.exists():
+        data = json.load(open(p))
+        text = data.get("caption_action_only") or data.get("caption")
+    return scene_id, traj, text
+
+
 def build_split(split):
     # --- GT anchor from the anchor run (scene-stable hashes) ---
     gt_files = latest_full(RUNS[ANCHOR], split, "Original Video", "mp4", "videos")
@@ -196,6 +229,8 @@ def build_split(split):
 
 
 def main():
+    cap_map = load_caption_map(RUNS[ANCHOR]) if MODE == "decoupled" else {}
+    text_index = {}
     grid_all = []
     for split in ("standard", "unseen"):
         odir = OUT / split
@@ -225,6 +260,18 @@ def main():
             pil[0].save(odir / f"{name}.gif", save_all=True, append_images=pil[1:],
                         duration=int(1000 / FPS), loop=0, disposal=2)
             rows.append(arr)
+            # --- text input sidecar (decoupled: caption_action_only) ---
+            if cap_map:
+                caption = cap_map.get(h)
+                if caption:
+                    scene_id, traj, text = decoupled_text(caption)
+                    rec = {"scene": caption, "scene_id": scene_id, "trajectory": traj,
+                           "prompt_key": "caption_action_only", "text_input": text}
+                    with (odir / f"{name}.json").open("w") as fp:
+                        json.dump(rec, fp, ensure_ascii=False, indent=2)
+                    text_index[f"{split}/{name}"] = rec
+                else:
+                    print(f"[{split}] no caption for {h[:8]} in wandb-summary")
             print(f"[{split}] {name}: {arr.shape}")
         if rows:
             T = min(a.shape[0] for a in rows)
@@ -232,6 +279,10 @@ def main():
             iio.imwrite(OUT / f"ALL_{split}_grid.mp4", grid, fps=FPS, codec="libx264")
             print(f"[{split}] grid -> ALL_{split}_grid.mp4 {grid.shape}")
             grid_all.append((split, grid))
+    if text_index:
+        with (OUT / "text_inputs.json").open("w") as fp:
+            json.dump(text_index, fp, ensure_ascii=False, indent=2)
+        print(f"[text] wrote {len(text_index)} entries -> {OUT / 'text_inputs.json'}")
 
 
 if __name__ == "__main__":
