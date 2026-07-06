@@ -97,6 +97,12 @@ class RecoWanVace1_3BCfg:
     # ReCo 출력 좌/우 split loss 가중치 (wrapper에서 사용). left=recon, right=dynamic.
     recon_loss_weight: float = 1.0
     dynamic_loss_weight: float = 1.0
+    # ldt 입력 소스. "teacher_bg"(기본, 기존 동작) = GT 배경(bg_clean)을 t로 노이즈해 주입
+    #   → test-time에 GT 없으면 불가. "recon_left" = ReCo latent의 recon-left 절반을 주입
+    #   (train=노이즈된 GT recon, inference=denoising chain) → GT 불개입, train/test 일치.
+    ldt_input_type: Literal["teacher_bg", "recon_left"] = "teacher_bg"
+    # >0이면 ldt 출력(ref_latent)을 clean recon latent(x0)로 직접 supervise (ablation).
+    ldt_loss_weight: float = 0.0
     # True면 ReCo(DiT/VACE LoRA) freeze → LightningDiT ctrl branch + ldt2reco_proj만 학습.
     # recon-우선 phase: freeze_reco=true + dynamic_loss_weight=0 으로 ldt만 recon에 fit.
     freeze_reco: bool = False
@@ -379,10 +385,15 @@ class RecoWanVace1_3BDenoiser(Denoiser[RecoWanVace1_3BCfg]):
         latents = rearrange(inputs.view, "b v c h w -> b c v h w")   # (B,16,F,H,2W)
         timestep = inputs.timestep if inputs.timestep.ndim >= 1 else inputs.timestep.unsqueeze(0)
 
-        # 1) LightningDiT ctrl branch: 48ch background latent을 same-t에서 denoise
-        bg = inputs.condition_latents
-        if bg is None:
-            raise ValueError("RecoWanVace._forward: condition_latents(48ch background latent)가 필요합니다.")
+        # 1) LightningDiT ctrl branch 입력 배경 latent (same-t)
+        if self.cfg.ldt_input_type == "recon_left":
+            # ReCo latent의 recon-left 절반 = 배경 (GT 불개입). inputs.view: (B,V,C,H,2W)
+            half = inputs.view.shape[-1] // 2
+            bg = inputs.view[..., :half]
+        else:
+            bg = inputs.condition_latents
+            if bg is None:
+                raise ValueError("RecoWanVace._forward: condition_latents(background latent)가 필요합니다.")
         raw_scene = getattr(inputs, "raw_state", None)
         proj_scene = self.ldt_branch.cnd_proj(raw_scene) if raw_scene is not None else None
         # bg(Wan2.2 VAE /16)와 ldt x_embedder가 기대하는 grid(va-wan ckpt native /8)가 다를 수 있음

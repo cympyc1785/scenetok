@@ -522,10 +522,15 @@ class T2VWrapper(DiffusionWrapper):
         target_reco = torch.cat([recon_lat, dyn_lat], dim=-1)        # (B,V,16,H,2W)
         b, v_t = target_reco.shape[:2]
 
-        # bg 48ch latent (inpaint_result frames → denoiser 내부 VAE)
-        bg_clean = self.denoiser.encode_bg(recon_video.to(device=device, dtype=dtype))
-        if num_target_latents is not None and num_target_latents != bg_clean.shape[1]:
-            bg_clean = bg_clean[:, :num_target_latents]
+        # bg latent (inpaint_result frames → denoiser 내부 VAE). recon_left 모드는 ldt가
+        # ReCo latent의 recon-left 절반을 쓰므로 GT bg 불필요.
+        recon_left_mode = getattr(self.denoiser.cfg, "ldt_input_type", "teacher_bg") == "recon_left"
+        if recon_left_mode:
+            bg_clean = None
+        else:
+            bg_clean = self.denoiser.encode_bg(recon_video.to(device=device, dtype=dtype))
+            if num_target_latents is not None and num_target_latents != bg_clean.shape[1]:
+                bg_clean = bg_clean[:, :num_target_latents]
 
         # scene tokens (context → compressor)
         scene_tokens = None
@@ -551,8 +556,11 @@ class T2VWrapper(DiffusionWrapper):
         timestep = repeat(timestep, "b -> b v", v=v_t)
         noise_reco = torch.randn_like(target_reco)
         noisy_reco = self.scheduler.add_noise(target_reco, noise_reco, timestep)
-        noise_bg = torch.randn_like(bg_clean)
-        noisy_bg = self.scheduler.add_noise(bg_clean, noise_bg, timestep)
+        if recon_left_mode:
+            noisy_bg = None   # ldt가 noisy_reco의 recon-left 절반을 씀 (_forward 내부)
+        else:
+            noise_bg = torch.randn_like(bg_clean)
+            noisy_bg = self.scheduler.add_noise(bg_clean, noise_bg, timestep)
 
         # scene tokens은 ldt branch의 cnd_proj로만 들어감 (main ReCo DiT는 scene 직접 미사용)
         # → raw_state로만 전달, state(projected)는 None.
@@ -576,13 +584,26 @@ class T2VWrapper(DiffusionWrapper):
         dyn_w = float(getattr(self.denoiser.cfg, "dynamic_loss_weight", 1.0))
         loss = recon_w * loss_recon + dyn_w * loss_dyn       # recon-우선 phase: dyn_w=0
 
+        # (ablation) ldt 출력(ref_latent)을 clean recon latent로 직접 supervise
+        ldt_w = float(getattr(self.denoiser.cfg, "ldt_loss_weight", 0.0))
+        loss_ldt = None
+        if ldt_w > 0 and getattr(self.denoiser, "_last_ref_latent", None) is not None:
+            ref = rearrange(self.denoiser._last_ref_latent, "b c f h w -> b f c h w")
+            recon_clean = target_reco[..., :wh]                     # clean recon latent (x0)
+            nf = min(ref.shape[1], recon_clean.shape[1])
+            loss_ldt = F.mse_loss(ref[:, :nf].to(recon_clean.dtype), recon_clean[:, :nf])
+            loss = loss + ldt_w * loss_ldt
+
         current_lr = self.optimizers().param_groups[0]["lr"]
         if self.global_rank == 0:
+            extra = f" ldt {loss_ldt.item():.4f}" if loss_ldt is not None else ""
             print(f"Train step {self.step_tracker.get_step()}; loss = {loss.item():.4f} "
-                  f"(recon {loss_recon.item():.4f} dyn {loss_dyn.item():.4f}) lr = {current_lr}")
+                  f"(recon {loss_recon.item():.4f} dyn {loss_dyn.item():.4f}{extra}) lr = {current_lr}")
         self.log("loss/diffusion", loss)
         self.log("loss/reco_recon", loss_recon)
         self.log("loss/reco_dynamic", loss_dyn)
+        if loss_ldt is not None:
+            self.log("loss/reco_ldt", loss_ldt)
         return loss
 
     def _reco_encode_dual_latents(self, batch):
@@ -606,9 +627,12 @@ class T2VWrapper(DiffusionWrapper):
             dyn_lat, recon_lat = dyn_lat[:, :num_target_latents], recon_lat[:, :num_target_latents]
         target_reco = torch.cat([recon_lat, dyn_lat], dim=-1)
         device, dtype = target_reco.device, target_reco.dtype
-        bg_clean = self.denoiser.encode_bg(recon_video.to(device=device, dtype=dtype))
-        if num_target_latents is not None and num_target_latents != bg_clean.shape[1]:
-            bg_clean = bg_clean[:, :num_target_latents]
+        if getattr(self.denoiser.cfg, "ldt_input_type", "teacher_bg") == "recon_left":
+            bg_clean = None   # ldt가 x_in의 recon-left 절반을 씀 (GT bg 불필요)
+        else:
+            bg_clean = self.denoiser.encode_bg(recon_video.to(device=device, dtype=dtype))
+            if num_target_latents is not None and num_target_latents != bg_clean.shape[1]:
+                bg_clean = bg_clean[:, :num_target_latents]
         scene_tokens = None
         if self.model_cfg.compressor is not None:
             ctx_lat = get_latents(autoencoder=self.autoencoder, inputs=batch["context"], view_type="context",
@@ -656,16 +680,18 @@ class T2VWrapper(DiffusionWrapper):
         b, v_t = target_reco.shape[:2]
         wh = target_reco.shape[-1] // 2
 
-        # full-sequence flow sampling (bg teacher-forced from GT at each t)
+        # full-sequence flow sampling. recon_left 모드는 ldt가 x_in의 recon-left 절반을
+        # 쓰므로 GT 배경 불필요(=진짜 test-time). teacher_bg 모드만 GT bg를 매 t 노이즈.
+        recon_left_mode = getattr(self.denoiser.cfg, "ldt_input_type", "teacher_bg") == "recon_left"
         self.scheduler.set_timesteps(self.model_cfg.scheduler.num_inference_steps)
         ts_list = self.scheduler.timesteps  # cpu (next_timestep이 cpu 비교) — step 내부서 device 처리
         x = torch.randn_like(target_reco)
-        noise_bg = torch.randn_like(bg_clean)
+        noise_bg = None if recon_left_mode else torch.randn_like(bg_clean)
         for i in range(len(ts_list) - 1):
             t = ts_list[i]
             ts_full = t.reshape(1, 1).expand(b, v_t).to(device=d["device"], dtype=d["dtype"])
             x_in = self.scheduler.scale_model_input(x, ts_full)
-            bg_t = self.scheduler.add_noise(bg_clean, noise_bg, ts_full)
+            bg_t = None if recon_left_mode else self.scheduler.add_noise(bg_clean, noise_bg, ts_full)
             inp = DenoiserInputs(view=x_in, pose=d["target_pose"], timestep=self.rescale_timesteps(ts_full),
                                  state=None, text=text, condition_latents=bg_t, raw_state=d["raw_scene"])
             pred = self.denoiser(inputs=inp, temporal_downsample=td, chunk_targets=False)
