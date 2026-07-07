@@ -702,7 +702,11 @@ def simple_wan_video_fn(
     scene_latent_tokens = None
     if scene_context is not None and scene_input_type != "none":
         scene_context = scene_context.to(dtype=latents.dtype, device=latents.device)
-        scene_context = dit.embed_scene_context(scene_context)
+        # `embed_scene_context` was never defined on WanModel — scene tokens are
+        # already projected to model.dim by the wrapper's `cnd_proj`. Identity
+        # unless a model defines its own projection (mirrors wan_ti2v.py).
+        if hasattr(dit, "embed_scene_context"):
+            scene_context = dit.embed_scene_context(scene_context)
         if scene_input_type == "cross_attention":
             if context is None:
                 context = scene_context

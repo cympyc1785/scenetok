@@ -65,6 +65,20 @@ class LightningDiTCfg:
     load_strict: bool=True
     causal_attention: bool=False
     text_cond_dim: int | None = None
+    # (①) Channel-concat the raw Plücker target ray map (6*temporal_downsample ch,
+    # generated at the LATENT grid = input_shape) onto the noisy latent before the
+    # patch-embed conv — paper-faithful (tgt_embedder concats 6ch ray + noisy image)
+    # and mirrors wan_ti2v's `channel_concat`. x_embedder input channels are inflated
+    # by 6*td, EXTRA channels zero-init (orig channels kept) so at init the concat ray
+    # contributes 0 → warm-start preserved. The existing lvsm-adaLN ray is kept too.
+    ray_channel_concat: bool = False
+    # (②) Per-view 2D RoPE on the scene cross-attn (attn2): scene-token keys are
+    # rotated by their (context-view, h_c, w_c) grid position and the target queries
+    # by their (target-frame, h_t, w_t) grid, restoring the spatial structure lost when
+    # rec_tokens were flattened (V*P). Requires `scene_rope_grid=[V_ctx, h_c, w_c]`.
+    # Replaces the 3D feat_rope on the attn2 query (attn1 keeps 3D). Default off.
+    scene_2d_rope: bool = False
+    scene_rope_grid: Union[Tuple[int], list[int], None] = None  # [V_ctx, h_c, w_c]
 class LightningDiT(Denoiser[LightningDiTCfg]):
     def __init__(
         self, 
@@ -109,8 +123,29 @@ class LightningDiT(Denoiser[LightningDiTCfg]):
             num_split=num_split,
             causal_attention=cfg.causal_attention,
             rope_pt_input_size=cfg.rope_pt_input_shape,
+            scene_2d_rope=getattr(cfg, "scene_2d_rope", False),
+            scene_rope_grid=getattr(cfg, "scene_rope_grid", None),
         )
-        
+        self.ray_channel_concat = getattr(cfg, "ray_channel_concat", False)
+        self.temporal_downsample = temporal_downsample
+        if self.ray_channel_concat:
+            # Second camera (skip_embedding) that emits the raw Plücker ray at the
+            # LATENT grid (input_shape) for channel-concat. embed_dim unused.
+            import copy
+            concat_cam_cfg = copy.deepcopy(cfg.camera)
+            try:
+                concat_cam_cfg.input_shape = cfg.input_shape
+            except Exception:
+                from omegaconf import OmegaConf
+                OmegaConf.set_struct(concat_cam_cfg, False)
+                concat_cam_cfg.input_shape = cfg.input_shape
+            self.concat_pose = get_camera(
+                concat_cam_cfg, num_split=num_split, using_wan=using_wan,
+                embed_dim=cfg.kwargs.hidden_size, temporal_downsample=temporal_downsample,
+            )
+            print(f"(Denoiser) ① ray_channel_concat ON: +{6*max(temporal_downsample,1)} ray ch "
+                  f"at latent grid {cfg.input_shape} (extra x_embedder ch zero-init)")
+
         if self.pretrained_from is not None:
             print("(Denoiser) Loading from pretrained: ", self.pretrained_from)
             weights = torch.load(self.pretrained_from, map_location=torch.device("cpu"))["model"]
@@ -130,6 +165,26 @@ class LightningDiT(Denoiser[LightningDiTCfg]):
 
         if cfg.ckpt_path is not None:
             self.load_weights(cfg.ckpt_path, strict=cfg.load_strict)
+
+        # (①) x_embedder surgery AFTER warm-start: expand input channels by the ray
+        # channel count, copy the (warm-started) original channels, zero-init the extra
+        # → concat ray contributes 0 at init (identical to the pre-concat model).
+        if self.ray_channel_concat:
+            extra = 6 * max(self.temporal_downsample, 1)
+            orig = self.model.x_embedder.proj
+            new = nn.Conv2d(
+                orig.in_channels + extra, orig.out_channels,
+                kernel_size=orig.kernel_size, stride=orig.stride,
+                padding=orig.padding, bias=orig.bias is not None,
+            )
+            with torch.no_grad():
+                new.weight.zero_()
+                new.weight[:, : orig.in_channels].copy_(orig.weight)
+                if orig.bias is not None:
+                    new.bias.copy_(orig.bias)
+            self.model.x_embedder.proj = new.to(orig.weight.device, orig.weight.dtype)
+            print(f"(Denoiser) ① x_embedder in_channels {orig.in_channels} -> "
+                  f"{orig.in_channels + extra} (extra zero-init, warm-start preserved)")
 
     def load_weights(
         self,
@@ -181,6 +236,18 @@ class LightningDiT(Denoiser[LightningDiTCfg]):
                 state = text
             else:
                 state = torch.cat([state, text], dim=1)
+
+        # (①) Channel-concat the raw Plücker ray (latent-grid, 6*td ch) onto the latent.
+        if self.ray_channel_concat:
+            raw_ray = self.concat_pose(
+                pose,
+                temporal_downsample=temporal_downsample,
+                chunk_targets=chunk_targets,
+                skip_embedding=True,
+            )  # (b, v, 6*td, h, w) at latent grid
+            if raw_ray.shape[1] != latents.shape[1] or raw_ray.shape[-2:] != latents.shape[-2:]:
+                raise ValueError("ray_channel_concat shape mismatch", raw_ray.shape, latents.shape)
+            latents = torch.cat([latents, raw_ray.to(latents.dtype)], dim=2)
 
         pemb = rearrange(pemb, "b v c h w -> b v (h w) c")
         sample, qk_list = self.model(latents=latents, pose=pemb.bfloat16(), timestep=timestep, cond_state=state)

@@ -1,0 +1,128 @@
+# @package _global_
+#
+# Stage A dense-direct + two convergence-speedups over lagernvs_va-wan_dl3dv_recon:
+#   #1 scene_lr_mult=10 → scene pathway (cnd_proj / scene cross-attn attn2 /
+#      null_tokens + compressor output_norm) trains at 1e-4 while the pretrained
+#      backbone stays at 1e-5. Addresses the freshly-init (cond_dim 64->768) scene
+#      path being learned from scratch at a low finetune LR.
+#   #2 compressor output_norm=true → trainable LayerNorm re-scales the frozen VGGT
+#      rec_tokens toward the distribution the pretrained scene cross-attn expects.
+# freeze.compressor=false so the output_norm trains (reconstructor stays hard-frozen).
+defaults:
+  - override /dataset: dl3dv
+  - override /dataset/view_sampler: bounded
+  - override /model/scheduler: rf
+  - override /model/denoiser: lightningdit_L_1
+  - override /model/autoencoders/context: va
+  - override /model/autoencoders/target: wan
+  - override /model/compressor: lagernvs
+  - override /model/denoiser/camera: ray
+  - override /model/denoiser/camera/embedding: lvsm
+
+dataset:
+  root: ./DATA/DL3DV/DL3DV-960
+  smallset: true
+  target_latent_type: wan
+  context_shape: [256, 448]
+  target_shape: [256, 448]
+  scale_context_focal_by_256: true
+  view_sampler:
+    num_context_views: 16
+    num_target_views: 10
+    min_distance_between_context_views: 64
+    max_distance_between_context_views: 96
+    context_gap_warm_up_steps: 30_000
+    target_gap_warm_up_steps: 30_000
+    initial_min_distance_between_context_views: 48
+    initial_max_distance_between_context_views: 64
+    chunk_targets: false
+    offset: 1
+
+data_loader:
+  train:
+    batch_size: 2
+  val:
+    standard:
+      shuffle: false
+      batch_size: 2
+      max_batches: 4
+      num_workers: 4
+      seed: 0
+      interval: 5000
+      persistent_workers: false
+    unseen:
+      shuffle: false
+      batch_size: 2
+      max_batches: 4
+      num_workers: 4
+      seed: 0
+      interval: 5000
+      persistent_workers: false
+val:
+  video_length: 34
+  window_shift: 5
+wandb:
+  tags: [dl3dv, lagernvs, stage_a, dense, sceneLR, output_norm, geoconn]
+  activated: true
+
+sampler:
+  clean_targets: 5
+
+freeze:
+  denoiser: false
+  compressor: false       # only compressor.output_norm trains (reconstructor hard-frozen in-module)
+
+model:
+  scheduler:
+    sampling_type: random_uniform
+    num_inference_steps: 25
+    kwargs:
+      weighting: shifted
+      timestep_shift: 4
+  compressor:
+    token_reduction: none   # dense-direct (12432 rec_tokens)
+    output_norm: true       # #2: trainable LayerNorm on rec_tokens
+    unfreeze_geo_connector: true  # #6: geo_feature_connector+norm trainable (VGGT frozen)
+    token_dim: 768
+  denoiser:
+    ckpt_path: checkpoints/va-wan_dl3dv.ckpt
+    load_strict: false
+    input_shape: [16, 28]
+    gradient_checkpointing: true
+    num_target_split: 1
+    camera:
+      input_shape: [128, 224]
+      embedding:
+        patch_size: 8
+        in_channels: 24
+    kwargs:
+      use_rope_3d: true
+      in_channels: 48
+
+trainer:
+  max_steps: 5_000_001
+  val_check_interval: 5000
+  task_steps: null
+  accumulate_grad_batches: 1
+  gradient_clip_val: 0.1
+  precision: bf16-mixed
+
+optimizer:
+  name: AdamW
+  lr: 1.0e-5
+  scale_lr: false
+  scene_lr_mult: 10.0       # #1: scene pathway at 1e-4, backbone at 1e-5
+  milestones: [2000]
+  scheduler:
+    - name: LinearLR
+      frequency: 1
+      interval: step
+      kwargs:
+        start_factor: 5.e-4
+        total_iters: 2000
+    - name: MultiStepLR
+      frequency: 1
+      interval: step
+      kwargs:
+        milestones: [500000]
+        gamma: 0.8

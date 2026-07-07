@@ -1,0 +1,15 @@
+name: lagernvs_renderer
+
+# Feed-forward (deterministic) LagerNVS renderer as a SceneTok decoder.
+# No camera/embedding subgroups (unlike lightningdit) — target rays are built in
+# the wrapper's recon path; scene tokens (token_dim) enter via a trainable adapter.
+scene_token_dim: 64
+hidden_size: 768        # B/8 renderer width
+depth: 12
+num_heads: 12
+patch_size: 8
+attention_type: bidirectional_cross_attention
+out_channels: 3
+# general_512 warm-start (set to null for scratch).
+renderer_ckpt: /data1/cympyc1785/lagernvs/checkpoints/lagernvs_general_512/model.pt
+load_strict: false
