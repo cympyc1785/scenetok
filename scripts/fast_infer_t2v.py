@@ -78,6 +78,9 @@ def parse_args():
     p.add_argument("--num_context_views", type=int, default=None)
     p.add_argument("--num_target_views", type=int, default=None)
     p.add_argument("--output_dir", default=None)
+    p.add_argument("--camera_rotate_deg", type=float, default=0.0,
+                   help="OOD test: target 카메라를 첫 프레임 기준 한쪽으로 점진 회전(총 deg). 0=off.")
+    p.add_argument("--camera_rotate_dir", default="right", choices=["right", "left", "up", "down"])
     p.add_argument("--ti2v_first_frame", action="store_true",
                    help="TI2V: GT target 첫 프레임 VAE latent을 매 denoising step frame0에 강제 주입.")
     p.add_argument("--max_scenes", type=int, default=1,
@@ -327,6 +330,30 @@ def main():
             with (input_dir / "meta.json").open("w") as fp:
                 json.dump(meta, fp, indent=2, default=str)
             print(f"[fast_infer] saved inputs → {input_dir}")
+
+            # OOD camera test: target 궤적을 첫 프레임 기준 한쪽으로 점진 회전(local yaw/pitch)
+            # 으로 교체. base @ rot(f·deg), f=0→1. (preprocess 전, c2w 기준)
+            if args.camera_rotate_deg != 0.0:
+                import numpy as _np
+                ext = batch["target"]["extrinsics"]                    # (b, v_t, 4, 4) c2w
+                bsz, vt = ext.shape[0], ext.shape[1]
+                base = ext[:, 0:1].clone()                             # (b,1,4,4)
+                th = _np.radians(args.camera_rotate_deg)
+                def _rot(axis, a):
+                    c, s = _np.cos(a), _np.sin(a)
+                    if axis == "y":  R = _np.array([[c,0,s],[0,1,0],[-s,0,c]])
+                    else:            R = _np.array([[1,0,0],[0,c,-s],[0,s,c]])
+                    return R
+                axis = "x" if args.camera_rotate_dir in ("up", "down") else "y"
+                sign = {"right": 1, "left": -1, "up": 1, "down": -1}[args.camera_rotate_dir]
+                poses = []
+                for i in range(vt):
+                    f = (i / (vt - 1)) if vt > 1 else 1.0
+                    d = torch.eye(4, dtype=ext.dtype, device=ext.device)
+                    d[:3, :3] = torch.from_numpy(_rot(axis, sign * f * th)).to(ext.dtype).to(ext.device)
+                    poses.append(base[:, 0] @ d)                       # (b,4,4)
+                batch["target"]["extrinsics"] = torch.stack(poses, dim=1)  # (b,v_t,4,4)
+                print(f"[fast_infer] OOD camera: rotate {args.camera_rotate_dir} {args.camera_rotate_deg}deg over {vt} frames (base=target[0])")
 
             # preprocess_batch mutates extrinsics → call ONCE then reuse.
             batch = preprocess_batch(batch, index=v_c // 2)
