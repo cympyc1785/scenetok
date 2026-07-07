@@ -1,0 +1,167 @@
+# @package _global_
+#
+# scenetok_va-wan2.1_dl3dv_256_finetune_small 재학습 — docs/KNOWN_BUGS.md 안내대로
+# 의도적 버그 플래그를 모두 끈(정상) 버전. 원본 run(exp/.../.hydra/config.yaml)과
+# 아키텍처·데이터·optim 전부 동일하고 아래 3개만 정정:
+#   Bug1 scale_focal_by_256        : false (원본도 false — 유지)
+#   Bug2 scale_context_focal_by_256: true  -> **false** (원본에서 유일하게 켜져 있던 버그)
+#   Bug3 force_incorrect           : false -> lvsm camera embed temporal_downsample=4
+#        (target=wan이면 diffusion_wrapper.py:378에서 td=4. 원본도 미설정=false라 이미
+#         td=4였음 — 명시만 함). 릴리즈 ckpt의 td=1과 달리 정상.
+# 타깃 VAE는 Wan2.1_VAE.pth(16ch, f8 → 256x448 latent [32,56]) — repo 기본 wan은 이제
+# Wan2.2(48ch)로 바뀌었으므로 여기서 pretrained_from/latent_channels를 명시 override.
+# va-wan_dl3dv.ckpt에서 finetune(load_strict=false로 채널 불일치 layer 재init·재적응).
+defaults:
+  - override /dataset: dl3dv
+  - override /dataset/view_sampler: bounded
+  - override /model/scheduler: rf
+  - override /model/denoiser: lightningdit_L_1
+  - override /model/autoencoders/context: va
+  - override /model/autoencoders/target: wan
+  - override /model/compressor: mv_B1
+  - override /model/compressor/camera: ray
+  - override /model/compressor/camera/embedding: lvsm
+  - override /model/denoiser/camera: ray
+  - override /model/denoiser/camera/embedding: lvsm
+
+dataset:
+  root: ./DATA/DL3DV/DL3DV-960
+  smallset: true
+  target_latent_type: wan
+
+  context_shape: [256, 448]
+  target_shape: [256, 448]
+
+  # KNOWN_BUGS.md Bug1/Bug2 정정: intrinsic scaling 모두 off (intrinsics는 이미 저장된
+  # H/W로 정규화되어 추가 스케일 불필요).
+  scale_context_focal_by_256: false
+  scale_focal_by_256: false
+
+  view_sampler:
+    num_context_views: 16
+    num_target_views: 10
+    min_distance_between_context_views: 64
+    max_distance_between_context_views: 96
+    context_gap_warm_up_steps: 30_000
+    target_gap_warm_up_steps: 30_000
+    initial_min_distance_between_context_views: 48
+    initial_max_distance_between_context_views: 64
+    chunk_targets: false
+    chunk_index_gap: 4
+    target_split_prob: 0.8
+    temporal_downsample: 4
+    context_sampling: farthest_point
+    offset: 1
+
+data_loader:
+  train:
+    batch_size: 8
+  val:
+    standard:
+      shuffle: false
+      batch_size: 4
+      max_batches: 8
+      num_workers: 4
+      seed: 0
+      interval: 5000
+      persistent_workers: false
+    unseen:
+      shuffle: false
+      batch_size: 4
+      max_batches: 8
+      num_workers: 4
+      seed: 0
+      interval: 5000
+      persistent_workers: false
+val:
+  video_length: 34
+  window_shift: 5
+wandb:
+  tags: [dl3dv, 256x448, va-wan2.1, unscaled_intrin]
+  activated: true
+
+sampler:
+  clean_targets: 5
+freeze:
+  denoiser: false
+  compressor: false
+model:
+  # KNOWN_BUGS.md Bug3 정정(명시): force_incorrect=false -> target=wan에서 td=4.
+  force_incorrect: false
+
+  autoencoders:
+    target:
+      # repo 기본 wan은 이제 Wan2.2(48ch). 원본 run과 동일하게 Wan2.1(16ch)로 고정.
+      pretrained_from: checkpoints/Wan2.1_VAE.pth
+      kwargs:
+        latent_channels: 16
+
+  scheduler:
+    sampling_type: random_uniform
+    num_inference_steps: 25
+    kwargs:
+      weighting: shifted
+      timestep_shift: 4
+  denoiser:
+    ckpt_path: checkpoints/va-wan_dl3dv.ckpt
+    load_strict: false # 채널 불일치(64->768 등) layer는 drop·재init
+    input_shape: [32, 56]   # Wan2.1 f8 target latent grid (256/8, 448/8)
+    gradient_checkpointing: true
+    num_target_split: 1
+    camera:
+      input_shape: [256, 448]
+      embedding:
+        patch_size: 8
+        in_channels: 24
+    kwargs:
+      use_rope_3d: true
+      in_channels: 16        # Wan2.1 latent channels
+
+  compressor:
+    ckpt_path: checkpoints/va-wan_dl3dv.ckpt
+    load_strict: false
+    kl_weights: [1e-10, 1e-10]
+    input_shape: [16, 28]    # VA-VAE f16 context latent grid (256/16, 448/16)
+    num_scene_tokens: 1024
+    causal_self_atten: false
+    gradient_checkpointing: true
+    token_dim: 64
+    init_large: true
+    camera_conditioning: adaLN
+    scene_token_projection: kl
+    mask_context: false
+    camera:
+      input_shape: [128, 224]
+      embedding:
+        patch_size: 16
+    kwargs:
+      use_rope_2d: true
+      use_rope_3d: false
+      patch_size: 2
+
+trainer:
+  max_steps: 5_000_001
+  val_check_interval: 5000
+  task_steps: null
+  accumulate_grad_batches: 1
+  gradient_clip_val: 0.1
+  precision: bf16-mixed
+
+optimizer:
+  name: AdamW
+  lr: 1.0e-5
+  scale_lr: false
+  milestones: [2000]
+  scheduler:
+    - name: LinearLR
+      frequency: 1
+      interval: step
+      kwargs:
+        start_factor: 5.e-4
+        total_iters: 2000
+    - name: MultiStepLR
+      frequency: 1
+      interval: step
+      kwargs:
+        milestones: [500000]
+        gamma: 0.8

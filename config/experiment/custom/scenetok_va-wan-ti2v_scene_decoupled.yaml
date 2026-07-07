@@ -45,16 +45,16 @@ data_loader:
   val:
     standard:
       shuffle: false
-      batch_size: 8
-      max_batches: 4
+      batch_size: 2
+      max_batches: 16
       num_workers: 2
       seed: 0
       interval: 5000
       persistent_workers: false
     unseen:
       shuffle: false
-      batch_size: 8
-      max_batches: 4
+      batch_size: 2
+      max_batches: 16
       num_workers: 2
       seed: 0
       interval: 5000
@@ -112,7 +112,7 @@ model:
         freq_direction: 15
 
   compressor:
-    ckpt_path: checkpoints/va-wan_dl3dv_256x448.ckpt
+    ckpt_path: checkpoints/va-wan_dl3dv_256-480_unscaled_intrins_weights.ckpt
     load_strict: false
     kl_weights: [0.0, 0.0]
     input_shape: [16, 28]
@@ -137,7 +137,7 @@ trainer:
   max_steps: 5_000_001
   val_check_interval: 5000
   task_steps: null
-  accumulate_grad_batches: 1
+  accumulate_grad_batches: 2  # train batch_size 4 × 2 = effective batch 8
   gradient_clip_val: 0.1
   precision: bf16-mixed
 

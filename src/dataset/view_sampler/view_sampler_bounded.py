@@ -28,6 +28,13 @@ class ViewSamplerBoundedCfg(ViewSamplerCfg):
     offset: int=0
     chunk_targets: bool=True
     override_context_gap: int | None = None
+    # Randomly permute the (temporally-sorted) context view order at train time.
+    # Matches LagerNVS's own pretraining, which shuffles conditioning views
+    # (ExpandedLinearViewSelector: np.random.choice(cond, replace=False)); the
+    # scene encoder is permutation-equivariant so this only affects ordering, and
+    # (image, pose) stay paired since the whole index tensor is permuted together.
+    # Default False = existing sorted (temporal) behavior. Target order untouched.
+    shuffle_context: bool = False
 
 
 class ViewSamplerBounded(ViewSampler[ViewSamplerBoundedCfg]):
@@ -291,7 +298,11 @@ class ViewSamplerBounded(ViewSampler[ViewSamplerBoundedCfg]):
             if index_target is not None:
                 index_target %= num_views
             index_context_right %= extrinsics.shape[0]
-        return ViewIndex(torch.tensor(sorted([index_context_left, *indices, index_context_right])), index_unrolled), index_target
+        context_index = torch.tensor(sorted([index_context_left, *indices, index_context_right]))
+        if self.cfg.shuffle_context and self.stage == "train":
+            # Permute context order (train only). Keeps target ordering intact.
+            context_index = context_index[torch.randperm(context_index.numel())]
+        return ViewIndex(context_index, index_unrolled), index_target
 
     @property
     def num_context_views(self) -> int:

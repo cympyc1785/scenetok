@@ -76,7 +76,8 @@ class Attention(nn.Module):
             self.to_v = nn.Linear(dim, dim, bias=qkv_bias)
 
         
-    def forward(self, x: torch.Tensor, context=None, rope=None, num_views: int=6, num_split: int=1) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, context=None, rope=None, num_views: int=6, num_split: int=1,
+                scene_rope_q=None, scene_rope_k=None, num_ctx_views=None) -> torch.Tensor:
         B, N, C = x.shape
 
         if self.cross_atten:
@@ -87,6 +88,25 @@ class Attention(nn.Module):
             qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
             q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
+
+        # (②) Per-view 2D scene RoPE on the cross-attn (attn2): rotate the target
+        # queries by their (h_t,w_t) grid and the scene keys by their (h_c,w_c) grid.
+        # Overrides the default (3D-on-query-only) rope path for attn2.
+        if self.cross_atten and scene_rope_q is not None:
+            # q: (B, heads, num_views*n_t, d) -> per target view
+            q = rearrange(q, "b h (v n) d -> (b v) h n d", v=num_views)
+            q = scene_rope_q(q)
+            q = rearrange(q, "(b v) h n d -> b h (v n) d", v=num_views)
+            # k: (B, heads, num_ctx*P, d) -> per context view
+            k = rearrange(k, "b h (v p) d -> (b v) h p d", v=num_ctx_views)
+            k = scene_rope_k(k)
+            k = rearrange(k, "(b v) h p d -> b h (v p) d", v=num_ctx_views)
+            q = rearrange(q, "b h n d -> b n h d")
+            k = rearrange(k, "b h n d -> b n h d")
+            v = rearrange(v, "b h n d -> b n h d")
+            x = flash_attn_func(q, k, v, dropout_p=self.attn_drop if self.training else 0., causal=self.is_causal)
+            x = rearrange(x, "b n h d -> b n (h d)")
+            return self.proj_drop(self.proj(x))
 
         if rope is not None:
             if self.is_3d_rope:
@@ -281,17 +301,21 @@ class LightningDiTBlock(nn.Module):
             )
         self.wo_shift = wo_shift
 
-    def forward(self, x, c, y, feat_rope=None, num_views: int=6, num_split: int=1):
+    def forward(self, x, c, y, feat_rope=None, num_views: int=6, num_split: int=1,
+                scene_rope_q=None, scene_rope_k=None, num_ctx_views=None):
         if self.wo_shift:
             scale_msa, gate_msa, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(4, dim=2)
             shift_msa = None
             shift_mlp = None
         else:
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=2)
-        
+
 
         x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), context=None, rope=feat_rope, num_views=num_views, num_split=num_split)
-        x = x + self.attn2(x, context=y, rope=feat_rope, num_views=num_views, num_split=num_split)
+        # (②) attn2 uses per-view 2D scene RoPE when provided (query=target grid,
+        # key=scene grid); else the original behaviour (3D feat_rope on query only).
+        x = x + self.attn2(x, context=y, rope=feat_rope, num_views=num_views, num_split=num_split,
+                           scene_rope_q=scene_rope_q, scene_rope_k=scene_rope_k, num_ctx_views=num_ctx_views)
         x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
@@ -345,6 +369,8 @@ class LitDiT(nn.Module):
         frequency_embedding_size: int=256,
         causal_attention: bool=False,
         rope_pt_input_size=None,
+        scene_2d_rope: bool=False,
+        scene_rope_grid=None,
     ):
         super().__init__()
         print("(LitDiT) Number of target splits: ", num_split)
@@ -424,6 +450,24 @@ class LitDiT(nn.Module):
                      causal_attention=causal_attention,
                      ) for _ in range(depth)
         ])
+        # (②) Per-view 2D RoPE for the scene cross-attention (attn2). Target queries
+        # rotated by their (h_t, w_t) latent grid, scene keys by their (h_c, w_c)
+        # context-patch grid → spatial structure restored on the flattened rec_tokens.
+        self.scene_2d_rope = scene_2d_rope
+        self.scene_rope_q = None
+        self.scene_rope_k = None
+        self.scene_ctx_views = None
+        if scene_2d_rope:
+            from ...encodings.embeddings import RotaryEmbedding2D
+            assert scene_rope_grid is not None and len(scene_rope_grid) == 3, \
+                "scene_2d_rope requires scene_rope_grid=[V_ctx, h_c, w_c]"
+            v_ctx, h_c, w_c = [int(s) for s in scene_rope_grid]
+            self.scene_ctx_views = v_ctx
+            hw_t = (input_hw[0] // patch_size, input_hw[1] // patch_size)
+            self.scene_rope_q = RotaryEmbedding2D(self.rope_dim, sizes=hw_t)
+            self.scene_rope_k = RotaryEmbedding2D(self.rope_dim, sizes=(h_c, w_c))
+            print(f"(LitDiT) ② scene 2D RoPE: query grid {hw_t}, scene key grid "
+                  f"({h_c},{w_c}) x {v_ctx} ctx views")
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels, use_rmsnorm=use_rmsnorm)
         self.initialize_weights()
 
@@ -532,9 +576,13 @@ class LitDiT(nn.Module):
         for block in self.blocks:
             # print(x.dtype, c.dtype, y.dtype)
             if use_checkpoint:
-                x = checkpoint(block, x, c, y, self.feat_rope, v, self.num_split, use_reentrant=False)
+                x = checkpoint(block, x, c, y, self.feat_rope, v, self.num_split,
+                               self.scene_rope_q, self.scene_rope_k, self.scene_ctx_views,
+                               use_reentrant=False)
             else:
-                x = block(x, c, y=y, feat_rope=self.feat_rope, num_views=v, num_split=self.num_split)
+                x = block(x, c, y=y, feat_rope=self.feat_rope, num_views=v, num_split=self.num_split,
+                          scene_rope_q=self.scene_rope_q, scene_rope_k=self.scene_rope_k,
+                          num_ctx_views=self.scene_ctx_views)
 
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
         x = rearrange(x, "b (v n) d -> (b v) n d", v=v)

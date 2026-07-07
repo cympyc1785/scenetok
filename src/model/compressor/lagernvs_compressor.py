@@ -15,11 +15,50 @@ from typing import Literal, Optional, Union
 
 import torch
 import einops
+import torch.nn.functional as F
 from torch import nn, Tensor
 from jaxtyping import Float
 
 from .compressor import Compressor
 from ..types import CompressorInputs
+
+
+class PerceiverResampler(nn.Module):
+    """Resample a variable-length set of features to `num_latents` fixed tokens.
+
+    Learnable latent queries cross-attend to the (frozen) dense LagerNVS rec_tokens,
+    interleaved with latent self-attention and an MLP per layer (Perceiver-IO /
+    Flamingo style). Only the latents self-attend — the ~12k rec_tokens are used as
+    keys/values only (no O(N²) self-attention), so this is cheap despite the large
+    input. Output: (b, num_latents, dim) fixed-length scene tokens.
+    """
+
+    def __init__(self, dim: int, num_latents: int, depth: int, num_heads: int, mlp_ratio: float = 4.0):
+        super().__init__()
+        self.latents = nn.Parameter(torch.randn(1, num_latents, dim) * 0.02)
+        self.layers = nn.ModuleList()
+        for _ in range(depth):
+            self.layers.append(nn.ModuleList([
+                nn.LayerNorm(dim), nn.LayerNorm(dim),  # cross: q-norm, kv-norm
+                nn.MultiheadAttention(dim, num_heads, batch_first=True),
+                nn.LayerNorm(dim),  # self-attn norm
+                nn.MultiheadAttention(dim, num_heads, batch_first=True),
+                nn.LayerNorm(dim),  # ffn norm
+                nn.Sequential(nn.Linear(dim, int(dim * mlp_ratio)), nn.GELU(),
+                              nn.Linear(int(dim * mlp_ratio), dim)),
+            ]))
+        self.out_norm = nn.LayerNorm(dim)
+
+    def forward(self, feats: Tensor) -> Tensor:  # feats: (b, N, dim)
+        b = feats.shape[0]
+        q = self.latents.expand(b, -1, -1)
+        for qn, kn, cross, sn, selfa, fn, ff in self.layers:
+            kv = kn(feats)
+            q = q + cross(qn(q), kv, kv, need_weights=False)[0]
+            qs = sn(q)
+            q = q + selfa(qs, qs, qs, need_weights=False)[0]
+            q = q + ff(fn(q))
+        return self.out_norm(q)
 
 # LagerNVS lives in a sibling repo (symlinked at submodules/lagernvs). Add to path so
 # `models.encoder_decoder` imports. xformers is optional there (SDPA fallback patched).
@@ -33,10 +72,26 @@ class LagerNVSCompressorCfg:
     name: Literal["lagernvs_compressor"]
     ckpt_path: str = "/data1/cympyc1785/lagernvs/checkpoints/lagernvs_general_512/model.pt"
     token_dim: int = 768                 # rec_tokens channel == denoiser cond_dim
-    num_scene_tokens: int = 12432        # nominal (v_input*p); cross-attn handles actual count
+    num_scene_tokens: int = 12432        # dense: nominal (v_input*p). perceiver: fixed count.
     scene_token_projection: Literal["simple"] = "simple"   # deterministic features, no KL
     img_norm: Literal["zero_one", "neg_one_one"] = "zero_one"  # input view value range
     load_strict: bool = False
+    # "none" = dense-direct (feed all rec_tokens to the denoiser cross-attn).
+    # "perceiver" = SceneTok-style: resample dense rec_tokens to `num_scene_tokens`
+    #   fixed-length scene tokens via a trainable Perceiver (frozen encoder stays frozen).
+    token_reduction: Literal["none", "perceiver"] = "none"
+    perceiver_depth: int = 6
+    perceiver_heads: int = 12
+    # Trainable LayerNorm on the output rec_tokens (before the denoiser cnd_proj).
+    # Re-scales/shifts the frozen VGGT features toward the distribution the
+    # pretrained scene cross-attn expects → faster adaptation. Needs
+    # freeze.compressor=false so this norm (only) trains (reconstructor stays frozen).
+    output_norm: bool = False
+    # #6: keep VGGT (+ camera_mlp) frozen but UNFREEZE the thin geo_feature_connector
+    # (Linear 2048->768) + geo_feature_norm adapter, so LagerNVS features can align to
+    # the denoiser. Needs freeze.compressor=false. Slightly deviates from the paper's
+    # "encoder fully frozen" recipe (only the connector adapter trains, VGGT stays frozen).
+    unfreeze_geo_connector: bool = False
 
 
 def _freeze(m: nn.Module) -> None:
@@ -63,8 +118,37 @@ class LagerNVSCompressor(Compressor[LagerNVSCompressorCfg]):
         model.load_state_dict(sd["model"], strict=cfg.load_strict)
         # Keep only the reconstructor (VGGT + geo_feature_connector); drop the renderer.
         self.reconstructor = model.reconstructor
-        _freeze(self.reconstructor)
-        print(f"(LagerNVSCompressor) reconstructor loaded & frozen from {cfg.ckpt_path}")
+        if cfg.unfreeze_geo_connector:
+            # Freeze VGGT + camera_mlp (encoder); keep geo_feature_connector +
+            # geo_feature_norm adapter trainable (#6).
+            _freeze(self.reconstructor.vggt)
+            _freeze(self.reconstructor.camera_mlp)
+            for m in (self.reconstructor.geo_feature_connector, self.reconstructor.geo_feature_norm):
+                for p in m.parameters():
+                    p.requires_grad_(True)
+                m.train()
+            print(f"(LagerNVSCompressor) VGGT frozen; geo_feature_connector+norm TRAINABLE (#6), from {cfg.ckpt_path}")
+        else:
+            _freeze(self.reconstructor)
+            print(f"(LagerNVSCompressor) reconstructor loaded & frozen from {cfg.ckpt_path}")
+
+        # Optional trainable Perceiver resampler: dense rec_tokens (768) ->
+        # `num_scene_tokens` fixed-length scene tokens (SceneTok-style). Encoder
+        # stays frozen; this + the denoiser are trained.
+        self.perceiver = None
+        if cfg.token_reduction == "perceiver":
+            self.perceiver = PerceiverResampler(
+                dim=cfg.token_dim,
+                num_latents=cfg.num_scene_tokens,
+                depth=cfg.perceiver_depth,
+                num_heads=cfg.perceiver_heads,
+            )
+            print(f"(LagerNVSCompressor) Perceiver resampler: {cfg.num_scene_tokens} tokens "
+                  f"x {cfg.token_dim}d, depth {cfg.perceiver_depth}")
+
+        self.output_norm = nn.LayerNorm(cfg.token_dim) if cfg.output_norm else None
+        if cfg.output_norm:
+            print(f"(LagerNVSCompressor) trainable output LayerNorm({cfg.token_dim}) on rec_tokens")
 
     @property
     def num_scene_tokens(self) -> int:
@@ -112,8 +196,17 @@ class LagerNVSCompressor(Compressor[LagerNVSCompressorCfg]):
         if self.cfg.img_norm == "neg_one_one":
             imgs = (imgs + 1.0) * 0.5                        # [-1,1] -> [0,1] for VGGT
         cam_token = self._build_cam_token(inputs.pose).to(imgs.dtype)
-        with torch.no_grad():
+        if self.cfg.unfreeze_geo_connector:
+            # VGGT runs no_grad+detach internally (freeze_vggt); grad flows only
+            # through the trainable geo_feature_connector + norm.
             rec = self.reconstructor(imgs, cam_token)        # (b, v, p, 768)
-        rec = einops.rearrange(rec, "b v p c -> b (v p) c")  # dense tokens
+        else:
+            with torch.no_grad():
+                rec = self.reconstructor(imgs, cam_token)    # (b, v, p, 768) fully frozen
+        rec = einops.rearrange(rec, "b v p c -> b (v p) c")  # dense tokens (b, v*p, 768)
+        if self.perceiver is not None:
+            rec = self.perceiver(rec)                        # (b, num_scene_tokens, 768) trainable
+        if self.output_norm is not None:
+            rec = self.output_norm(rec)                      # trainable re-scale toward denoiser cnd_proj input dist
         # Match the (tokens, qk) tuple contract that callers unpack via `tokens, *_`.
         return rec, None

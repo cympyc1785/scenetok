@@ -98,6 +98,11 @@ class OptimizerCfg:
     kwargs: Dict[str, Any] | None = None
     scheduler: LRSchedulerCfg | list[LRSchedulerCfg] | None = None
     override_lr: Optional[float] = None
+    # >1.0 puts the scene-conditioning pathway (denoiser cnd_proj / scene cross-attn
+    # `attn2` / null_tokens + any trainable compressor params) in a param group at
+    # `lr * scene_lr_mult`, while the pretrained backbone stays at base `lr`. Speeds
+    # adaptation of the freshly-initialized scene pathway (e.g. LagerNVS recon).
+    scene_lr_mult: float = 1.0
 
 @dataclass
 class TestCfg:

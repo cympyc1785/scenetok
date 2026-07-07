@@ -1,4 +1,5 @@
 
+import os
 import torch
 import einops
 import numpy as np
@@ -219,15 +220,18 @@ def derive_shape_dependent_fields(dataset_cfg: DatasetCfg, model_cfg: ModelCfg) 
         (so compressor camera tokens align with compressor video tokens).
     """
     # ── Target / denoiser side ──────────────────────────────────────────
+    # The feed-forward LagerNVS renderer renders pixels directly (no latent
+    # `input_shape` / lvsm camera to derive) — skip cleanly.
     target_latent = get_target_latent_shape(dataset_cfg, model_cfg)
-    if target_latent is not None:
+    if target_latent is not None and hasattr(model_cfg.denoiser, "input_shape"):
         _override_if_diff(model_cfg.denoiser, "input_shape", target_latent, "denoiser.input_shape")
-        _derive_camera_shapes(
-            model_cfg.denoiser,
-            pixel_shape=list(dataset_cfg.target_shape),
-            latent_shape=target_latent,
-            label_prefix="denoiser",
-        )
+        if getattr(model_cfg.denoiser, "camera", None) is not None:
+            _derive_camera_shapes(
+                model_cfg.denoiser,
+                pixel_shape=list(dataset_cfg.target_shape),
+                latent_shape=target_latent,
+                label_prefix="denoiser",
+            )
 
     # ── Context / compressor side ───────────────────────────────────────
     compressor_cfg = getattr(model_cfg, "compressor", None)
@@ -328,8 +332,8 @@ class DiffusionWrapper(LightningModule):
         print("(Main Model) Using Memory Efficient Attention: ", self.model_cfg.enable_xformers_memory_efficient_attention)
         print("(Main Model) Using Scheduler from: ", self.model_cfg.scheduler.pretrained_from)
        
-        num_target_split = self.model_cfg.denoiser.num_target_split
-        
+        num_target_split = getattr(self.model_cfg.denoiser, "num_target_split", 1)
+
         print("(Main Model) Number of Target Splits: ", num_target_split)
         print(f"(Sampler) Timestep Shift: {self.model_cfg.scheduler.kwargs.timestep_shift}")
         print(f"(Sampler) Clean Targets: {sampler_cfg.clean_targets}")
@@ -856,6 +860,55 @@ class DiffusionWrapper(LightningModule):
             deduped.append(iss)
         return deduped
 
+    def _lagernvs_renderer_step(self, batch, log_prefix="train"):
+        """Feed-forward (deterministic) recon path: FROZEN SceneTok compressor →
+        scene tokens → LagerNVS renderer(target Plücker rays) → RGB, L2 + LPIPS.
+        No noise / timestep (bypasses the diffusion training_step)."""
+        import torch.nn.functional as F
+        from vis import compute_plucker_coordinates  # lagernvs (sys.path added by renderer module)
+
+        batch = preprocess_batch(batch, index=0)                 # ctx0-relative
+        ctx_ext = batch["context"]["extrinsics"]                 # (b,Vc,4,4) c2w
+        device, dtype = ctx_ext.device, ctx_ext.dtype
+        scene_scale = (1.35 * ctx_ext[:, :, :3, 3].norm(dim=-1).amax(dim=1)).clamp(min=1e-6)  # (b,)
+
+        context_latents = self._compressor_context_view(batch)
+        ctx_inputs = CompressorInputs(
+            view=context_latents,
+            pose=CameraInputs(intrinsics=batch["context"]["intrinsics"], extrinsics=ctx_ext),
+            mask=None,
+        )
+        if self.frozen_compressor:
+            with torch.no_grad():
+                tokens, *_ = self.compressor(inputs=ctx_inputs)
+        else:
+            tokens, *_ = self.compressor(inputs=ctx_inputs)
+        scene_tokens = tokens.sample() if self.model_cfg.compressor.scene_token_projection == "kl" else tokens
+
+        tgt = batch["target"]
+        tgt_rgb = tgt["latent"].to(device).float().clamp(0, 1)   # (b,V,3,H,W) raw RGB [0,1]
+        V, H, W = tgt_rgb.shape[1], tgt_rgb.shape[-2], tgt_rgb.shape[-1]
+        tgt_ext = tgt["extrinsics"].clone().float()
+        tgt_ext[..., :3, 3] = tgt_ext[..., :3, 3] / scene_scale[:, None, None]
+        K = tgt["intrinsics"].float()
+        fxfycxcy = torch.stack([K[..., 0, 0] * W, K[..., 1, 1] * H,
+                                K[..., 0, 2] * W, K[..., 1, 2] * H], dim=-1)   # (b,V,4)
+        target_rays = compute_plucker_coordinates(tgt_ext, fxfycxcy, (H, W)).to(device)  # (b,V,6,H,W)
+
+        rgb = self.denoiser.render(scene_tokens.to(dtype), target_rays.to(dtype)).float()  # (b,V,3,H,W)
+        loss_l2 = F.mse_loss(rgb, tgt_rgb)
+        loss = loss_l2
+        try:
+            lp = self.metric.lpips(rgb.flatten(0, 1) * 2 - 1, tgt_rgb.flatten(0, 1) * 2 - 1).mean()
+            loss = loss_l2 + 0.5 * lp
+            self.log(f"{log_prefix}/lpips", lp, prog_bar=False, sync_dist=True)
+        except Exception as e:
+            if not getattr(self, "_lpips_warned", False):
+                print("(lagernvs_renderer) LPIPS skipped:", e); self._lpips_warned = True
+        self.log(f"{log_prefix}/loss", loss, prog_bar=True, sync_dist=True)
+        self.log(f"{log_prefix}/l2", loss_l2, prog_bar=False, sync_dist=True)
+        return loss
+
     def training_step(self, batch, batch_idx):
         if batch is None:  # safe_collate returned None (entire batch was None-filtered)
             return None
@@ -863,6 +916,13 @@ class DiffusionWrapper(LightningModule):
         if self.step_tracker is not None:
             self.step_tracker.set_step(self.global_step)
             self.log(f"step_tracker/step", self.step_tracker.get_step())
+
+        # Feed-forward (deterministic) LagerNVS renderer decoder → separate recon path.
+        if getattr(self.model_cfg.denoiser, "name", None) == "lagernvs_renderer":
+            loss = self._lagernvs_renderer_step(batch, log_prefix="train")
+            if os.environ.get("DEBUG") and self.global_step < 3:
+                print(f"Train step {self.global_step}; loss = {loss.item():.4f}")
+            return loss
 
         # convert all camera poses for context and target to relative w.r.t a random context camera
         # during test time, you can select any context index to be the origin
@@ -1102,6 +1162,13 @@ class DiffusionWrapper(LightningModule):
     # @rank_zero_only
     def validation_step(self, batch, batch_idx, dataloader_idx: Optional[int]=None):
         if batch is None:
+            return None
+
+        # Feed-forward LagerNVS renderer: recon-loss val only (no diffusion rollout).
+        if getattr(self.model_cfg.denoiser, "name", None) == "lagernvs_renderer":
+            with torch.no_grad():
+                loader_name = self.validation_loader_names.get(dataloader_idx or 0, f"val_{dataloader_idx}")
+                self._lagernvs_renderer_step(batch, log_prefix=f"val/{loader_name}")
             return None
 
         # val_step = global step // val_check_interval → clean validation counter
@@ -1565,9 +1632,31 @@ class DiffusionWrapper(LightningModule):
             )
 
     def configure_optimizers(self):
-        param_list = [{"params": self.denoiser.parameters()}]
-        if self.model_cfg.compressor is not None:
-            param_list.append({"params": self.compressor.parameters()})
+        scene_lr_mult = getattr(self.optimizer_cfg, "scene_lr_mult", 1.0)
+        if scene_lr_mult and scene_lr_mult != 1.0:
+            # Higher LR for the (freshly-init) scene-conditioning pathway; base LR
+            # for the pretrained backbone. Scene params = denoiser cnd_proj / scene
+            # cross-attn (`attn2`) / null_tokens + all trainable compressor params.
+            scene_kw = ("cnd_proj", "attn2", "null_tokens")
+            scene_params, base_params = [], []
+            for n, p in self.denoiser.named_parameters():
+                if not p.requires_grad:
+                    continue
+                (scene_params if any(k in n for k in scene_kw) else base_params).append(p)
+            param_list = [
+                {"params": base_params, "lr": self.lr},
+                {"params": scene_params, "lr": self.lr * scene_lr_mult},
+            ]
+            if self.model_cfg.compressor is not None:
+                comp_params = [p for p in self.compressor.parameters() if p.requires_grad]
+                if comp_params:
+                    param_list.append({"params": comp_params, "lr": self.lr * scene_lr_mult})
+            print(f"(Optimizer) scene_lr_mult={scene_lr_mult}: base {len(base_params)} @ {self.lr}, "
+                  f"scene {len(scene_params)} @ {self.lr * scene_lr_mult}")
+        else:
+            param_list = [{"params": self.denoiser.parameters()}]
+            if self.model_cfg.compressor is not None:
+                param_list.append({"params": self.compressor.parameters()})
         optimizer = self.get_optimizer(self.optimizer_cfg, param_list, self.lr)
         if self.optimizer_cfg.scheduler is not None:
             if type(self.optimizer_cfg.scheduler) == list:
