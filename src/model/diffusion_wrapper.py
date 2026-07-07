@@ -1,4 +1,5 @@
 
+import os
 import torch
 import einops
 import numpy as np
@@ -1412,6 +1413,27 @@ class DiffusionWrapper(LightningModule):
             scaling_factor=getattr(self.model_cfg.autoencoders, "context").kwargs.scaling_factor,
             chunk_targets=getattr(self.dataset_cfg.view_sampler, "chunk_targets", True),
         )
+
+        # OOD camera test (env-var): target 궤적을 첫 프레임 기준 한쪽으로 점진 회전으로 교체.
+        #   OOD_CAMERA_ROTATE_DEG (총 deg) + OOD_CAMERA_ROTATE_DIR (right/left/up/down).
+        _ood_deg = float(os.environ.get("OOD_CAMERA_ROTATE_DEG", "0") or 0)
+        if _ood_deg != 0.0:
+            import numpy as _np
+            ext = batch["target"]["extrinsics"]; vt = ext.shape[1]; base = ext[:, 0:1].clone()
+            th = _np.radians(_ood_deg); _dir = os.environ.get("OOD_CAMERA_ROTATE_DIR", "right")
+            axis = "x" if _dir in ("up", "down") else "y"
+            sign = {"right": 1, "left": -1, "up": 1, "down": -1}[_dir]
+            def _rot(ax, a):
+                c, s = _np.cos(a), _np.sin(a)
+                return _np.array([[c,0,s],[0,1,0],[-s,0,c]]) if ax == "y" else _np.array([[1,0,0],[0,c,-s],[0,s,c]])
+            poses = []
+            for i in range(vt):
+                f = (i / (vt - 1)) if vt > 1 else 1.0
+                d = torch.eye(4, dtype=ext.dtype, device=ext.device)
+                d[:3, :3] = torch.from_numpy(_rot(axis, sign * f * th)).to(ext.dtype).to(ext.device)
+                poses.append(base[:, 0] @ d)
+            batch["target"]["extrinsics"] = torch.stack(poses, dim=1)
+            print(f"(OOD recon) rotate {_dir} {_ood_deg}deg over {vt} frames (base=target[0])")
 
         # Relative camera w.r.t middle context camera (can be any other context camera)
         batch = preprocess_batch(batch, index=v_c//2)
