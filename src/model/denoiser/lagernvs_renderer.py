@@ -26,9 +26,22 @@ import torch
 import einops
 from torch import nn, Tensor
 
-_LAGERNVS_ROOT = "/data1/cympyc1785/lagernvs"
+# LagerNVS lives in a sibling repo. Prefer the in-repo checkout at
+# submodules/lagernvs; fall back to the original absolute path (dev machine).
+_LAGERNVS_ROOT = str(Path(__file__).resolve().parents[3] / "submodules" / "lagernvs")
+if not Path(_LAGERNVS_ROOT).exists():
+    _LAGERNVS_ROOT = "/data1/cympyc1785/lagernvs"
 if _LAGERNVS_ROOT not in sys.path:
     sys.path.insert(0, _LAGERNVS_ROOT)
+
+
+def _resolve_lagernvs_ckpt(path: str) -> str:
+    """Remap a /data1 dev-machine ckpt path onto the resolved LagerNVS root."""
+    if path and not Path(path).exists() and "/lagernvs/" in path:
+        cand = Path(_LAGERNVS_ROOT) / path.split("/lagernvs/", 1)[1]
+        if cand.exists():
+            return str(cand)
+    return path
 
 
 @dataclass
@@ -41,6 +54,9 @@ class LagerNVSRendererCfg:
     patch_size: int = 8
     attention_type: Literal["cross_attention", "bidirectional_cross_attention"] = "bidirectional_cross_attention"
     out_channels: int = 3
+    # True  → project SceneTok tokens (scene_token_dim) up to hidden_size (geo_feature_connector).
+    # False → feed scene tokens directly as KV (requires hidden_size == scene_token_dim).
+    use_scene_adapter: bool = True
     # Pretrained LagerNVS checkpoint to warm-start the renderer (renderer.* keys).
     # None → scratch init (decoder learns from the SceneTok token channel up).
     renderer_ckpt: Optional[str] = "/data1/cympyc1785/lagernvs/checkpoints/lagernvs_general_512/model.pt"
@@ -59,27 +75,45 @@ class LagerNVSRenderer(nn.Module):
 
         self.cfg = cfg
         # SceneTok token (token_dim) -> renderer hidden. Replaces geo_feature_connector.
-        self.scene_adapter = nn.Sequential(
-            nn.Linear(cfg.scene_token_dim, cfg.hidden_size),
-            nn.LayerNorm(cfg.hidden_size, bias=False),
+        if cfg.use_scene_adapter:
+            self.scene_adapter = nn.Sequential(
+                nn.Linear(cfg.scene_token_dim, cfg.hidden_size),
+                nn.LayerNorm(cfg.hidden_size, bias=False),
+            )
+        else:
+            assert cfg.hidden_size == cfg.scene_token_dim, (
+                "use_scene_adapter=False requires hidden_size == scene_token_dim "
+                f"(got hidden_size={cfg.hidden_size}, scene_token_dim={cfg.scene_token_dim})"
+            )
+            self.scene_adapter = None
+        # Public lagernvs Renderer is already deterministic (tgt_ch=6, no timestep);
+        # newer forks expose in_noisy_channels/use_adaln to force it. Pass only what
+        # this checkout's signature accepts.
+        import inspect
+        renderer_kwargs = dict(
+            attention_to_features_type=cfg.attention_type,
+            out_channels=cfg.out_channels,
         )
+        _sig = inspect.signature(Renderer.__init__).parameters
+        if "in_noisy_channels" in _sig:
+            renderer_kwargs["in_noisy_channels"] = 0   # feed-forward: rays only
+        if "use_adaln" in _sig:
+            renderer_kwargs["use_adaln"] = False       # no timestep
         self.renderer = Renderer(
             cfg.depth,
             cfg.hidden_size,
             cfg.patch_size,
             cfg.num_heads,
-            attention_to_features_type=cfg.attention_type,
-            in_noisy_channels=0,       # feed-forward: rays only (deterministic)
-            use_adaln=False,           # no timestep
-            out_channels=cfg.out_channels,
+            **renderer_kwargs,
         )
         if cfg.renderer_ckpt:
-            sd = torch.load(cfg.renderer_ckpt, map_location="cpu")
+            ckpt_path = _resolve_lagernvs_ckpt(cfg.renderer_ckpt)
+            sd = torch.load(ckpt_path, map_location="cpu")
             sd = sd.get("model", sd)
             sd = {k.replace("module.", ""): v for k, v in sd.items()}
             rsd = {k[len("renderer."):]: v for k, v in sd.items() if k.startswith("renderer.")}
             missing, unexpected = self.renderer.load_state_dict(rsd, strict=False)
-            print(f"(LagerNVSRenderer) renderer warm-start from {cfg.renderer_ckpt}: "
+            print(f"(LagerNVSRenderer) renderer warm-start from {ckpt_path}: "
                   f"loaded {len(rsd)-len(unexpected)}/{len(rsd)}, missing={len(missing)}")
         else:
             print("(LagerNVSRenderer) renderer from SCRATCH (no pretrained), "
@@ -92,7 +126,7 @@ class LagerNVSRenderer(nn.Module):
     def render(self, scene_tokens: Tensor, target_rays: Tensor) -> Tensor:
         """scene_tokens (b, N, token_dim) + target_rays (b, V, 6, H, W) -> RGB (b, V, 3, H, W)."""
         b, v_target = target_rays.shape[:2]
-        rec = self.scene_adapter(scene_tokens)                       # (b, N, hidden)
+        rec = self.scene_adapter(scene_tokens) if self.scene_adapter is not None else scene_tokens
         rec = einops.repeat(rec, "b n d -> (b v) n d", v=v_target)   # per target view
         rgb = self.renderer(rec, target_rays)                        # (b, V, 3, H, W) in [0,1]
         return rgb

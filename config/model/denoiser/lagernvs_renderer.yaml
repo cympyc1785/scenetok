@@ -13,3 +13,6 @@ out_channels: 3
 # general_512 warm-start (set to null for scratch).
 renderer_ckpt: /data1/cympyc1785/lagernvs/checkpoints/lagernvs_general_512/model.pt
 load_strict: false
+# true → adapter projects scene tokens up to hidden_size; false → feed tokens
+# directly as KV (requires hidden_size == scene_token_dim).
+use_scene_adapter: true
