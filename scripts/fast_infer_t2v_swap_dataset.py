@@ -86,6 +86,9 @@ def parse_args():
                    help="cfg sweep 없이 --cfg_scale 값 하나만 (기본은 [user_cfg,1.0] 스윕).")
     p.add_argument("--text_modes", default=None,
                    help="텍스트 combo 제한, 콤마구분 (예: 'empty,user'). 미지정시 전체.")
+    p.add_argument("--poses_pt", default=None,
+                   help="viser poses.pt(target_c2w_edited, rel ctx0)로 target 궤적 교체. "
+                        "GT target intrinsics[0] 사용, preprocess index=0.")
     p.add_argument("--static_target_camera", action="store_true",
                    help="target extrinsics/intrinsics를 context[:, 0]으로 모두 덮어써서 "
                         "정지 카메라 시점(첫 context view 고정)에서 dynamic foreground만 "
@@ -283,6 +286,26 @@ def main():
                 batch["target"]["intrinsics"] = ctx_int0.expand(-1, v_t, -1, -1).clone()
                 print(f"[static_target_camera] target extrinsics/intrinsics overwritten with context[:, 0] for all {v_t} views")
 
+            if args.poses_pt:
+                import numpy as _np
+                pp = torch.load(args.poses_pt, map_location="cpu", weights_only=False)
+                tgt_rel = torch.as_tensor(
+                    _np.asarray(pp.get("target_c2w_edited", pp.get("target_c2w"))),
+                    dtype=batch["target"]["extrinsics"].dtype)                 # (T,4,4) rel ctx0
+                T = tgt_rel.shape[0]
+                ctx0 = batch["context"]["extrinsics"][:, 0]                     # (B,4,4) world
+                edited_abs = ctx0.unsqueeze(1) @ tgt_rel.to(ctx0.device).unsqueeze(0)  # (B,T,4,4)
+                gt_int0 = batch["target"]["intrinsics"][:, 0:1]                 # GT target K
+                batch["target"]["extrinsics"] = edited_abs
+                batch["target"]["intrinsics"] = gt_int0.expand(-1, T, -1, -1).clone()
+                batch["target"]["index"] = torch.arange(T, device=edited_abs.device).unsqueeze(0).expand(edited_abs.shape[0], -1).clone()
+                lat = batch["target"].get("latent")
+                if lat is not None:
+                    batch["target"]["latent"] = torch.zeros(
+                        (lat.shape[0], T) + tuple(lat.shape[2:]), dtype=lat.dtype, device=lat.device)
+                v_t = T
+                print(f"[poses_pt] target traj ← {args.poses_pt} ({T} frames, rel→ctx0→abs)")
+
             # dataset prompt extraction (없으면 빈 문자열 → dataset combo skip)
             dataset_text_raw = batch.get("text", None)
             if dataset_text_raw is not None and len(dataset_text_raw) > 0:
@@ -357,7 +380,8 @@ def main():
                 json.dump(meta, fp, indent=2, default=str)
             print(f"[infer] saved inputs → {input_dir}")
 
-            batch = preprocess_batch(batch, index=v_c // 2)
+            # poses.pt는 rel ctx0 프레임 → context[0] 기준으로 preprocess (regen_one과 동일).
+            batch = preprocess_batch(batch, index=0 if args.poses_pt else v_c // 2)
 
             for cfg_scale_i, prompt_i, tag in combos:
                 cfg.model.cfg_scale = cfg_scale_i
