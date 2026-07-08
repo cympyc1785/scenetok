@@ -78,6 +78,8 @@ model:
     use_scene_adapter: false   # feed scene tokens directly as KV
     hidden_size: 64            # == scene_token_dim (no adapter)
     num_heads: 4               # 64 / 4 = head_dim 16
+    val_render_moves: true     # log OOD camera-move videos in validation
+    val_move_amount: 0.6
   compressor:
     ckpt_path: checkpoints/va-wan_dl3dv.ckpt
     load_strict: false

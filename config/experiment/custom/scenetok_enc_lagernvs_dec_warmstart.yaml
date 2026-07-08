@@ -73,6 +73,8 @@ freeze:
 model:
   denoiser:
     renderer_ckpt: /data1/cympyc1785/lagernvs/checkpoints/lagernvs_general_512/model.pt
+    val_render_moves: true     # log OOD camera-move videos in validation
+    val_move_amount: 0.6
   compressor:
     ckpt_path: checkpoints/va-wan_dl3dv.ckpt
     load_strict: false
