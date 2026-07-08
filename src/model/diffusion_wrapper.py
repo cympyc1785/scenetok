@@ -443,6 +443,9 @@ class DiffusionWrapper(LightningModule):
             name: {"video": [], "scene": []}
             for name in self.validation_loader_names.values()
         }
+        # lagernvs_renderer: single combined recon metric pooled over ALL val
+        # dataloaders (standard+unseen), weighted by image count, flushed once.
+        self.val_recon_accum = {"l2": 0.0, "lpips": 0.0, "n": 0, "lpips_n": 0}
         # Loss NaN/Inf occurrence counter (process-lifetime cumulative).
         # Used by training_step to drop into pdb after 3 occurrences.
         self.nan_loss_count = 0
@@ -883,7 +886,7 @@ class DiffusionWrapper(LightningModule):
             deduped.append(iss)
         return deduped
 
-    def _lagernvs_renderer_step(self, batch, log_prefix="train"):
+    def _lagernvs_renderer_step(self, batch, log_prefix="train", log_split=True):
         """Feed-forward (deterministic) recon path: FROZEN SceneTok compressor →
         scene tokens → LagerNVS renderer(target Plücker rays) → RGB, L2 + LPIPS.
         No noise / timestep (bypasses the diffusion training_step)."""
@@ -921,16 +924,21 @@ class DiffusionWrapper(LightningModule):
         rgb = self.denoiser.render(scene_tokens.to(dtype), target_rays.to(dtype)).float()  # (b,V,3,H,W)
         loss_l2 = F.mse_loss(rgb, tgt_rgb)
         loss = loss_l2
+        lp = None
         try:
             lp = self.metric.lpips(rgb.flatten(0, 1) * 2 - 1, tgt_rgb.flatten(0, 1) * 2 - 1).mean()
             loss = loss_l2 + 0.5 * lp
-            self.log(f"{log_prefix}/lpips", lp, prog_bar=False, sync_dist=True)
         except Exception as e:
             if not getattr(self, "_lpips_warned", False):
                 print("(lagernvs_renderer) LPIPS skipped:", e); self._lpips_warned = True
-        self.log(f"{log_prefix}/loss", loss, prog_bar=True, sync_dist=True)
-        self.log(f"{log_prefix}/l2", loss_l2, prog_bar=False, sync_dist=True)
-        return loss
+        if log_split:
+            self.log(f"{log_prefix}/loss", loss, prog_bar=True, sync_dist=True)
+            self.log(f"{log_prefix}/l2", loss_l2, prog_bar=False, sync_dist=True)
+            if lp is not None:
+                self.log(f"{log_prefix}/lpips", lp, prog_bar=False, sync_dist=True)
+        n = rgb.shape[0] * rgb.shape[1]  # images in this batch (b*V) for weighted mean
+        metrics = {"l2": loss_l2.detach(), "lpips": (lp.detach() if lp is not None else None), "n": n}
+        return loss, metrics
 
     @torch.no_grad()
     def _lagernvs_render_moves(self, batch):
@@ -993,7 +1001,7 @@ class DiffusionWrapper(LightningModule):
 
         # Feed-forward (deterministic) LagerNVS renderer decoder → separate recon path.
         if getattr(self.model_cfg.denoiser, "name", None) == "lagernvs_renderer":
-            loss = self._lagernvs_renderer_step(batch, log_prefix="train")
+            loss, _ = self._lagernvs_renderer_step(batch, log_prefix="train")
             if os.environ.get("DEBUG") and self.global_step < 3:
                 print(f"Train step {self.global_step}; loss = {loss.item():.4f}")
             return loss
@@ -1242,7 +1250,14 @@ class DiffusionWrapper(LightningModule):
         if getattr(self.model_cfg.denoiser, "name", None) == "lagernvs_renderer":
             with torch.no_grad():
                 loader_name = self.validation_loader_names.get(dataloader_idx or 0, f"val_{dataloader_idx}")
-                self._lagernvs_renderer_step(batch, log_prefix=f"val/{loader_name}")
+                # Single combined recon metric across BOTH val dataloaders: no
+                # per-split logging here, just accumulate weighted sums and flush
+                # one val/{l2,lpips,loss} in on_validation_end.
+                _, m = self._lagernvs_renderer_step(batch, log_prefix=f"val/{loader_name}", log_split=False)
+                acc = self.val_recon_accum
+                acc["l2"] += m["l2"].item() * m["n"]; acc["n"] += m["n"]
+                if m["lpips"] is not None:
+                    acc["lpips"] += m["lpips"].item() * m["n"]; acc["lpips_n"] += m["n"]
                 # OOD camera-move videos (opt-in): accumulate concat clips for logging.
                 if getattr(self.model_cfg.denoiser, "val_render_moves", False):
                     buf = self.val_moves_buffer.setdefault(loader_name, {"video": [], "scene": []})
@@ -1507,6 +1522,18 @@ class DiffusionWrapper(LightningModule):
                     log_tensor_as_video(self.logger, target, "Original Video", fps=8, step=val_step, caption=scenes)
                     self.logger.log_image(f"Context ({self.sampler.cfg.name})", vis_list, step=val_step, caption=scenes)
 
+        # Flush lagernvs_renderer combined recon metric (pooled standard+unseen).
+        if self.global_rank == 0 and self.val_recon_accum["n"] > 0:
+            acc = self.val_recon_accum
+            l2 = acc["l2"] / acc["n"]
+            self.logger.log_metrics({"val/l2": l2}, val_step)
+            if acc["lpips_n"] > 0:
+                lp = acc["lpips"] / acc["lpips_n"]
+                self.logger.log_metrics({"val/lpips": lp}, val_step)
+                self.logger.log_metrics({"val/loss": l2 + 0.5 * lp}, val_step)
+            else:
+                self.logger.log_metrics({"val/loss": l2}, val_step)
+
         # Flush lagernvs_renderer OOD camera-move videos (video only, no metrics).
         if self.global_rank == 0:
             for loader_name, buf in self.val_moves_buffer.items():
@@ -1531,6 +1558,7 @@ class DiffusionWrapper(LightningModule):
         for buf in self.val_moves_buffer.values():
             for v in buf.values():
                 v.clear()
+        self.val_recon_accum = {"l2": 0.0, "lpips": 0.0, "n": 0, "lpips_n": 0}
 
         print("Setting Max Timesteps for training to: ", self.model_cfg.scheduler.num_train_timesteps)
         self.scheduler.set_timesteps(self.model_cfg.scheduler.num_train_timesteps)
