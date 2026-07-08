@@ -1,0 +1,130 @@
+# @package _global_
+#
+# (D) FROZEN SceneTok encoder (NO KL 64-compression) + feed-forward LagerNVS decoder.
+#   mv_B1 compressor를 reproject_out=false로 열어 out_proj(768→64 KL)를 건너뛰고
+#   transformer의 768-dim scene token을 그대로 사용(= "64로 다시 압축" 제외). LagerNVS
+#   renderer(hidden 768, general_512 warm-start)가 768 토큰을 adapter 없이 KV로 직접
+#   소비. compressor FROZEN, renderer만 학습. Loss = L2 + 0.5·LPIPS. No diffusion.
+#   DL3DV smallset @256×256. warmstart(64→adapter→768)와의 대조: 768 raw vs 64 KL.
+defaults:
+  - override /dataset: dl3dv
+  - override /dataset/view_sampler: bounded
+  - override /model/scheduler: rf
+  - override /model/denoiser: lagernvs_renderer
+  - override /model/autoencoders/context: va
+  - override /model/autoencoders/target: wan
+  - override /model/compressor: mv_B1
+  - override /model/compressor/camera: ray
+  - override /model/compressor/camera/embedding: lvsm
+
+dataset:
+  root: ./DATA/DL3DV/DL3DV-960
+  smallset: true
+  target_latent_type: wan
+  context_shape: [256, 256]
+  target_shape: [256, 256]
+  scale_context_focal_by_256: true   # match the frozen va-wan_dl3dv compressor's training
+  view_sampler:
+    num_context_views: 16
+    num_target_views: 8
+    min_distance_between_context_views: 64
+    max_distance_between_context_views: 96
+    context_gap_warm_up_steps: 30_000
+    target_gap_warm_up_steps: 30_000
+    initial_min_distance_between_context_views: 48
+    initial_max_distance_between_context_views: 64
+    chunk_targets: false
+    offset: 1
+
+data_loader:
+  train:
+    batch_size: 4
+  val:
+    standard:
+      shuffle: false
+      batch_size: 4
+      max_batches: 4
+      num_workers: 4
+      seed: 0
+      interval: 5000
+      persistent_workers: false
+    unseen:
+      shuffle: false
+      batch_size: 4
+      max_batches: 4
+      num_workers: 4
+      seed: 0
+      interval: 5000
+      persistent_workers: false
+val:
+  video_length: 34
+  window_shift: 5
+wandb:
+  tags: [dl3dv, scenetok_enc, lagernvs_dec, feedforward, warmstart, no_kl_768, frozen]
+  activated: true
+
+sampler:
+  clean_targets: 5
+
+freeze:
+  denoiser: false        # renderer trains
+  compressor: true       # SceneTok compressor FROZEN
+
+model:
+  denoiser:
+    renderer_ckpt: /data1/cympyc1785/lagernvs/checkpoints/lagernvs_general_512/model.pt
+    use_scene_adapter: false   # 768 tokens fed directly as KV (no 64->768 adapter)
+    hidden_size: 768           # == scene_token_dim (768 raw SceneTok token)
+    scene_token_dim: 768       # matches compressor output_dim (reproject_out=false)
+    num_heads: 12              # 768 / 12 = head_dim 64
+    val_render_moves: true     # log OOD camera-move videos in validation
+    val_move_amount: 0.6
+  compressor:
+    ckpt_path: checkpoints/va-wan_dl3dv.ckpt
+    load_strict: false
+    kl_weights: [0.0, 0.0]
+    input_shape: [16, 16]
+    num_scene_tokens: 1024
+    causal_self_atten: false
+    gradient_checkpointing: false
+    token_dim: 64
+    reproject_out: false          # ★ skip out_proj(768->64 KL): scene token = 768 raw
+    scene_token_projection: simple # wrapper가 .sample() 안 하도록 (kl 아님)
+    init_large: true
+    camera_conditioning: adaLN
+    mask_context: false
+    camera:
+      input_shape: [128, 128]
+      embedding:
+        patch_size: 16
+    kwargs:
+      use_rope_2d: true
+      use_rope_3d: false
+      patch_size: 2
+
+trainer:
+  max_steps: 5_000_001
+  val_check_interval: 5000
+  task_steps: null
+  accumulate_grad_batches: 1
+  gradient_clip_val: 0.1
+  precision: bf16-mixed
+
+optimizer:
+  name: AdamW
+  lr: 1.0e-4              # renderer finetune (general_512 warm-start)
+  scale_lr: false
+  milestones: [2000]
+  scheduler:
+    - name: LinearLR
+      frequency: 1
+      interval: step
+      kwargs:
+        start_factor: 5.e-4
+        total_iters: 2000
+    - name: MultiStepLR
+      frequency: 1
+      interval: step
+      kwargs:
+        milestones: [500000]
+        gamma: 0.8
