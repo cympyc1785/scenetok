@@ -16,3 +16,6 @@ load_strict: false
 # true → adapter projects scene tokens up to hidden_size; false → feed tokens
 # directly as KV (requires hidden_size == scene_token_dim).
 use_scene_adapter: true
+# validation OOD camera-move video logging (video only, no metrics).
+val_render_moves: false
+val_move_amount: 0.6

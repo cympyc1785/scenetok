@@ -437,6 +437,12 @@ class DiffusionWrapper(LightningModule):
             name: {"sampled": [], "target": [], "context": [], "scene": []}
             for name in self.validation_loader_names.values()
         }
+        # lagernvs_renderer: accumulate OOD camera-move concat videos across val
+        # batches, flushed (video only) in on_validation_end.
+        self.val_moves_buffer = {
+            name: {"video": [], "scene": []}
+            for name in self.validation_loader_names.values()
+        }
         # Loss NaN/Inf occurrence counter (process-lifetime cumulative).
         # Used by training_step to drop into pdb after 3 occurrences.
         self.nan_loss_count = 0
@@ -926,6 +932,57 @@ class DiffusionWrapper(LightningModule):
         self.log(f"{log_prefix}/l2", loss_l2, prog_bar=False, sync_dist=True)
         return loss
 
+    @torch.no_grad()
+    def _lagernvs_render_moves(self, batch):
+        """OOD camera-move render for validation logging (video only, no metrics).
+        Returns (concat_video (b,V,3,H,5W) in [0,1], scenes list). Mirrors
+        scripts/infer_lagernvs_renderer_moves.py: orig + move_l/r/f/b, base=first
+        GT target cam, local ramp in the scene-scale-normalized ctx0 frame."""
+        import torch.nn.functional as F
+        from vis import compute_plucker_coordinates
+        MOVE = {"move_left": (-1, 0, 0), "move_right": (1, 0, 0),
+                "move_forward": (0, 0, 1), "move_back": (0, 0, -1)}
+        amount = float(self.model_cfg.denoiser.val_move_amount)
+
+        batch = preprocess_batch(batch, index=0)
+        ctx_ext = batch["context"]["extrinsics"]
+        device, dtype = ctx_ext.device, ctx_ext.dtype
+        scene_scale = (1.35 * ctx_ext[:, :, :3, 3].norm(dim=-1).amax(dim=1)).clamp(min=1e-6)  # (b,)
+
+        ctx_inputs = CompressorInputs(
+            view=self._compressor_context_view(batch),
+            pose=CameraInputs(intrinsics=batch["context"]["intrinsics"], extrinsics=ctx_ext),
+            mask=None)
+        tokens, *_ = self.compressor(inputs=ctx_inputs)
+        scene_tokens = tokens.sample() if self.model_cfg.compressor.scene_token_projection == "kl" else tokens
+
+        tgt = batch["target"]
+        H, W = tgt["latent"].shape[-2], tgt["latent"].shape[-1]
+        b, V = tgt["extrinsics"].shape[0], tgt["extrinsics"].shape[1]
+        tgt_ext = tgt["extrinsics"].clone().float()
+        tgt_ext[..., :3, 3] = tgt_ext[..., :3, 3] / scene_scale[:, None, None]  # (b,V,4,4)
+        K = tgt["intrinsics"].float()                                            # (b,V,3,3)
+
+        def _render(ext, Kv):  # ext (b,V,4,4), Kv (b,V,3,3)
+            fxfycxcy = torch.stack([Kv[..., 0, 0] * W, Kv[..., 1, 1] * H,
+                                    Kv[..., 0, 2] * W, Kv[..., 1, 2] * H], dim=-1)  # (b,V,4)
+            rays = compute_plucker_coordinates(ext, fxfycxcy, (H, W)).to(device)     # (b,V,6,H,W)
+            return self.denoiser.render(scene_tokens.to(dtype), rays.to(dtype)).float().clamp(0, 1)
+
+        cols = [_render(tgt_ext, K)]  # orig
+        base = tgt_ext[:, 0]          # (b,4,4)
+        K0 = K[:, 0:1].repeat(1, V, 1, 1)
+        f = torch.linspace(0, 1, V, device=device) if V > 1 else torch.ones(1, device=device)
+        for name in ["move_left", "move_right", "move_forward", "move_back"]:
+            vec = torch.tensor(MOVE[name], device=device, dtype=torch.float32)
+            delta = torch.eye(4, device=device).repeat(b, V, 1, 1)               # (b,V,4,4)
+            delta[..., :3, 3] = (f[None, :, None] * amount) * vec[None, None, :]
+            ext = base[:, None] @ delta                                          # (b,V,4,4)
+            cols.append(_render(ext, K0))
+        concat = torch.cat(cols, dim=-1)  # (b,V,3,H,5W)
+        scenes = batch["scene"] if isinstance(batch["scene"], (list, tuple)) else [str(batch["scene"])]
+        return concat, list(scenes)
+
     def training_step(self, batch, batch_idx):
         if batch is None:  # safe_collate returned None (entire batch was None-filtered)
             return None
@@ -1186,6 +1243,13 @@ class DiffusionWrapper(LightningModule):
             with torch.no_grad():
                 loader_name = self.validation_loader_names.get(dataloader_idx or 0, f"val_{dataloader_idx}")
                 self._lagernvs_renderer_step(batch, log_prefix=f"val/{loader_name}")
+                # OOD camera-move videos (opt-in): accumulate concat clips for logging.
+                if getattr(self.model_cfg.denoiser, "val_render_moves", False):
+                    buf = self.val_moves_buffer.setdefault(loader_name, {"video": [], "scene": []})
+                    if len(buf["scene"]) < self.val_vis_num:
+                        vid, scenes = self._lagernvs_render_moves(batch)
+                        buf["video"].append(vid.detach().cpu())
+                        buf["scene"].extend(scenes)
             return None
 
         # val_step = global step // val_check_interval → clean validation counter
@@ -1443,6 +1507,18 @@ class DiffusionWrapper(LightningModule):
                     log_tensor_as_video(self.logger, target, "Original Video", fps=8, step=val_step, caption=scenes)
                     self.logger.log_image(f"Context ({self.sampler.cfg.name})", vis_list, step=val_step, caption=scenes)
 
+        # Flush lagernvs_renderer OOD camera-move videos (video only, no metrics).
+        if self.global_rank == 0:
+            for loader_name, buf in self.val_moves_buffer.items():
+                if len(buf["scene"]) == 0:
+                    continue
+                n = self.val_vis_num
+                vid = torch.cat(buf["video"])[:n].to(self.device, non_blocking=True)
+                scenes = buf["scene"][:n]
+                log_tensor_as_video(self.logger, vid,
+                                    f"{loader_name}/OOD Moves (orig|L|R|F|B)",
+                                    fps=8, step=val_step, caption=scenes)
+
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
 
@@ -1450,6 +1526,9 @@ class DiffusionWrapper(LightningModule):
             self.predicted[loader_name].clear()
             self.generated[loader_name].clear()
         for buf in self.val_vis_buffer.values():
+            for v in buf.values():
+                v.clear()
+        for buf in self.val_moves_buffer.values():
             for v in buf.values():
                 v.clear()
 

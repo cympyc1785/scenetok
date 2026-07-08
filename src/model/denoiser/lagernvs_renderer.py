@@ -57,6 +57,10 @@ class LagerNVSRendererCfg:
     # True  → project SceneTok tokens (scene_token_dim) up to hidden_size (geo_feature_connector).
     # False → feed scene tokens directly as KV (requires hidden_size == scene_token_dim).
     use_scene_adapter: bool = True
+    # Validation: also render OOD camera-move trajectories (orig + move_l/r/f/b) and
+    # log ONLY the concat video to wandb (no metrics). Default False = recon-loss only.
+    val_render_moves: bool = False
+    val_move_amount: float = 0.6           # move distance in scene-scale units (ramped 0->amount)
     # Pretrained LagerNVS checkpoint to warm-start the renderer (renderer.* keys).
     # None → scratch init (decoder learns from the SceneTok token channel up).
     renderer_ckpt: Optional[str] = "/data1/cympyc1785/lagernvs/checkpoints/lagernvs_general_512/model.pt"
