@@ -110,8 +110,12 @@ trainer:
 
 optimizer:
   name: AdamW
-  lr: 4.0e-4              # scratch renderer + compressor finetune (single lr)
+  lr: 4.0e-4              # scratch renderer @ 4e-4
   scale_lr: false
+  # compressor(+scene) param group @ lr*scene_lr_mult = 1e-5 (pretrained finetune).
+  # Full 4e-4 on the pretrained compressor gives NaN grads on compressor.scene_tokens
+  # (7009 skips) → renderer high lr, compressor low lr via param groups.
+  scene_lr_mult: 0.025
   milestones: [2000]
   scheduler:
     - name: LinearLR
