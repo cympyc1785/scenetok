@@ -337,12 +337,35 @@ def sample(
     chunk_targets: bool=True,
     first_frame_latents: Optional[Float[Tensor, "batch 1 channel height width"]]=None,
     first_frame_mask_latent: Optional[Tensor]=None,
+    capture_noise_levels: Optional[list]=None,
+    capture_store: Optional[dict]=None,
     ):
 
 
     device = x_t.device
     b, v_t, c, h, w = x_t.shape
     pred_conditional = None
+
+    # Optional: decode the intermediate noisy latent x_t at target noise levels
+    # (denoising-timestep visualization). Backward-compatible: default None = off.
+    def _decode_latents(xt):
+        if autoencoder_name is None:
+            return (xt + 1) / 2
+        if autoencoder_name == "wan" and chunk_targets:
+            outs = [last_stage_decode(autoencoder=autoencoder, latents=x, view_type="target",
+                                      autoencoder_name=autoencoder_name, scaling_factor=scaling_factor,
+                                      chunk_targets=chunk_targets)
+                    for x in torch.split(xt, split_size_or_sections=5, dim=1)]
+            return torch.concat(outs, dim=1)
+        return last_stage_decode(autoencoder=autoencoder, latents=xt, view_type="target",
+                                 autoencoder_name=autoencoder_name, scaling_factor=scaling_factor,
+                                 chunk_targets=chunk_targets)
+    # t=0 (final clean) captured after the loop from `decoded`; loop handles t>0.
+    _cap_todo = sorted([float(t) for t in capture_noise_levels if float(t) > 0], reverse=True) \
+        if capture_noise_levels else []
+    _cap_zero = bool(capture_noise_levels) and any(float(t) == 0 for t in capture_noise_levels)
+    if capture_store is None:
+        capture_store = {}
     if first_frame_latents is not None:
         first_frame_latents = first_frame_latents.to(device=x_t.device, dtype=x_t.dtype)
         if first_frame_latents.shape[0] != b or first_frame_latents.shape[1] != 1:
@@ -378,6 +401,14 @@ def sample(
 
         ts = repeat(ts, "v -> b v", b=b).to(x_t.device)
         ts_next = repeat(ts_next, "v -> b v", b=b).to(x_t.device)
+
+        # Capture x_t at target noise levels (before this step denoises it further).
+        if _cap_todo and denoise_mask.any():
+            cur_noise = float(ts[:, denoise_mask].max())
+            while _cap_todo and cur_noise <= _cap_todo[0]:
+                lvl = _cap_todo.pop(0)
+                capture_store[lvl] = _decode_latents(x_t.clone()).float().clamp(0, 1).cpu()
+
         scheduler.set_scheduling_matrix(ts_next[:, denoise_mask])
         
         # Project latent --> view indices
@@ -466,5 +497,8 @@ def sample(
 
     else:
         decoded = (x_t + 1) / 2
+
+    if _cap_zero:
+        capture_store[0.0] = decoded.float().clamp(0, 1).cpu()
 
     return decoded, uncertainty_map

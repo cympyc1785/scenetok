@@ -682,7 +682,9 @@ class DiffusionWrapper(LightningModule):
 
     @torch.no_grad()
     def generate_batch_with_scene(self, batch, sampler: Sampler, repeat_factor: int=1,
-                                  ti2v_first_frame: bool=False):
+                                  ti2v_first_frame: bool=False,
+                                  capture_noise_levels: Optional[list]=None,
+                                  capture_store: Optional[dict]=None):
 
         context_latents = self._compressor_context_view(batch)
 
@@ -813,6 +815,8 @@ class DiffusionWrapper(LightningModule):
             offset=self.dataset_cfg.view_sampler.offset,
             chunk_targets=getattr(self.dataset_cfg.view_sampler, "chunk_targets", True),
             first_frame_latents=first_frame_latents,
+            capture_noise_levels=capture_noise_levels,
+            capture_store=capture_store,
         ), scene_tokens
 
     @staticmethod
