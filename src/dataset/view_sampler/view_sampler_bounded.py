@@ -20,6 +20,9 @@ class ViewSamplerBoundedCfg(ViewSamplerCfg):
     initial_min_distance_between_context_views: int = 0
     initial_max_distance_between_context_views: int | None = None
     initial_max_distance_to_context_views: int = 0
+    # LagerNVS-style: per-example target extrapolation margin sampled U[min,max]
+    # (frames), no warm-up. If set, overrides max_distance_to_context_views + warmup.
+    target_extrap_range: list | None = None
 
     num_target_split: int=1
     chunk_index_gap: int=1
@@ -159,8 +162,19 @@ class ViewSamplerBounded(ViewSampler[ViewSamplerBoundedCfg]):
         # if not self.cameras_are_circular:
         #     max_context_gap = min(num_views - 1, max_context_gap)   # NOTE fixed former bug here
 
-        # Compute the margin from context window to target window based on the current global step
-        if self.stage != "test" and self.cfg.target_gap_warm_up_steps > 0:
+        # Compute the margin from context window to target window.
+        # LagerNVS-style: sample the target extrapolation amount per example from
+        # [min,max] (no warm-up) — mirrors ExpandedLinearViewSelector's delta_t·
+        # expansion(1.0). `target_extrap_range` overrides the fixed+warmup path.
+        if self.cfg.target_extrap_range is not None:
+            lo, hi = int(self.cfg.target_extrap_range[0]), int(self.cfg.target_extrap_range[1])
+            if self.stage == "test":
+                max_target_gap = hi
+            elif hi > lo:
+                max_target_gap = torch.randint(lo, hi + 1, size=tuple()).item()
+            else:
+                max_target_gap = lo
+        elif self.stage != "test" and self.cfg.target_gap_warm_up_steps > 0:
             max_target_gap = self.schedule(
                 self.cfg.initial_max_distance_to_context_views,
                 self.cfg.max_distance_to_context_views,

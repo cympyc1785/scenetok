@@ -1,7 +1,6 @@
 # @package _global_
 #
 # lagernvs_va-wan_dl3dv_recon_sceneLRnorm_shuf (#1 scene_lr_mult + #2 output_norm
-# + #E1 shuffle_context) + TARGET EXTRAPOLATION: view_sampler target을 context
 # 윈도우 밖으로 확장(max_distance_to_context_views 0→48 warmup). base(interp only)
 # 대비 extrapolation 학습. LagerNVS(reconstructor frozen, output_norm만 학습) 인코더
 # + SceneTok lightningdit 디코더(finetune), dense 768(768→64 없음).
@@ -34,10 +33,9 @@ dataset:
     target_gap_warm_up_steps: 30_000
     initial_min_distance_between_context_views: 48
     initial_max_distance_between_context_views: 64
-    # TARGET EXTRAPOLATION: target을 context 윈도우 밖 최대 48f까지(0→48 warmup).
     # base sceneLRnorm_shuf는 둘 다 0(=interpolation only).
-    max_distance_to_context_views: 48
-    initial_max_distance_to_context_views: 0
+    # LagerNVS식: 매 샘플 g∈[10,20] 뽑아 target을 context 윈도우 밖 ±g 확장(no warmup).
+    target_extrap_range: [10, 20]
     chunk_targets: false
     offset: 1
     shuffle_context: true   # #E1: permute context view order (train only)
