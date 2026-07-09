@@ -29,8 +29,8 @@ dataset:
   smallset: true
   target_latent_type: wan
 
-  context_shape: [256, 448]
-  target_shape: [256, 448]
+  context_shape: [256, 256]
+  target_shape: [256, 256]
 
   # NOTE: Allow compatibility with va-wan, refer to docs/KNOWN_BUG.md
   scale_context_focal_by_256: true
@@ -93,11 +93,11 @@ model:
   denoiser:
     ckpt_path: checkpoints/va-wan_dl3dv.ckpt
     load_strict: false
-    input_shape: [16, 28]
+    input_shape: [16, 16]
     gradient_checkpointing: true
     num_target_split: 1
     camera:
-      input_shape: [128, 224]
+      input_shape: [128, 128]
       embedding:
         patch_size: 8
         in_channels: 24
@@ -109,7 +109,7 @@ model:
     ckpt_path: checkpoints/va-wan_dl3dv.ckpt
     load_strict: false
     kl_weights: [1e-10, 1e-10]
-    input_shape: [16, 28]
+    input_shape: [16, 16]
     num_scene_tokens: 1024
     causal_self_atten: false
     gradient_checkpointing: true
@@ -119,7 +119,7 @@ model:
     scene_token_projection: kl
     mask_context: false
     camera:
-      input_shape: [128, 224]
+      input_shape: [128, 128]
       embedding:
         patch_size: 16
     kwargs:
