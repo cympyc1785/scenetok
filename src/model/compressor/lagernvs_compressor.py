@@ -60,11 +60,22 @@ class PerceiverResampler(nn.Module):
             q = q + ff(fn(q))
         return self.out_norm(q)
 
-# LagerNVS lives in a sibling repo (symlinked at submodules/lagernvs). Add to path so
-# `models.encoder_decoder` imports. xformers is optional there (SDPA fallback patched).
-_LAGERNVS_ROOT = "/data1/cympyc1785/lagernvs"
+# LagerNVS lives in a sibling repo. Prefer the in-repo checkout at
+# submodules/lagernvs; fall back to the original absolute path (dev machine).
+_LAGERNVS_ROOT = str(Path(__file__).resolve().parents[3] / "submodules" / "lagernvs")
+if not Path(_LAGERNVS_ROOT).exists():
+    _LAGERNVS_ROOT = "/data1/cympyc1785/lagernvs"
 if _LAGERNVS_ROOT not in sys.path:
     sys.path.insert(0, _LAGERNVS_ROOT)
+
+
+def _resolve_lagernvs_ckpt(path: str) -> str:
+    """Remap a /data1 dev-machine ckpt path onto the resolved LagerNVS root."""
+    if path and not Path(path).exists() and "/lagernvs/" in path:
+        cand = Path(_LAGERNVS_ROOT) / path.split("/lagernvs/", 1)[1]
+        if cand.exists():
+            return str(cand)
+    return path
 
 
 @dataclass
@@ -114,7 +125,7 @@ class LagerNVSCompressor(Compressor[LagerNVSCompressorCfg]):
         from models.encoder_decoder import EncDec_VitB8
 
         model = EncDec_VitB8(pretrained_vggt=False)
-        sd = torch.load(cfg.ckpt_path, map_location="cpu")
+        sd = torch.load(_resolve_lagernvs_ckpt(cfg.ckpt_path), map_location="cpu")
         model.load_state_dict(sd["model"], strict=cfg.load_strict)
         # Keep only the reconstructor (VGGT + geo_feature_connector); drop the renderer.
         self.reconstructor = model.reconstructor
