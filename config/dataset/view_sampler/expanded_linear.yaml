@@ -1,0 +1,13 @@
+name: expanded_linear
+
+# LagerNVS ExpandedLinearViewSelector 재현 (num_cond은 배칭 위해 num_context_views로 고정).
+num_context_views: 6           # LagerNVS num_cond (2-6) 중 고정값
+num_target_views: 8            # LagerNVS num_tgt_views
+context_sampling: "uniform"    # (base 필수 필드, 이 sampler에선 미사용)
+
+view_range_min: 10             # per-gap delta_t 하한 (LagerNVS view_sampler_range)
+view_range_max: 20             # per-gap delta_t 상한
+expansion_factor: 1.0          # target extrapolation ±expansion·delta_t
+temp_jitter_prop: 0.1
+target_has_input_p: 1.0        # DL3DV LagerNVS 값
+shuffle_context: true
