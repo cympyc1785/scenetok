@@ -81,6 +81,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **SceneGen viser: Render 시 viser 3D 화면 스크린샷 저장 복원** (`viser_server_scenegen.py`) — dl3dv viser_server와 동일하게 render() 끝에 연결된 각 client의 `get_render`로 3D 뷰를 캡쳐해 출력 폴더에 `viser_screenshot.png`(다중 client면 `_client{id}`) 저장. 생성 mp4/gif/poses.pt와 함께.
 
 ### Fixed
+- **fix: lagernvs_renderer val OOD 영상 wandb 패널 키 정리** — `{loader}/OOD Moves (orig|L|R|F|B)` → **`{loader}/OOD_moves`**. 파이프(`|`)·괄호가 wandb 패널 그룹핑/regex와 충돌해 영상이 로깅돼도(scan_history 5/5 확인) 대시보드 패널이 안 보이던 문제. column 순서는 caption(`[orig|L|R|F|B]`)으로 이동. train2/train3(lagernvs_dec extrap) resume로 적용.
 - **Wan TI2V/T2V scene 주입 전면 차단 버그** (`embed_scene_context` 미정의): `simple_wan_video_fn`이 `dit.embed_scene_context(scene_context)`를 호출하는데 이 메서드는 도입 커밋(27fddb7)부터 어느 브랜치에도 정의된 적 없음 → `scene_input_type != "none"`이면 항상 `AttributeError`로 죽어 new_cross_attention/cross_attention/controlnet 등 모든 scene 토큰 주입 경로가 막혀 있던 잠복 버그. scene 토큰은 wrapper의 `cnd_proj`(cond_dim 64→model.dim, 학습 대상)로 이미 투영돼 들어오고 블록별 `scene_cross_attn=CrossAttention(model.dim)`도 model.dim KV를 기대하므로 identity 자리 → `wan_ti2v.py`/`wan_t2v_14B.py`에서 `hasattr(dit, "embed_scene_context")` 가드 pass-through로 수정(no-op이 de-facto 동작이라 기존 동작과 충돌 없음, 모든 scene 경로 복구). FIX.log 기록.
 
 ### Changed

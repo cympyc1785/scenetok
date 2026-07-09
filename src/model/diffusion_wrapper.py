@@ -1545,10 +1545,12 @@ class DiffusionWrapper(LightningModule):
                     continue
                 n = self.val_vis_num
                 vid = torch.cat(buf["video"])[:n].to(self.device, non_blocking=True)
-                scenes = buf["scene"][:n]
+                # column order orig|left|right|forward|back → put in caption, keep the
+                # panel KEY free of special chars (|, parens) which break wandb panels.
+                caps = [f"{s} [orig|L|R|F|B]" for s in buf["scene"][:n]]
                 log_tensor_as_video(self.logger, vid,
-                                    f"{loader_name}/OOD Moves (orig|L|R|F|B)",
-                                    fps=8, step=val_step, caption=scenes)
+                                    f"{loader_name}/OOD_moves",
+                                    fps=8, step=val_step, caption=caps)
 
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
