@@ -995,6 +995,37 @@ class DiffusionWrapper(LightningModule):
         scenes = batch["scene"] if isinstance(batch["scene"], (list, tuple)) else [str(batch["scene"])]
         return concat, list(scenes)
 
+    @torch.no_grad()
+    def _diffusion_render_moves(self, batch, orig_sampled):
+        """OOD camera-move videos for the SceneTok (LightningDiT diffusion) decoder.
+        `batch` is already preprocess_batch(index=v_c//2)ed; `orig_sampled` (b,V,3,H,W)
+        is the GT-trajectory generation (reused as 'orig'). For each move variant the
+        target extrinsics become base@local-ramp and are re-generated via the sampler
+        (expensive: 1 full denoise per variant). Returns (concat (b,V,3,H,5W), scenes)."""
+        MOVE = {"move_left": (-1, 0, 0), "move_right": (1, 0, 0),
+                "move_forward": (0, 0, 1), "move_back": (0, 0, -1)}
+        amount_frac = float(getattr(self.model_cfg.denoiser, "val_move_amount", 0.5))
+        ctx_ext = batch["context"]["extrinsics"]
+        device, dtype = ctx_ext.device, ctx_ext.dtype
+        scene_scale = (1.35 * ctx_ext[:, :, :3, 3].norm(dim=-1).amax(dim=1)).clamp(min=1e-6)  # (b,)
+        tgt = batch["target"]
+        b, V = tgt["extrinsics"].shape[0], tgt["extrinsics"].shape[1]
+        base = tgt["extrinsics"][:, 0].float()                       # (b,4,4) relative
+        f = torch.linspace(0, 1, V, device=device) if V > 1 else torch.ones(1, device=device)
+        amt = (amount_frac * scene_scale).view(b, 1, 1)              # (b,1,1)
+        cols = [orig_sampled.float().clamp(0, 1)]
+        for name in ["move_left", "move_right", "move_forward", "move_back"]:
+            vec = torch.tensor(MOVE[name], device=device, dtype=torch.float32)
+            delta = torch.eye(4, device=device).repeat(b, V, 1, 1)   # (b,V,4,4)
+            delta[..., :3, 3] = (f.view(1, V, 1) * amt) * vec.view(1, 1, 3)
+            ext = (base[:, None] @ delta).to(dtype)                  # (b,V,4,4)
+            bm = dict(batch); bm["target"] = dict(tgt); bm["target"]["extrinsics"] = ext
+            sv, _, _ = self.generate_batch_with_scene(bm, self.sampler)
+            cols.append(sv.float().clamp(0, 1))
+        concat = torch.cat(cols, dim=-1)                             # (b,V,3,H,5W)
+        scenes = batch["scene"] if isinstance(batch["scene"], (list, tuple)) else [str(batch["scene"])]
+        return concat, list(scenes)
+
     def training_step(self, batch, batch_idx):
         if batch is None:  # safe_collate returned None (entire batch was None-filtered)
             return None
@@ -1319,6 +1350,17 @@ class DiffusionWrapper(LightningModule):
         sampled_views, _, _ = self.generate_batch_with_scene(batch, self.sampler)
         b, v_t, c, h, w = sampled_views.shape
         target_views = target_views[:, :v_t]
+
+        # OOD camera-move videos (opt-in) for the SceneTok diffusion decoder — only
+        # the first val batch (each variant = one full denoise, so keep it small).
+        if getattr(self.model_cfg.denoiser, "val_render_moves", False) and batch_idx == 0:
+            try:
+                mbuf = self.val_moves_buffer.setdefault(loader_name, {"video": [], "scene": []})
+                mvid, mscenes = self._diffusion_render_moves(batch, sampled_views)
+                mbuf["video"].append(mvid.detach().cpu()); mbuf["scene"].extend(mscenes)
+            except Exception as e:
+                if not getattr(self, "_diff_moves_warned", False):
+                    print("(diffusion OOD moves) skipped:", e); self._diff_moves_warned = True
 
         # Diagnostic + finite-mask guard. NaN/Inf in sampled_views poisons FVD's
         # linalg.sqrtm via NaN activations → covariance → Schur decomposition hang.

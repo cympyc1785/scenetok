@@ -95,6 +95,8 @@ model:
     input_shape: [16, 16]
     gradient_checkpointing: true
     num_target_split: 1
+    val_render_moves: true    # SceneTok diffusion decoder OOD move 영상 로깅
+    val_move_amount: 0.5
     camera:
       input_shape: [128, 128]
       embedding:

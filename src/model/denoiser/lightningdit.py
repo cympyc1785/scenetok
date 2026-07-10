@@ -79,6 +79,10 @@ class LightningDiTCfg:
     # Replaces the 3D feat_rope on the attn2 query (attn1 keeps 3D). Default off.
     scene_2d_rope: bool = False
     scene_rope_grid: Union[Tuple[int], list[int], None] = None  # [V_ctx, h_c, w_c]
+    # Validation: also generate OOD camera-move trajectories (orig + move_l/r/f/b)
+    # for the FIRST val batch and log the concat video. Default False (unchanged).
+    val_render_moves: bool = False
+    val_move_amount: float = 0.5   # move margin as fraction of scene_scale(1.35·max‖ctx t‖)
 class LightningDiT(Denoiser[LightningDiTCfg]):
     def __init__(
         self, 
