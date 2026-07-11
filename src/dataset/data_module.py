@@ -159,16 +159,22 @@ class DataModule(LightningDataModule):
             # each = full batch_size × max_batches (e.g. 8×4 = 32 dynamicverse / DAVIS).
             if dataset_cfg.name == "multi":
                 from . import _parse_sub_cfg
-                sub_cfg = None
-                for sub_raw in dataset_cfg.datasets:
-                    c = _parse_sub_cfg(sub_raw)
-                    if c.name == "dynamicverse":
-                        sub_cfg = c
-                        break
-                assert sub_cfg is not None, "multi validation expects a dynamicverse sub-dataset"
-                sub_cfg.val_seen = key != "unseen"
-                sub_cfg.evaluation_index_path = Path(
-                    f"assets/evaluation_index/dynamicverse_{key}.json")
+                subs = [_parse_sub_cfg(s) for s in dataset_cfg.datasets]
+                dyn = next((c for c in subs if getattr(c, "name", None) == "dynamicverse"), None)
+                if dyn is not None:
+                    # DL3DV+DynamicVerse: validate the DYNAMIC sub only (panels match
+                    # the single-dataset dynamicverse validation exactly).
+                    sub_cfg = dyn
+                    sub_cfg.val_seen = key != "unseen"
+                    sub_cfg.evaluation_index_path = Path(
+                        f"assets/evaluation_index/dynamicverse_{key}.json")
+                else:
+                    # Recon mix (e.g. dl3dv+re10k): validate each sub separately —
+                    # standard -> first sub, unseen -> second sub (key labels dataset).
+                    idx = 0 if key != "unseen" else min(1, len(subs) - 1)
+                    sub_cfg = subs[idx]
+                    if getattr(sub_cfg, "name", None) in {"dl3dv", "re10k"}:
+                        sub_cfg.val_seen = True
                 dataset = get_dataset(sub_cfg, "val", self.step_tracker, generator, force_shuffle=False)
                 dataset = self.dataset_shim(dataset, "val")
                 validation_length = cfg.batch_size * cfg.max_batches if cfg.max_batches > 0 else len(dataset)
