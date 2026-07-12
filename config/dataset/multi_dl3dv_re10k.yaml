@@ -50,13 +50,11 @@ datasets:
       temporal_downsample: 4
       num_context_views: 6
       num_target_views: 10
-      min_distance_between_context_views: 64
-      max_distance_between_context_views: 96
-      initial_min_distance_between_context_views: 48
-      initial_max_distance_between_context_views: 64
-      context_gap_warm_up_steps: 30_000
-      target_gap_warm_up_steps: 30_000
-      target_extrap_range: [10, 20]      # DL3DV: small gap
+      # LagerNVS 256-native dl3dv: delta_t [10,20] x expansion 1.0 (coupled).
+      lagernvs_extrap: true
+      view_range_min: 10
+      view_range_max: 20
+      expansion_factor: 1.0
       chunk_targets: false
       offset: 1
   # ── RE10K: .torch (native pipeline), short scenes → tight context spacing,
@@ -79,12 +77,11 @@ datasets:
       temporal_downsample: 4
       num_context_views: 6
       num_target_views: 10
-      min_distance_between_context_views: 4
-      max_distance_between_context_views: 8
-      initial_min_distance_between_context_views: 4
-      initial_max_distance_between_context_views: 8
-      context_gap_warm_up_steps: 0
-      target_gap_warm_up_steps: 0
-      target_extrap_range: [25, 192]     # RE10K: large gap (long walkthroughs)
+      # LagerNVS 256-native re10k: delta_t [25,192] x expansion 0.1 (coupled).
+      # delta_t auto-clamps to fit short re10k clips; target stays contiguous (video).
+      lagernvs_extrap: true
+      view_range_min: 25
+      view_range_max: 192
+      expansion_factor: 0.1
       chunk_targets: false
       offset: 1

@@ -24,6 +24,17 @@ class ViewSamplerBoundedCfg(ViewSamplerCfg):
     # (frames), no warm-up. If set, overrides max_distance_to_context_views + warmup.
     target_extrap_range: list | None = None
 
+    # LagerNVS-COUPLED extrapolation (ExpandedLinearViewSelector semantics): sample
+    # per-adjacent context spacing delta_t ∈ [view_range_min, view_range_max]
+    # (clamped to fit the clip), set context window = delta_t*(num_context-1), and
+    # couple the target extrapolation margin = round(expansion_factor * delta_t).
+    # Wan-compatible (target stays a contiguous clip). Overrides context-gap and
+    # target-gap logic. Default off (existing behavior unchanged).
+    lagernvs_extrap: bool = False
+    view_range_min: int = 0
+    view_range_max: int = 0
+    expansion_factor: float = 1.0
+
     num_target_split: int=1
     chunk_index_gap: int=1
     target_split_prob: float=0.0
@@ -182,8 +193,32 @@ class ViewSamplerBounded(ViewSampler[ViewSamplerBoundedCfg]):
             )
         else:
             max_target_gap = self.cfg.max_distance_to_context_views
+        # LagerNVS-COUPLED extrapolation: derive context window + target margin from a
+        # per-adjacent delta_t (ExpandedLinearViewSelector). Target stays a contiguous
+        # clip so it decodes to a video (wan-compatible).
+        lagernvs_override = False
+        if self.cfg.lagernvs_extrap:
+            nc = self.cfg.num_context_views
+            span_needed = self.latent_to_original_index(self.cfg.num_target_views) if self.cfg.num_target_views > 0 else 0
+            max_dt_fit = (num_views - 1) // max(1, nc - 1)
+            dt_hi = min(self.cfg.view_range_max, max_dt_fit)
+            dt_lo = min(self.cfg.view_range_min, dt_hi)
+            if self.stage == "test":
+                delta_t = dt_hi
+            elif dt_hi > dt_lo:
+                delta_t = torch.randint(dt_lo, dt_hi + 1, size=tuple()).item()
+            else:
+                delta_t = dt_hi
+            delta_t = max(int(delta_t), 1)
+            # window must fit the contiguous target clip; clamp within the sequence.
+            context_gap = min(max(delta_t * (nc - 1), span_needed), num_views - 1)
+            max_target_gap = int(round(self.cfg.expansion_factor * delta_t))
+            lagernvs_override = True
+
         # Pick the gap between the context views.
-        if max_context_gap < min_context_gap:
+        if lagernvs_override:
+            pass  # context_gap / max_target_gap already set above
+        elif max_context_gap < min_context_gap:
             raise ValueError(f"Example does not have enough frames! {max_context_gap} <= f <= {min_context_gap}, and num views: {num_views}")
         elif max_context_gap == min_context_gap:
             context_gap = max_context_gap

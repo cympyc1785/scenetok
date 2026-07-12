@@ -27,15 +27,12 @@ dataset:
   view_sampler:
     num_context_views: 16
     num_target_views: 10
-    min_distance_between_context_views: 64
-    max_distance_between_context_views: 96
-    context_gap_warm_up_steps: 30_000
-    target_gap_warm_up_steps: 30_000
-    initial_min_distance_between_context_views: 48
-    initial_max_distance_between_context_views: 64
-    # base sceneLRnorm_shuf는 둘 다 0(=interpolation only).
-    # LagerNVS식: 매 샘플 g∈[10,20] 뽑아 target을 context 윈도우 밖 ±g 확장(no warmup).
-    target_extrap_range: [10, 20]
+    # LagerNVS-COUPLED extrap: delta_t [10,20] x expansion 1.0 (context spacing =
+    # delta_t*(nc-1), target margin = expansion*delta_t). target 연속(영상).
+    lagernvs_extrap: true
+    view_range_min: 10
+    view_range_max: 20
+    expansion_factor: 1.0
     chunk_targets: false
     offset: 1
     shuffle_context: true   # #E1: permute context view order (train only)
