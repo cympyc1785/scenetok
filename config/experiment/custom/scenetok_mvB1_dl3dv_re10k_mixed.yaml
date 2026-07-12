@@ -1,0 +1,120 @@
+# @package _global_
+# (SceneTok enc-dec) mv_B1 인코더 + LightningDiT 디코더, DL3DV+RE10K MIXED, INTERPOLATION only (extrap 없음). 각 데이터셋이 자기 bounded view_sampler를 가져 per-dataset
+# extrapolation frame 범위 적용: DL3DV [10,20], RE10K [25,192] (LagerNVS 규약).
+# 둘 다 trainable(finetune, va-wan_dl3dv.ckpt warm-start). 256x256, wan target.
+# val: standard=DL3DV, unseen=RE10K (data_module multi val 라우팅 확장).
+defaults:
+  - override /dataset: multi_dl3dv_re10k_interp
+  - override /model/scheduler: rf
+  - override /model/denoiser: lightningdit_L_1
+  - override /model/autoencoders/context: va
+  - override /model/autoencoders/target: wan
+  - override /model/compressor: mv_B1
+  - override /model/compressor/camera: ray
+  - override /model/compressor/camera/embedding: lvsm
+  - override /model/denoiser/camera: ray
+  - override /model/denoiser/camera/embedding: lvsm
+
+data_loader:
+  train:
+    batch_size: 2
+  val:
+    standard:
+      shuffle: false
+      batch_size: 2
+      max_batches: 4
+      num_workers: 4
+      seed: 0
+      interval: 5000
+      persistent_workers: false
+    unseen:
+      shuffle: false
+      batch_size: 2
+      max_batches: 4
+      num_workers: 4
+      seed: 0
+      interval: 5000
+      persistent_workers: false
+val:
+  video_length: 34
+  window_shift: 5
+wandb:
+  tags: [mixed, dl3dv, re10k, scenetok, interp, stage_a, 256x256]
+  activated: true
+
+sampler:
+  clean_targets: 5
+freeze:
+  denoiser: false
+  compressor: false
+model:
+  scheduler:
+    sampling_type: random_uniform
+    num_inference_steps: 25
+    kwargs:
+      weighting: shifted
+      timestep_shift: 4
+  denoiser:
+    ckpt_path: checkpoints/va-wan_dl3dv.ckpt
+    load_strict: false
+    input_shape: [16, 16]
+    gradient_checkpointing: true
+    num_target_split: 1
+    val_render_moves: true
+    val_move_amount: 0.5
+    camera:
+      input_shape: [128, 128]
+      embedding:
+        patch_size: 8
+        in_channels: 24
+    kwargs:
+      use_rope_3d: true
+      in_channels: 48
+  compressor:
+    ckpt_path: checkpoints/va-wan_dl3dv.ckpt
+    load_strict: false
+    kl_weights: [1e-10, 1e-10]
+    input_shape: [16, 16]
+    num_scene_tokens: 1024
+    causal_self_atten: false
+    gradient_checkpointing: true
+    token_dim: 64
+    init_large: true
+    camera_conditioning: adaLN
+    scene_token_projection: kl
+    mask_context: false
+    camera:
+      input_shape: [128, 128]
+      embedding:
+        patch_size: 16
+    kwargs:
+      use_rope_2d: true
+      use_rope_3d: false
+      patch_size: 2
+
+trainer:
+  max_steps: 5_000_001
+  val_check_interval: 5000
+  task_steps: null
+  accumulate_grad_batches: 1
+  gradient_clip_val: 0.1
+  precision: bf16-mixed
+
+optimizer:
+  name: AdamW
+  lr: 1.0e-5
+  scale_lr: false
+  milestones: [2000]
+  scheduler:
+    - name: LinearLR
+      frequency: 1
+      interval: step
+      kwargs:
+        start_factor: 5.e-4
+        total_iters: 2000
+    - name: MultiStepLR
+      frequency: 1
+      interval: step
+      kwargs:
+        milestones: [500000]
+        gamma: 0.8

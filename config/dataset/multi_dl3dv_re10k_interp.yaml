@@ -1,7 +1,7 @@
 defaults:
   - view_sampler: bounded
 
-# MultiDataset: DL3DV + RE10K weighted mix, both RECON (no dynamic/text).
+# MultiDataset DL3DV+RE10K, INTERPOLATION only (expansion 0 = no extrapolation).
 # Each sub keeps its OWN bounded view_sampler with a PER-DATASET target
 # extrapolation range (LagerNVS convention): DL3DV target gap ~[10,20] frames
 # (short image sequences), RE10K ~[25,192] frames (long walkthroughs). RE10K
@@ -54,7 +54,7 @@ datasets:
       lagernvs_extrap: true
       view_range_min: 10
       view_range_max: 20
-      expansion_factor: 1.0
+      expansion_factor: 0.0     # INTERPOLATION only (target within context window)
       chunk_targets: false
       offset: 1
   # ── RE10K: .torch (native pipeline), short scenes → tight context spacing,
@@ -82,6 +82,6 @@ datasets:
       lagernvs_extrap: true
       view_range_min: 25
       view_range_max: 192
-      expansion_factor: 0.1
+      expansion_factor: 0.0     # INTERPOLATION only (target within context window)
       chunk_targets: false
       offset: 1
