@@ -1,0 +1,143 @@
+# @package _global_
+# ABLATION: DL3DV-only, INTERPOLATION only (extrap 없음), KNOWN_BUGS만 정정.
+#  - scale_context_focal_by_256: false (Bug2 off), force_incorrect: false (Bug3 off, td=4)
+#  - re10k 없음, extrapolation 없음(lagernvs_extrap expansion 0)
+# 나머지(mv_B1 + LightningDiT, 256x256, batch8, ctx6, va-wan_dl3dv warm-start)는
+# mixed 런(scenetok_mvB1_dl3dv_re10k_mixed{,_extrap})과 동일 → 데이터/샘플링만 비교 가능.
+defaults:
+  - override /dataset: dl3dv
+  - override /dataset/view_sampler: bounded
+  - override /model/scheduler: rf
+  - override /model/denoiser: lightningdit_L_1
+  - override /model/autoencoders/context: va
+  - override /model/autoencoders/target: wan
+  - override /model/compressor: mv_B1
+  - override /model/compressor/camera: ray
+  - override /model/compressor/camera/embedding: lvsm
+  - override /model/denoiser/camera: ray
+  - override /model/denoiser/camera/embedding: lvsm
+
+dataset:
+  root: ./DATA/DL3DV/DL3DV-960
+  smallset: true
+  target_latent_type: wan
+  context_shape: [256, 256]
+  target_shape: [256, 256]
+  scale_context_focal_by_256: false   # KNOWN_BUGS Bug2 OFF (focal 정규화)
+  scale_focal_by_256: false           # Bug1 OFF
+  view_sampler:
+    context_sampling: farthest_point
+    temporal_downsample: 4
+    num_context_views: 6
+    num_target_views: 10
+    # LagerNVS-coupled: delta_t [10,20]로 context 배치, expansion 0 = INTERPOLATION.
+    lagernvs_extrap: true
+    view_range_min: 10
+    view_range_max: 20
+    expansion_factor: 0.0
+    chunk_targets: false
+    offset: 1
+
+data_loader:
+  train:
+    batch_size: 8
+  val:
+    standard:
+      shuffle: false
+      batch_size: 2
+      max_batches: 4
+      num_workers: 4
+      seed: 0
+      interval: 5000
+      persistent_workers: false
+    unseen:
+      shuffle: false
+      batch_size: 2
+      max_batches: 4
+      num_workers: 4
+      seed: 0
+      interval: 5000
+      persistent_workers: false
+val:
+  video_length: 34
+  window_shift: 5
+wandb:
+  tags: [dl3dv, scenetok, interp, bugfix, ablation, stage_a, 256x256]
+  activated: true
+
+sampler:
+  clean_targets: 5
+freeze:
+  denoiser: false
+  compressor: false
+model:
+  scheduler:
+    sampling_type: random_uniform
+    num_inference_steps: 25
+    kwargs:
+      weighting: shifted
+      timestep_shift: 4
+  denoiser:
+    ckpt_path: checkpoints/va-wan_dl3dv.ckpt
+    load_strict: false
+    input_shape: [16, 16]
+    gradient_checkpointing: true
+    num_target_split: 1
+    val_render_moves: true
+    val_move_amount: 0.5
+    camera:
+      input_shape: [128, 128]
+      embedding:
+        patch_size: 8
+        in_channels: 24
+    kwargs:
+      use_rope_3d: true
+      in_channels: 48
+  compressor:
+    ckpt_path: checkpoints/va-wan_dl3dv.ckpt
+    load_strict: false
+    kl_weights: [1e-10, 1e-10]
+    input_shape: [16, 16]
+    num_scene_tokens: 1024
+    causal_self_atten: false
+    gradient_checkpointing: true
+    token_dim: 64
+    init_large: true
+    camera_conditioning: adaLN
+    scene_token_projection: kl
+    mask_context: false
+    camera:
+      input_shape: [128, 128]
+      embedding:
+        patch_size: 16
+    kwargs:
+      use_rope_2d: true
+      use_rope_3d: false
+      patch_size: 2
+
+trainer:
+  max_steps: 5_000_001
+  val_check_interval: 5000
+  task_steps: null
+  accumulate_grad_batches: 1
+  gradient_clip_val: 0.1
+  precision: bf16-mixed
+
+optimizer:
+  name: AdamW
+  lr: 1.0e-5
+  scale_lr: false
+  milestones: [2000]
+  scheduler:
+    - name: LinearLR
+      frequency: 1
+      interval: step
+      kwargs:
+        start_factor: 5.e-4
+        total_iters: 2000
+    - name: MultiStepLR
+      frequency: 1
+      interval: step
+      kwargs:
+        milestones: [500000]
+        gamma: 0.8
