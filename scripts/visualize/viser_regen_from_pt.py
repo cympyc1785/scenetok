@@ -122,7 +122,8 @@ def main():
     ap.add_argument("--model_experiment", default=None)
     ap.add_argument("--model_shape", default=None)
     ap.add_argument("--eval_index", default=str(DEFAULT_EVAL_INDEX))
-    ap.add_argument("--infer_steps", type=int, default=50)
+    ap.add_argument("--infer_steps", type=int, default=25,
+                    help="denoising steps (default 25 = native SceneTok eval convention)")
     ap.add_argument("--cfg_scale", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda")
