@@ -18,7 +18,7 @@ defaults:
 
 data_loader:
   train:
-    batch_size: 2
+    batch_size: 8
   val:
     standard:
       shuffle: false
@@ -62,7 +62,7 @@ model:
     gradient_checkpointing: true
     num_target_split: 1
     val_render_moves: true
-    val_move_amount: 0.5
+    val_move_amount: 1.0   # 2x (viser 유사 큰 이동)
     camera:
       input_shape: [128, 128]
       embedding:

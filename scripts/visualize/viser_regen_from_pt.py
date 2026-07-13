@@ -66,7 +66,7 @@ def find_batch(cache, scene_hash):
     return None
 
 
-def regen_one(wrapper, batch, tgt_rel, device, precision, out_dir, fps, infer_steps, cfg_scale, seed):
+def regen_one(wrapper, batch, tgt_rel, device, precision, out_dir, fps, infer_steps, cfg_scale, seed, reference_index=0):
     """Mirror viser_server.generate() core (lines ~574-628)."""
     from src.misc.batch_utils import preprocess_batch
     from src.misc.image_io import save_image_video
@@ -90,10 +90,11 @@ def regen_one(wrapper, batch, tgt_rel, device, precision, out_dir, fps, infer_st
                               device=device, dtype=ctx_lat.dtype),
         "index": torch.arange(T, device=device).unsqueeze(0),
     }
-    # Reference frame = FIRST context view (index 0): target poses are defined
-    # identity-at-context[0], so index 0 keeps a pattern's identity start truly
-    # identity (matches viser_server).
-    b = preprocess_batch(b, index=0)
+    # Reference frame: index 0 (ctx0, viser default) OR "center" (v_c//2) to match
+    # the model's validation/test convention (validation_step/test_step use v_c//2).
+    v_c = b["context"]["extrinsics"].shape[1]
+    ref_idx = (v_c // 2) if reference_index == "center" else int(reference_index)
+    b = preprocess_batch(b, index=ref_idx)
 
     with torch.no_grad(), torch.amp.autocast(device_type="cuda", dtype=precision,
                                              enabled=(precision != torch.float32)):
@@ -126,6 +127,9 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--fps", type=int, default=15)
+    ap.add_argument("--reference_index", default="0",
+                    help="preprocess anchor: '0' (ctx0, viser default) or 'center' "
+                         "(v_c//2, matches validation/test convention)")
     ap.add_argument("--num_target_views", type=int, default=None,
                     help="override view_sampler.num_target_views (va-vdc needs 8; va-wan leaves None)")
     ap.add_argument("--override", action="append", default=[],
@@ -195,7 +199,8 @@ def main():
                 print(f"[regen] SKIP {d.name}: scene {scene_hash[:12]} not in eval loader"); fail += 1; continue
             t0 = time.time()
             shape = regen_one(wrapper, batch, tgt, device, precision, out_d,
-                              args.fps, args.infer_steps, args.cfg_scale, args.seed)
+                              args.fps, args.infer_steps, args.cfg_scale, args.seed,
+                              reference_index=args.reference_index)
             # save inputs/config alongside the result (CLAUDE.md workflow)
             torch.save({"target_c2w_edited": tgt, "scene": scene_hash,
                         "source_bundle": obj.get("source_bundle")}, out_d / "poses.pt")
@@ -205,7 +210,7 @@ def main():
                 "cfg_scale": args.cfg_scale, "seed": args.seed, "fps": args.fps,
                 "src": str(d), "scene": scene_hash, "out_shape": list(shape),
                 "intrinsics": "GT target K (scale_context_focal_by_256 aware)",
-                "reference_index": 0,
+                "reference_index": args.reference_index,
             }, indent=2))
             print(f"[regen] OK {d.name} → {shape} ({time.time()-t0:.1f}s)")
             ok += 1
