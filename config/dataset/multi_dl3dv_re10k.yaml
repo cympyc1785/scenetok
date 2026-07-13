@@ -17,7 +17,7 @@ precomputed_latents: {context: false, target: false}
 view_sampler:
   name: bounded
   context_sampling: farthest_point
-  num_context_views: 6
+  num_context_views: 16
   num_target_views: 10
   temporal_downsample: 4
   chunk_targets: false
@@ -48,7 +48,7 @@ datasets:
       name: bounded
       context_sampling: farthest_point
       temporal_downsample: 4
-      num_context_views: 6
+      num_context_views: 16
       num_target_views: 10
       # LagerNVS 256-native dl3dv: delta_t [10,20] x expansion 1.0 (coupled).
       lagernvs_extrap: true
@@ -75,7 +75,7 @@ datasets:
       name: bounded
       context_sampling: farthest_point
       temporal_downsample: 4
-      num_context_views: 6
+      num_context_views: 16
       num_target_views: 10
       # LagerNVS 256-native re10k: delta_t [25,192] x expansion 0.1 (coupled).
       # delta_t auto-clamps to fit short re10k clips; target stays contiguous (video).

@@ -28,7 +28,7 @@ dataset:
   view_sampler:
     context_sampling: farthest_point
     temporal_downsample: 4
-    num_context_views: 6
+    num_context_views: 16
     num_target_views: 10
     # LagerNVS-coupled: delta_t [10,20]로 context 배치, expansion 0 = INTERPOLATION.
     lagernvs_extrap: true
