@@ -169,12 +169,11 @@ class DataModule(LightningDataModule):
                     sub_cfg.evaluation_index_path = Path(
                         f"assets/evaluation_index/dynamicverse_{key}.json")
                 else:
-                    # Recon mix (e.g. dl3dv+re10k): validate each sub separately —
-                    # standard -> first sub, unseen -> second sub (key labels dataset).
-                    idx = 0 if key != "unseen" else min(1, len(subs) - 1)
-                    sub_cfg = subs[idx]
-                    if getattr(sub_cfg, "name", None) in {"dl3dv", "re10k"}:
-                        sub_cfg.val_seen = True
+                    # Recon mix (e.g. dl3dv+re10k): validate on DL3DV ONLY (original
+                    # DL3DV validation) so panels/metrics match the single-dataset
+                    # dl3dv runs. standard=seen split, unseen=unseen split.
+                    sub_cfg = next((c for c in subs if getattr(c, "name", None) == "dl3dv"), subs[0])
+                    sub_cfg.val_seen = key != "unseen"
                 dataset = get_dataset(sub_cfg, "val", self.step_tracker, generator, force_shuffle=False)
                 dataset = self.dataset_shim(dataset, "val")
                 validation_length = cfg.batch_size * cfg.max_batches if cfg.max_batches > 0 else len(dataset)
