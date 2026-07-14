@@ -1,0 +1,105 @@
+# @package _global_
+# EVAL-ONLY: original va-wan_dl3dv finetuned model settings, but RAW dl3dv dataset
+# (on-the-fly VA/Wan encode) so 11K held-out scenes are loadable (latent_dl3dv only
+# covers precomputed 1K). Model side = IDENTICAL to scenetok_va-wan_shift4_dl3dv_
+# finetuned (chunk_targets default True, num_target_split 2, force_incorrect true,
+# focal on, 25 step). Only the data source differs.
+defaults:
+  - override /dataset: dl3dv
+  - override /dataset/view_sampler: bounded
+  - override /model/scheduler: rf
+  - override /model/denoiser: lightningdit_L_1
+  - override /model/autoencoders/context: va
+  - override /model/autoencoders/target: wan
+  - override /model/compressor: mv_B1
+  - override /model/compressor/camera: ray
+  - override /model/compressor/camera/embedding: lvsm
+  - override /model/denoiser/camera: ray
+  - override /model/denoiser/camera/embedding: lvsm
+
+dataset:
+  root: ./DATA/DL3DV/DL3DV-960
+  smallset: true
+  target_latent_type: wan
+  context_shape: [256, 256]
+  target_shape: [256, 256]
+  scale_context_focal_by_256: true      # KNOWN_BUGS Bug2 ON (va-wan native)
+  scale_focal_by_256: false
+  precomputed_latents: {context: false, target: false}
+  view_sampler:
+    num_context_views: 16
+    num_target_views: 10
+    num_target_split: 2                  # va-wan native (RoPE split per 17-frame chunk)
+    chunk_index_gap: 5
+    offset: 1
+    # chunk_targets defaults True (va-wan native chunked targets)
+
+data_loader:
+  train: {batch_size: 2}
+  val:
+    standard: {shuffle: false, batch_size: 2, max_batches: 4, num_workers: 4, seed: 0, interval: 5000, persistent_workers: false}
+    unseen:   {shuffle: false, batch_size: 2, max_batches: 4, num_workers: 4, seed: 0, interval: 5000, persistent_workers: false}
+val:
+  video_length: 34
+  window_shift: 5
+wandb:
+  tags: [dl3dv, va-wan, eval, rawdata]
+  activated: false
+
+sampler:
+  clean_targets: 5
+freeze:
+  denoiser: false
+  compressor: true
+model:
+  force_incorrect: true                  # va-wan native (Bug3, camera td=1)
+  scheduler:
+    sampling_type: random_chunked_uniform
+    num_inference_steps: 25
+    kwargs:
+      weighting: shifted
+      timestep_shift: 4
+  denoiser:
+    ckpt_path: checkpoints/va-wan_dl3dv.ckpt
+    load_strict: false
+    input_shape: [16, 16]
+    gradient_checkpointing: true
+    num_target_split: 2                   # va-wan native
+    camera:
+      input_shape: [128, 128]
+      embedding:
+        patch_size: 8
+        in_channels: 24
+    kwargs:
+      use_rope_3d: true
+      in_channels: 48
+  compressor:
+    ckpt_path: checkpoints/va-wan_dl3dv.ckpt
+    load_strict: false
+    kl_weights: [0.0, 0.0]
+    input_shape: [16, 16]
+    num_scene_tokens: 1024
+    causal_self_atten: false
+    gradient_checkpointing: true
+    token_dim: 64
+    init_large: true
+    camera_conditioning: adaLN
+    scene_token_projection: kl
+    mask_context: false
+    camera:
+      input_shape: [128, 128]
+      embedding:
+        patch_size: 16
+    kwargs:
+      use_rope_2d: true
+      use_rope_3d: false
+      patch_size: 2
+
+trainer:
+  max_steps: 5_000_001
+  val_check_interval: 5000
+  precision: bf16-mixed
+optimizer:
+  name: AdamW
+  lr: 1.0e-5
+  scale_lr: false

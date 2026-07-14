@@ -61,6 +61,9 @@ def main():
     ap.add_argument("--save_clips", action="store_true")
     ap.add_argument("--override", action="append", default=[],
                     help="extra hydra override(s) for build_model, e.g. +model.force_incorrect=true")
+    ap.add_argument("--framewise", action="store_true",
+                    help="sample EACH target view independently (v_t=1 → 1 latent per frame), "
+                         "no temporal coupling; concat into the clip.")
     args = ap.parse_args()
 
     seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
@@ -103,7 +106,19 @@ def main():
             torch.manual_seed(seed)
             b = preprocess_batch(deepcopy(batch), index=v_c // 2)
             with torch.no_grad(), torch.amp.autocast("cuda", dtype=precision, enabled=(precision != torch.float32)):
-                sampled, _, _ = wrapper.generate_batch_with_scene(b, wrapper.sampler, repeat_factor=1)
+                if args.framewise:
+                    # sample each target view independently (v_t=1 → 1 latent per frame)
+                    Vt = b["target"]["extrinsics"].shape[1]
+                    outs = []
+                    for j in range(Vt):
+                        bj = dict(b)
+                        bj["target"] = {k: (v[:, j:j + 1] if torch.is_tensor(v) and v.dim() > 1 else v)
+                                        for k, v in b["target"].items()}
+                        sj, _, _ = wrapper.generate_batch_with_scene(bj, wrapper.sampler, repeat_factor=1)
+                        outs.append(sj[:, :1])
+                    sampled = torch.cat(outs, dim=1)
+                else:
+                    sampled, _, _ = wrapper.generate_batch_with_scene(b, wrapper.sampler, repeat_factor=1)
             sampled = sampled.float().clamp(0, 1)
             V = min(sampled.shape[1], gt.shape[1], len(tgt_idx))
             for i in range(V):
@@ -123,6 +138,9 @@ def main():
                 cd = clip_dir / f"{args.tag}_{args.ctx}" / scene
                 save_image_video(images=sampled[0], indices=torch.arange(sampled.shape[1]),
                                  output_dir=cd, name="pred", save_img=False, save_video=True, fps=8)
+                gd = clip_dir / "gt" / scene
+                save_image_video(images=gt[0].float().clamp(0, 1), indices=torch.arange(gt.shape[1]),
+                                 output_dir=gd, name="gt", save_img=False, save_video=True, fps=8)
 
     Path(args.out).mkdir(parents=True, exist_ok=True)
     outp = Path(args.out) / f"{args.tag}_{args.ctx}.json"
