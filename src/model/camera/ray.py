@@ -91,7 +91,13 @@ class Ray(Camera[RayCfg]):
                 ray_encodings = (ray_encodings,)
             _list = []
             for ray_encoding in ray_encodings:
-                padding = torch.zeros_like(ray_encoding[:, :temporal_downsample-1], device=ray_encoding.device, dtype=ray_encoding.dtype)
+                # Pad the special first video token to a full temporal_downsample group.
+                # Use an EXPLICIT (td-1)-frame zero pad: `zeros_like(ray_encoding[:, :td-1])`
+                # under-pads when the chunk has < td-1 frames (e.g. a single first frame →
+                # 1+1+0=2, not divisible by td) — breaking framewise/single-frame sampling.
+                pad_shape = list(ray_encoding.shape)
+                pad_shape[1] = max(temporal_downsample - 1, 0)
+                padding = torch.zeros(pad_shape, device=ray_encoding.device, dtype=ray_encoding.dtype)
 
                 _list.append(torch.concat(
                     [

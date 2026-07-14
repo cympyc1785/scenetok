@@ -86,7 +86,11 @@ class Plucker(Camera[PluckerCfg]):
                 ray_encodings = (ray_encodings,)
             _list = []
             for ray_encoding in ray_encodings:
-                padding = torch.zeros_like(ray_encoding[:, 0:temporal_downsample-1], device=ray_encoding.device, dtype=ray_encoding.dtype)
+                # Explicit (td-1)-frame pad (see ray.py): zeros_like(...[:, :td-1]) under-pads
+                # a single first frame (1+1+0=2, not divisible by td) → framewise breaks.
+                pad_shape = list(ray_encoding.shape)
+                pad_shape[1] = max(temporal_downsample - 1, 0)
+                padding = torch.zeros(pad_shape, device=ray_encoding.device, dtype=ray_encoding.dtype)
 
                 ray_encoding = torch.concat(
                     [ray_encoding[:, 0:1], 
