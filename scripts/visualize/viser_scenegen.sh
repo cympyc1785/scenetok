@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=0 TORCHDYNAMO_DISABLE=1   python scripts/visualize/viser_server_scenegen.py --scene 004e9db3337e8206 --port 8080
